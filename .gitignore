@@ -1,0 +1,8 @@
+# generated artifacts — everything here is rebuilt from the user's own transcripts
+metrics.db
+metrics.db-shm
+metrics.db-wal
+dashboard.html
+receiver.log*
+reports/
+__pycache__/
