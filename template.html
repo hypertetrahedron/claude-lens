@@ -1,0 +1,966 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="300">
+<title>Claude Code Usage</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page:           #f9f9f7;
+    --surface-1:      #fcfcfb;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --grid:           #e1e0d9;
+    --baseline:       #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --series-1:       #2a78d6;
+    --series-2:       #1baf7a;
+    --series-3:       #eda100;
+    --series-4:       #008300;
+    --series-5:       #4a3aa7;
+    --hover-wash:     rgba(11,11,11,0.04);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page:           #0d0d0d;
+      --surface-1:      #1a1a19;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --grid:           #2c2c2a;
+      --baseline:       #383835;
+      --border:         rgba(255,255,255,0.10);
+      --series-1:       #3987e5;
+      --series-2:       #199e70;
+      --series-3:       #c98500;
+      --series-4:       #008300;
+      --series-5:       #9085e9;
+      --hover-wash:     rgba(255,255,255,0.06);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page:           #0d0d0d;
+    --surface-1:      #1a1a19;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --grid:           #2c2c2a;
+    --baseline:       #383835;
+    --border:         rgba(255,255,255,0.10);
+    --series-1:       #3987e5;
+    --series-2:       #199e70;
+    --series-3:       #c98500;
+    --series-4:       #008300;
+    --series-5:       #9085e9;
+    --hover-wash:     rgba(255,255,255,0.06);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 20px;
+    background: var(--page); color: var(--text-primary);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1280px; margin: 0 auto; }
+
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
+  header h1 { font-size: 20px; font-weight: 600; margin: 0; }
+  header .sub { color: var(--text-muted); font-size: 12px; }
+  header .spacer { flex: 1; }
+  #theme-btn {
+    background: var(--surface-1); color: var(--text-secondary);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer;
+  }
+
+  .filters {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+    margin-bottom: 16px;
+  }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  .seg button {
+    background: var(--surface-1); color: var(--text-secondary); border: 0;
+    padding: 5px 12px; font: inherit; font-size: 13px; cursor: pointer;
+  }
+  .seg button + button { border-left: 1px solid var(--border); }
+  .seg button:hover { background: var(--hover-wash); }
+  .seg button[aria-pressed="true"] { color: var(--text-primary); font-weight: 600; }
+  .filters select, .filters input, #chart-sel {
+    background: var(--surface-1); color: var(--text-primary);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 5px 8px; font: inherit; font-size: 13px;
+  }
+  .filters input { min-width: 220px; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .tile {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 10px; padding: 12px 14px;
+  }
+  .tile .label { color: var(--text-muted); font-size: 12px; }
+  .tile .value { font-size: 26px; font-weight: 600; margin-top: 2px; }
+  .tile .hint { color: var(--text-muted); font-size: 11px; margin-top: 2px; }
+
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px; margin-bottom: 16px;
+  }
+  .card h2 { font-size: 13px; font-weight: 600; color: var(--text-secondary); margin: 0 0 10px; }
+  .card-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .card-head h2 { margin: 0 0 10px; }
+  .seg-sm button { padding: 3px 10px; font-size: 12px; }
+  #chart-wrap { position: relative; }
+  #chart-wrap svg { display: block; width: 100%; }
+  .tick-label { fill: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .grid-line { stroke: var(--grid); stroke-width: 1; }
+  .base-line { stroke: var(--baseline); stroke-width: 1; }
+  .bar { fill: var(--series-1); }
+  .fill-s1 { fill: var(--series-1); } .fill-s2 { fill: var(--series-2); }
+  .fill-s3 { fill: var(--series-3); } .fill-s4 { fill: var(--series-4); }
+  .fill-s5 { fill: var(--series-5); }
+  .sw-s1 { background: var(--series-1); } .sw-s2 { background: var(--series-2); }
+  .sw-s3 { background: var(--series-3); } .sw-s4 { background: var(--series-4); }
+  .sw-s5 { background: var(--series-5); }
+  .bar-hit { fill: transparent; cursor: pointer; }
+  .bar-hit:hover + .bar, .bar.hot { opacity: 0.8; }
+  #chart-legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-secondary); margin: 0 0 6px; }
+  #chart-legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  .btn {
+    background: var(--surface-1); color: var(--text-secondary);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer;
+  }
+  .btn:hover { background: var(--hover-wash); }
+  .btn[aria-pressed="true"] { color: var(--text-primary); font-weight: 600; }
+
+  #tooltip {
+    position: absolute; pointer-events: none; z-index: 10; display: none;
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px; font-size: 12px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.18); min-width: 150px;
+  }
+  #tooltip .tt-title { color: var(--text-muted); margin-bottom: 4px; }
+  #tooltip .tt-row { display: flex; justify-content: space-between; gap: 14px; }
+  #tooltip .tt-row .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+  #tooltip .tt-row .k { color: var(--text-secondary); }
+
+  .tbl-scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  th {
+    color: var(--text-muted); font-weight: 500; font-size: 12px;
+    cursor: pointer; user-select: none; white-space: nowrap;
+    position: sticky; top: 0; background: var(--surface-1);
+  }
+  th .arrow { font-size: 10px; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tr.data-row { cursor: pointer; }
+  tr.data-row:hover { background: var(--hover-wash); }
+  td.prompt { max-width: 480px; }
+  td.prompt .txt {
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden; color: var(--text-primary);
+  }
+  tr.open td.prompt .txt { -webkit-line-clamp: unset; }
+  tr.group-row { cursor: pointer; background: var(--hover-wash); }
+  tr.group-row td { font-weight: 600; color: var(--text-primary); border-bottom: 1px solid var(--baseline); }
+  tr.group-row .cnt { color: var(--text-muted); font-weight: 400; }
+  .pill {
+    display: inline-block; padding: 1px 7px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--text-secondary);
+    font-size: 11px; margin: 0 4px 2px 0; white-space: nowrap;
+  }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--series-1); margin-right: 5px; }
+  .muted { color: var(--text-muted); }
+  tr.detail-row td { background: var(--hover-wash); padding: 10px 14px 14px; }
+  .detail { display: flex; gap: 32px; flex-wrap: wrap; font-size: 12.5px; }
+  .detail h3 { font-size: 11px; font-weight: 600; color: var(--text-muted); margin: 0 0 6px; text-transform: uppercase; letter-spacing: .04em; }
+  .detail table { width: auto; font-size: 12.5px; }
+  .detail td, .detail th { padding: 3px 10px 3px 0; border-bottom: none; cursor: default; position: static; }
+  .detail th { color: var(--text-muted); }
+  .empty { color: var(--text-muted); padding: 24px; text-align: center; }
+  footer { color: var(--text-muted); font-size: 11px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Claude Code Usage</h1>
+    <span class="sub" id="generated-at"></span>
+    <span class="spacer"></span>
+    <button id="theme-btn" type="button">Theme</button>
+  </header>
+
+  <div class="filters">
+    <span class="seg" id="range-seg" role="group" aria-label="Date range">
+      <button data-range="1">Today</button>
+      <button data-range="7">7d</button>
+      <button data-range="30" aria-pressed="true">30d</button>
+      <button data-range="90">90d</button>
+      <button data-range="0">All</button>
+    </span>
+    <select id="f-project" aria-label="Project"></select>
+    <select id="f-model" aria-label="Model"></select>
+    <input id="f-search" type="search" placeholder="Search prompt text…" aria-label="Search prompts">
+  </div>
+
+  <div class="tiles">
+    <div class="tile"><div class="label">Prompts</div><div class="value" id="t-prompts">–</div><div class="hint" id="t-prompts-h"></div></div>
+    <div class="tile"><div class="label">Output tokens</div><div class="value" id="t-out">–</div><div class="hint">generated by models</div></div>
+    <div class="tile"><div class="label">Input tokens</div><div class="value" id="t-in">–</div><div class="hint">incl. cache read/write</div></div>
+    <div class="tile"><div class="label">Lines written</div><div class="value" id="t-lines">–</div><div class="hint" id="t-lines-h"></div></div>
+    <div class="tile"><div class="label">Cost</div><div class="value" id="t-cost">–</div><div class="hint" id="t-cost-h">actual + estimated</div></div>
+    <div class="tile"><div class="label">Current 5h window</div><div class="value" id="t-window">–</div><div class="hint" id="t-window-h"></div></div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <h2 id="chart-title">Output tokens per day</h2>
+      <select id="chart-sel" aria-label="Chart metric">
+        <option value="out">Output tokens / day</option>
+        <option value="tpm">Output tokens / active min</option>
+        <option value="lpm">Lines changed / active min</option>
+        <option value="cost">Cost / day</option>
+        <option value="comp">Cost composition / day</option>
+        <option value="cache">Cache hit rate / day</option>
+        <option value="cpk">Cost per 1K lines / day</option>
+        <option value="mix">Model mix / day</option>
+        <option value="agents">Subagent share / day</option>
+      </select>
+    </div>
+    <div id="chart-legend" hidden></div>
+    <div id="chart-wrap"><div id="tooltip"></div></div>
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <button class="btn" id="group-btn" type="button" aria-pressed="false">Group by project</button>
+      <button class="btn" id="csv-btn" type="button">Export CSV</button>
+    </div>
+    <div class="tbl-scroll">
+      <table id="tbl">
+        <thead><tr id="tbl-head"></tr></thead>
+        <tbody id="tbl-body"></tbody>
+      </table>
+    </div>
+    <div class="empty" id="empty" hidden>No prompts match the current filters.</div>
+  </div>
+
+  <footer>One row per user prompt; subagent work and harness-injected turns are folded into the prompt that caused them. Costs marked ~ are estimated from the public pricing table (historical backfill); others are reported by Claude Code itself.</footer>
+</div>
+
+<script>
+"use strict";
+const DATA = /*__DATA__*/null;
+
+/* ---------- utilities ---------- */
+const $ = (id) => document.getElementById(id);
+const fmtC = (n) => {                       // compact: 12.9K / 4.2M
+  if (n == null) return "–";
+  const a = Math.abs(n);
+  if (a >= 1e9) return (n / 1e9).toFixed(1) + "B";
+  if (a >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (a >= 1e4) return (n / 1e3).toFixed(1) + "K";
+  return n.toLocaleString("en-US");
+};
+const fmtFull = (n) => n == null ? "–" : n.toLocaleString("en-US");
+const fmtCost = (c, est) => (est ? "~$" : "$") + (c >= 100 ? c.toFixed(0) : c >= 1 ? c.toFixed(2) : c.toFixed(3));
+const fmtDur = (s) => {
+  if (s == null) return "–";
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.round(s / 60) + "m";
+  return (s / 3600).toFixed(1) + "h";
+};
+const el = (tag, cls, text) => {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;   // textContent only — data is untrusted
+  return e;
+};
+const dayOf = (iso) => iso ? iso.slice(0, 10) : "";
+
+/* ---------- theme ---------- */
+(() => {
+  const saved = localStorage.getItem("ccu-theme");
+  if (saved) document.documentElement.dataset.theme = saved;
+  $("theme-btn").addEventListener("click", () => {
+    const cur = document.documentElement.dataset.theme ||
+      (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    const next = cur === "dark" ? "light" : "dark";
+    document.documentElement.dataset.theme = next;
+    localStorage.setItem("ccu-theme", next);
+    render();
+  });
+})();
+
+/* ---------- state & filters ---------- */
+// Filters persist across the 5-min auto-refresh reload.
+const saved = (() => { try { return JSON.parse(localStorage.getItem("ccu-state")) || {}; } catch { return {}; } })();
+const state = { range: saved.range ?? 30, project: saved.project || "all",
+                model: saved.model || "all", q: "", sort: "ts", dir: -1,
+                chart: saved.chart || "out", group: !!saved.group };
+const persist = () => localStorage.setItem("ccu-state", JSON.stringify(
+  { range: state.range, project: state.project, model: state.model,
+    chart: state.chart, group: state.group }));
+const rows = DATA.rows;
+
+function initFilters() {
+  const projects = [...new Set(rows.map(r => r.project))].sort();
+  const models = [...new Set(rows.flatMap(r => r.models.map(m => m.model)))].sort();
+  const fill = (sel, items, allLabel) => {
+    sel.append(el("option", null, allLabel));
+    sel.options[0].value = "all";
+    for (const it of items) {
+      const o = el("option", null, it); o.value = it; sel.append(o);
+    }
+  };
+  fill($("f-project"), projects, "All projects");
+  fill($("f-model"), models, "All models");
+  if (projects.includes(state.project)) $("f-project").value = state.project; else state.project = "all";
+  if (models.includes(state.model)) $("f-model").value = state.model; else state.model = "all";
+  $("f-project").addEventListener("change", e => { state.project = e.target.value; persist(); render(); });
+  $("f-model").addEventListener("change", e => { state.model = e.target.value; persist(); render(); });
+  let deb;
+  $("f-search").addEventListener("input", e => {
+    clearTimeout(deb);
+    deb = setTimeout(() => { state.q = e.target.value.toLowerCase(); render(); }, 150);
+  });
+  for (const x of $("range-seg").children)
+    x.setAttribute("aria-pressed", +x.dataset.range === state.range);
+  $("range-seg").addEventListener("click", e => {
+    const b = e.target.closest("button"); if (!b) return;
+    state.range = +b.dataset.range;
+    for (const x of $("range-seg").children) x.setAttribute("aria-pressed", x === b);
+    persist(); render();
+  });
+  $("chart-sel").value = state.chart;
+  $("chart-sel").addEventListener("change", e => {
+    state.chart = e.target.value;
+    persist(); renderChart(filtered());
+  });
+  $("group-btn").setAttribute("aria-pressed", state.group);
+  $("group-btn").addEventListener("click", () => {
+    state.group = !state.group;
+    $("group-btn").setAttribute("aria-pressed", state.group);
+    persist(); renderTable(filtered());
+  });
+  $("csv-btn").addEventListener("click", exportCsv);
+}
+
+function filtered() {
+  let cutoff = "";
+  if (state.range > 0) {
+    const d = new Date(); d.setDate(d.getDate() - (state.range - 1)); d.setHours(0, 0, 0, 0);
+    cutoff = d.toISOString();
+  }
+  return rows.filter(r =>
+    (!cutoff || r.ts >= cutoff) &&
+    (state.project === "all" || r.project === state.project) &&
+    (state.model === "all" || r.models.some(m => m.model === state.model)) &&
+    (!state.q || r.text.toLowerCase().includes(state.q)));
+}
+
+/* ---------- tiles ---------- */
+function renderTiles(rs) {
+  const out = rs.reduce((a, r) => a + r.out, 0);
+  const inp = rs.reduce((a, r) => a + r.inp, 0);
+  const cost = rs.reduce((a, r) => a + r.cost, 0);
+  const anyEst = rs.some(r => r.est);
+  const agents = rs.reduce((a, r) => a + r.agents.length, 0);
+  $("t-prompts").textContent = fmtFull(rs.length);
+  $("t-prompts-h").textContent = agents ? agents + " subagent runs folded in" : "";
+  $("t-out").textContent = fmtC(out);
+  $("t-out").title = fmtFull(out);
+  $("t-in").textContent = fmtC(inp);
+  $("t-in").title = fmtFull(inp);
+  const ladd = rs.reduce((a, r) => a + (r.ladd || 0), 0);
+  const lrem = rs.reduce((a, r) => a + (r.lrem || 0), 0);
+  const files = rs.reduce((a, r) => a + (r.files || 0), 0);
+  $("t-lines").textContent = fmtC(ladd);
+  $("t-lines").title = fmtFull(ladd) + " added, " + fmtFull(lrem) + " removed";
+  $("t-lines-h").textContent = "−" + fmtC(lrem) + " removed · " + fmtC(files) + " file edits";
+  $("t-cost").textContent = fmtCost(cost, anyEst);
+  const alt = rs.reduce((a, r) => a + (r.alt || 0), 0);
+  const savedPct = alt > 0 ? Math.round(100 * (alt - cost) / alt) : 0;
+  $("t-cost-h").textContent = alt > cost
+    ? "without caching: " + fmtCost(alt, anyEst) + " (−" + savedPct + "%)"
+    : (anyEst ? "includes estimated historical rows" : "reported by Claude Code");
+  $("t-cost").title = "Caching saved " + fmtCost(alt - cost, false) + " on this slice";
+}
+
+/* ---------- current 5h rate-limit window (global, not filter-scoped) ---------- */
+function renderWindow() {
+  const w = DATA.window;
+  if (!w) {
+    $("t-window").textContent = "idle";
+    $("t-window-h").textContent = "no active block";
+    return;
+  }
+  $("t-window").textContent = fmtC(w.out);
+  $("t-window").title = fmtFull(w.out) + " output tokens · " + w.requests + " requests";
+  const end = new Date(w.end);
+  $("t-window-h").textContent = "out tokens · " + fmtCost(w.cost, false) +
+    " · resets " + end.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+/* ---------- daily bar chart ---------- */
+const fmtRate = (v) => v >= 100 ? fmtC(Math.round(v)) : v >= 10 ? v.toFixed(0) : v.toFixed(1);
+const fmtUsd = (v) => "$" + fmtRate(v);
+const fmtPct = (v) => v.toFixed(0) + "%";
+// Rates use active time: the sum of each prompt's wall-clock span (prompt ->
+// last API response). Days with under a minute of activity are skipped rather
+// than shown as misleading spikes; cost-per-1K-lines needs >= 50 lines.
+const CHARTS = {
+  out:   { title: "Output tokens per day",
+           val: b => b.out || null, fmt: fmtC },
+  tpm:   { title: "Output tokens per active minute",
+           val: b => b.wall >= 60 ? b.out / (b.wall / 60) : null, fmt: fmtRate },
+  lpm:   { title: "Lines changed per active minute",
+           val: b => b.wall >= 60 && b.lines ? b.lines / (b.wall / 60) : null, fmt: fmtRate },
+  cost:  { title: "Cost per day",
+           val: b => b.cost || null, fmt: fmtUsd },
+  cache: { title: "Cache hit rate per day (% of input served from cache)",
+           val: b => b.inp > 0 ? 100 * b.cr / b.inp : null, fmt: fmtPct, top: 100 },
+  cpk:   { title: "Cost per 1,000 lines written",
+           val: b => b.lines >= 50 ? b.cost / (b.lines / 1000) : null, fmt: fmtUsd },
+  agents:{ title: "Subagent share of output tokens",
+           val: b => b.out > 0 ? 100 * b.agentOut / b.out : null, fmt: fmtPct, top: 100 },
+  mix:   { title: "Model mix per day (output tokens)", stacked: "fams" },
+  comp:  { title: "Cost composition per day", stacked: "comp", fmt: fmtUsd },
+};
+// Cost components: fixed name -> color-slot pairing, order matches row.comp
+const COMP = [["cache read", 1], ["cache write", 3], ["output", 5], ["uncached input", 2]];
+// Fixed family -> color-slot assignment (color follows the entity, never rank).
+const FAMILIES = [
+  ["opus",   m => m.includes("opus")],
+  ["fable",  m => m.includes("fable") || m.includes("mythos")],
+  ["sonnet", m => m.includes("sonnet")],
+  ["haiku",  m => m.includes("haiku")],
+  ["other",  () => true],
+];
+const famOf = (model) => FAMILIES.find(([, test]) => test(model || ""))[0];
+const famSlot = (fam) => FAMILIES.findIndex(([n]) => n === fam) + 1;
+
+function renderChart(rs) {
+  const wrap = $("chart-wrap");
+  for (const n of [...wrap.children]) if (n.id !== "tooltip") n.remove();
+  const chart = CHARTS[state.chart] || CHARTS.out;
+  $("chart-title").textContent = chart.title;
+
+  const byDay = new Map();
+  for (const r of rs) {
+    const d = dayOf(r.ts); if (!d) continue;
+    const b = byDay.get(d) || { out: 0, inp: 0, cost: 0, prompts: 0, wall: 0,
+                                lines: 0, cr: 0, agentOut: 0, fams: {} };
+    b.out += r.out; b.inp += r.inp; b.cost += r.cost; b.prompts++;
+    b.wall += r.wall_s || 0; b.lines += (r.ladd || 0) + (r.lrem || 0);
+    b.cr += r.cr || 0; b.agentOut += r.agent_out || 0;
+    b.alt = (b.alt || 0) + (r.alt || 0);
+    b.comp = b.comp || [0, 0, 0, 0];
+    (r.comp || []).forEach((c, i) => b.comp[i] += c);
+    for (const m of r.models) {
+      const f = famOf(m.model);
+      b.fams[f] = (b.fams[f] || 0) + m.out;
+    }
+    byDay.set(d, b);
+  }
+  const days = [...byDay.keys()].sort();
+  if (!days.length) return;
+  // contiguous day axis from first to last
+  const seq = [];
+  for (let d = new Date(days[0] + "T00:00:00Z"); ; d.setUTCDate(d.getUTCDate() + 1)) {
+    const key = d.toISOString().slice(0, 10);
+    seq.push(key);
+    if (key >= days[days.length - 1]) break;
+    if (seq.length > 400) break;
+  }
+
+  const W = Math.max(wrap.clientWidth || 900, 320), H = 190;
+  const padL = 46, padR = 8, padT = 8, padB = 26;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  // stacked charts: [name, colorSlot, accessor] per series, fixed order
+  const stackDefs =
+    chart.stacked === "fams" ? FAMILIES.map(([n]) => [n, famSlot(n), b => b.fams[n] || 0]) :
+    chart.stacked === "comp" ? COMP.map(([n, slot], i) => [n, slot, b => (b.comp || [])[i] || 0]) :
+    null;
+  const present = stackDefs
+    ? stackDefs.filter(([, , get]) => seq.some(k => { const b = byDay.get(k); return b && get(b) > 0; }))
+    : [];
+  const dayVal = (k) => {
+    const b = byDay.get(k); if (!b) return null;
+    if (stackDefs) { const s = present.reduce((a, [, , g]) => a + g(b), 0); return s || null; }
+    return chart.val(b);
+  };
+  const tickFmt = chart.fmt || fmtC;
+  let top = chart.top;
+  if (!top) {
+    const maxV = Math.max(...seq.map(k => dayVal(k) || 0), 1e-9);
+    // clean tick ceiling: 1/2/5 * 10^n
+    const pow = Math.pow(10, Math.floor(Math.log10(maxV)));
+    top = [1, 2, 5, 10].map(m => m * pow).find(v => v >= maxV);
+  }
+
+  // legend: only for stacked multi-series charts (single series needs none)
+  const legend = $("chart-legend");
+  if (stackDefs && present.length) {
+    legend.hidden = false;
+    legend.replaceChildren(...present.map(([n, slot]) => {
+      const s = el("span");
+      s.append(el("span", "sw sw-s" + slot), document.createTextNode(n));
+      return s;
+    }));
+  } else {
+    legend.hidden = true;
+  }
+  const band = plotW / seq.length;
+  const barW = Math.min(24, Math.max(2, band - 2));
+
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("width", W); svg.setAttribute("height", H);
+  const mk = (t, at) => { const e = document.createElementNS(ns, t); for (const k in at) e.setAttribute(k, at[k]); return e; };
+
+  for (let i = 0; i <= 4; i++) {              // hairline solid gridlines
+    const v = top * i / 4, y = padT + plotH - plotH * v / top;
+    svg.append(mk("line", { x1: padL, x2: W - padR, y1: y, y2: y, class: i ? "grid-line" : "base-line" }));
+    const t = mk("text", { x: padL - 6, y: y + 4, "text-anchor": "end", class: "tick-label" });
+    t.textContent = v ? tickFmt(v) : "0"; svg.append(t);
+  }
+  const labelEvery = Math.ceil(seq.length / Math.floor(plotW / 64));
+  const roundedBar = (x, y, w, hBase, cls, key) => {
+    const r = Math.min(4, w / 2, hBase - y);   // 4px rounded data-end, square baseline
+    const d = `M${x},${hBase} V${y + r} Q${x},${y} ${x + r},${y} H${x + w - r} Q${x + w},${y} ${x + w},${y + r} V${hBase} Z`;
+    return mk("path", { d, class: cls, "data-day": key });
+  };
+  seq.forEach((key, i) => {
+    const b = byDay.get(key);
+    const v = dayVal(key);
+    const x = padL + i * band + (band - barW) / 2;
+    if (stackDefs && v != null && v > 0) {
+      // stacked segments bottom-up in fixed series order, 2px surface gaps
+      let yCursor = padT + plotH;
+      const segs = present.map(([, slot, get]) => [slot, get(b)]).filter(s => s[1] > 0);
+      segs.forEach(([slot, val], si) => {
+        const h = Math.max(1, plotH * val / top);
+        const yTop = yCursor - h;
+        const isTop = si === segs.length - 1;
+        if (isTop) {
+          svg.append(roundedBar(x, yTop, barW, yCursor, "bar fill-s" + slot, key));
+        } else {
+          svg.append(mk("rect", { x, y: yTop, width: barW, height: Math.max(1, h - 2),
+                                  class: "bar fill-s" + slot, "data-day": key }));
+        }
+        yCursor = yTop - 2;                     // 2px surface gap between segments
+      });
+    } else if (v != null && v > 0) {
+      const h = Math.max(2, plotH * v / top);
+      const y = padT + plotH - h;
+      svg.append(roundedBar(x, y, barW, padT + plotH, "bar", key));
+    }
+    if (i % labelEvery === 0) {
+      const t = mk("text", { x: padL + i * band + band / 2, y: H - 8, "text-anchor": "middle", class: "tick-label" });
+      t.textContent = key.slice(5); svg.append(t);
+    }
+    // full-band transparent hit target, larger than the mark
+    const hit = mk("rect", { x: padL + i * band, y: padT, width: band, height: plotH, class: "bar-hit", "data-day": key, tabindex: b ? 0 : -1 });
+    svg.append(hit);
+  });
+
+  const tt = $("tooltip");
+  const show = (e) => {
+    const key = e.target.dataset.day; const b = byDay.get(key);
+    const bars = svg.querySelectorAll(".bar");
+    bars.forEach(x => x.classList.toggle("hot", x.dataset.day === key));
+    if (!b) { tt.style.display = "none"; return; }
+    const v = chart.stacked ? null : chart.val(b);
+    const rows = [el("div", "tt-title", key)];
+    switch (state.chart) {
+      case "tpm":
+        rows.push(ttRow("Tokens/min", v != null ? fmtRate(v) : "–"),
+                  ttRow("Output", fmtFull(b.out)),
+                  ttRow("Active time", fmtDur(Math.round(b.wall))));
+        break;
+      case "lpm":
+        rows.push(ttRow("Lines/min", v != null ? fmtRate(v) : "–"),
+                  ttRow("Lines ±", fmtFull(b.lines)),
+                  ttRow("Active time", fmtDur(Math.round(b.wall))));
+        break;
+      case "cache":
+        rows.push(ttRow("Hit rate", v != null ? fmtPct(v) : "–"),
+                  ttRow("Cache read", fmtFull(b.cr)),
+                  ttRow("Total input", fmtFull(b.inp)));
+        break;
+      case "cpk":
+        rows.push(ttRow("Cost/1K lines", v != null ? fmtUsd(v) : "–"),
+                  ttRow("Lines ±", fmtFull(b.lines)));
+        break;
+      case "agents":
+        rows.push(ttRow("Subagent share", v != null ? fmtPct(v) : "–"),
+                  ttRow("Subagent out", fmtFull(b.agentOut)),
+                  ttRow("Total out", fmtFull(b.out)));
+        break;
+      case "mix":
+        for (const [n, , get] of present)
+          if (get(b)) rows.push(ttRow(n, fmtFull(get(b))));
+        rows.push(ttRow("Total out", fmtFull(b.out)));
+        break;
+      case "comp": {
+        for (const [n, , get] of present)
+          if (get(b)) rows.push(ttRow(n, "$" + get(b).toFixed(2)));
+        const saved = (b.alt || 0) - b.cost;
+        if (saved > 0.01) rows.push(ttRow("Cache saved", "$" + saved.toFixed(2)));
+        break;
+      }
+      case "cost": {
+        const saved = (b.alt || 0) - b.cost;
+        rows.push(ttRow("Without cache", "$" + (b.alt || 0).toFixed(2)),
+                  ttRow("Cache saved", "$" + Math.max(saved, 0).toFixed(2)));
+        break;
+      }
+      default:
+        rows.push(ttRow("Output", fmtFull(b.out)), ttRow("Input", fmtFull(b.inp)));
+    }
+    rows.push(ttRow("Prompts", fmtFull(b.prompts)),
+              ttRow("Cost", fmtCost(b.cost, true).replace("~", "")));
+    tt.replaceChildren(...rows);
+    tt.style.display = "block";
+    const r = wrap.getBoundingClientRect();
+    const ev = e.touches ? e.touches[0] : e;
+    let x = (ev.clientX ?? r.left + 40) - r.left + 14, y = (ev.clientY ?? r.top + 20) - r.top - 10;
+    if (x + tt.offsetWidth > r.width) x -= tt.offsetWidth + 24;
+    tt.style.left = x + "px"; tt.style.top = y + "px";
+  };
+  const ttRow = (k, v) => { const d = el("div", "tt-row"); d.append(el("span", "k", k), el("span", "v", v)); return d; };
+  svg.addEventListener("pointermove", e => { if (e.target.classList.contains("bar-hit")) show(e); });
+  svg.addEventListener("pointerleave", () => { tt.style.display = "none"; svg.querySelectorAll(".bar.hot").forEach(x => x.classList.remove("hot")); });
+  svg.addEventListener("focusin", e => { if (e.target.classList.contains("bar-hit")) show(e); });
+  wrap.append(svg);
+}
+
+/* ---------- table ---------- */
+const COLS = [
+  { k: "ts", label: "Time" },
+  { k: "project", label: "Project" },
+  { k: "text", label: "Prompt" },
+  { k: "models", label: "Models" },
+  { k: "inp", label: "Input", num: true },
+  { k: "out", label: "Output", num: true },
+  { k: "tools", label: "Tools", num: true },
+  { k: "agents", label: "Agents", num: true },
+  { k: "files", label: "Files", num: true },
+  { k: "lines", label: "Lines ±", num: true },
+  { k: "cost", label: "Cost", num: true },
+  { k: "wall_s", label: "Time to done", num: true },
+];
+const sortVal = (r, k) => {
+  if (k === "models") return r.models.length;
+  if (k === "tools") return r.tools.reduce((a, t) => a + t[1], 0);
+  if (k === "agents") return r.agents.length;
+  if (k === "lines") return (r.ladd || 0) + (r.lrem || 0);
+  return r[k] ?? "";
+};
+const fmtLines = (r) => {
+  if (!r.ladd && !r.lrem) return "–";
+  return "+" + fmtC(r.ladd) + " −" + fmtC(r.lrem);
+};
+
+function renderHead() {
+  const tr = $("tbl-head"); tr.replaceChildren();
+  for (const c of COLS) {
+    const th = el("th", c.num ? "num" : null, c.label + " ");
+    if (state.sort === c.k) th.append(el("span", "arrow", state.dir < 0 ? "▼" : "▲"));
+    th.addEventListener("click", () => {
+      if (state.sort === c.k) state.dir *= -1;
+      else { state.sort = c.k; state.dir = c.k === "ts" || c.num ? -1 : 1; }
+      render();
+    });
+    tr.append(th);
+  }
+}
+
+function shortModel(m) {
+  return m.replace(/^claude-/, "").replace(/-\d{8}$/, "");
+}
+
+function appendRow(body, r) {
+    const tr = el("tr", "data-row");
+    const t = el("td", null, r.ts ? r.ts.slice(0, 16).replace("T", " ") : "–");
+    t.style.whiteSpace = "nowrap";
+    tr.append(t);
+    tr.append(el("td", "muted", r.project));
+    const tdP = el("td", "prompt"); tdP.append(el("div", "txt", r.text || "(empty)")); tr.append(tdP);
+    const tdM = el("td");
+    for (const m of r.models) {
+      const pill = el("span", "pill");
+      pill.append(el("span", "dot"), document.createTextNode(shortModel(m.model)));
+      pill.title = `${m.calls} calls · ${fmtFull(m.out)} out`;
+      tdM.append(pill);
+    }
+    tr.append(tdM);
+    const tdIn = el("td", "num", fmtC(r.inp)); tdIn.title = fmtFull(r.inp); tr.append(tdIn);
+    const tdOut = el("td", "num", fmtC(r.out)); tdOut.title = fmtFull(r.out); tr.append(tdOut);
+    tr.append(el("td", "num", String(r.tools.reduce((a, x) => a + x[1], 0))));
+    tr.append(el("td", "num", String(r.agents.length)));
+    tr.append(el("td", "num", r.files ? String(r.files) : "–"));
+    const tdL = el("td", "num", fmtLines(r));
+    tdL.title = r.chars ? fmtFull(r.chars) + " chars written" : "";
+    tr.append(tdL);
+    tr.append(el("td", "num", fmtCost(r.cost, r.est)));
+    tr.append(el("td", "num", fmtDur(r.wall_s)));
+    tr.addEventListener("click", () => toggleDetail(tr, r));
+    body.append(tr);
+    return tr;
+}
+
+function renderTable(rs) {
+  renderHead();
+  const body = $("tbl-body"); body.replaceChildren();
+  $("empty").hidden = rs.length > 0;
+  const sorted = [...rs].sort((a, b) => {
+    const va = sortVal(a, state.sort), vb = sortVal(b, state.sort);
+    return (va < vb ? -1 : va > vb ? 1 : 0) * state.dir;
+  });
+  if (!state.group) {
+    for (const r of sorted.slice(0, 500)) appendRow(body, r);
+    return;
+  }
+  // group by project, groups ordered by total cost; header row = subtotals,
+  // click a header to collapse/expand its rows
+  const groups = new Map();
+  for (const r of sorted) {
+    if (!groups.has(r.project)) groups.set(r.project, []);
+    groups.get(r.project).push(r);
+  }
+  const order = [...groups.entries()].sort((a, b) =>
+    b[1].reduce((s, r) => s + r.cost, 0) - a[1].reduce((s, r) => s + r.cost, 0));
+  for (const [proj, list] of order) {
+    const sum = (k) => list.reduce((s, r) => s + (r[k] || 0), 0);
+    const gtr = el("tr", "group-row");
+    const first = el("td", null, proj + " ");
+    first.colSpan = 4;
+    first.append(el("span", "cnt", "— " + list.length + " prompts"));
+    gtr.append(first);
+    gtr.append(el("td", "num", fmtC(sum("inp"))));
+    gtr.append(el("td", "num", fmtC(sum("out"))));
+    gtr.append(el("td", "num", fmtFull(list.reduce((s, r) => s + r.tools.reduce((a, t) => a + t[1], 0), 0))));
+    gtr.append(el("td", "num", fmtFull(list.reduce((s, r) => s + r.agents.length, 0))));
+    gtr.append(el("td", "num", fmtFull(sum("files"))));
+    gtr.append(el("td", "num", "+" + fmtC(sum("ladd")) + " −" + fmtC(sum("lrem"))));
+    gtr.append(el("td", "num", fmtCost(sum("cost"), list.some(r => r.est))));
+    gtr.append(el("td", "num", fmtDur(sum("wall_s"))));
+    body.append(gtr);
+    const rowEls = list.slice(0, 200).map(r => appendRow(body, r));
+    gtr.addEventListener("click", () => {
+      const hide = rowEls[0] && rowEls[0].style.display !== "none";
+      for (const e2 of rowEls) {
+        e2.style.display = hide ? "none" : "";
+        const sib = e2.nextSibling;
+        if (sib && sib.classList && sib.classList.contains("detail-row"))
+          sib.style.display = hide ? "none" : "";
+      }
+    });
+  }
+}
+
+/* ---------- CSV export of the current filtered view ---------- */
+function exportCsv() {
+  const rs = [...filtered()].sort((a, b) => {
+    const va = sortVal(a, state.sort), vb = sortVal(b, state.sort);
+    return (va < vb ? -1 : va > vb ? 1 : 0) * state.dir;
+  });
+  const esc = (v) => {
+    const s = String(v ?? "");
+    return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const head = ["time", "project", "prompt", "models", "api_calls",
+                "input_tokens", "output_tokens", "cache_read_tokens",
+                "tool_calls", "subagents", "files_changed", "lines_added",
+                "lines_removed", "chars_written", "cost_usd", "cost_estimated",
+                "duration_s", "cost_cache_read", "cost_cache_write",
+                "cost_output", "cost_uncached_input", "cost_without_cache"];
+  const lines = [head.join(",")];
+  for (const r of rs) {
+    lines.push([
+      r.ts, r.project, esc(r.text),
+      esc(r.models.map(m => shortModel(m.model)).join("; ")),
+      r.api_calls, r.inp, r.out, r.cr || 0,
+      r.tools.reduce((a, t) => a + t[1], 0), r.agents.length,
+      r.files, r.ladd, r.lrem, r.chars,
+      r.cost, r.est ? 1 : 0, r.wall_s ?? "",
+      ...(r.comp || [0, 0, 0, 0]), r.alt ?? "",
+    ].map(esc).join(","));
+  }
+  const blob = new Blob([lines.join("\r\n")], { type: "text/csv" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "claude-usage-" + new Date().toISOString().slice(0, 10) + ".csv";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function donutSvg(comp, total) {
+  const ns = "http://www.w3.org/2000/svg";
+  const size = 116, c = size / 2, R = 52, r0 = 33;
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", `0 0 ${size} ${size}`);
+  svg.setAttribute("width", size); svg.setAttribute("height", size);
+  const pt = (rad, ang) => [c + rad * Math.cos(ang), c + rad * Math.sin(ang)];
+  let a = -Math.PI / 2;
+  comp.forEach((v, i) => {
+    if (v <= 0) return;
+    const [name, slot] = COMP[i];
+    const frac = Math.min(v / total, 1);
+    const p = document.createElementNS(ns, "path");
+    if (frac > 0.999) {                       // lone slice: full ring
+      p.setAttribute("d",
+        `M${c},${c - R} A${R},${R} 0 1 1 ${c - 0.01},${c - R} Z ` +
+        `M${c},${c - r0} A${r0},${r0} 0 1 0 ${c - 0.01},${c - r0} Z`);
+      p.setAttribute("fill-rule", "evenodd");
+    } else {
+      const a2 = a + frac * 2 * Math.PI;
+      const large = frac > 0.5 ? 1 : 0;
+      const [x1, y1] = pt(R, a), [x2, y2] = pt(R, a2);
+      const [x3, y3] = pt(r0, a2), [x4, y4] = pt(r0, a);
+      p.setAttribute("d",
+        `M${x1},${y1} A${R},${R} 0 ${large} 1 ${x2},${y2} ` +
+        `L${x3},${y3} A${r0},${r0} 0 ${large} 0 ${x4},${y4} Z`);
+      a = a2;
+    }
+    p.setAttribute("class", "fill-s" + slot);
+    p.style.stroke = "var(--surface-1)";      // 2px surface gap between slices
+    p.style.strokeWidth = "2";
+    const t = document.createElementNS(ns, "title");
+    t.textContent = `${name}: $${v.toFixed(2)} (${(100 * v / total).toFixed(0)}%)`;
+    p.append(t);
+    svg.append(p);
+  });
+  const txt = document.createElementNS(ns, "text");
+  txt.setAttribute("x", c); txt.setAttribute("y", c + 4);
+  txt.setAttribute("text-anchor", "middle");
+  txt.style.fill = "var(--text-primary)";
+  txt.style.font = "600 13px system-ui, sans-serif";
+  txt.textContent = "$" + (total >= 10 ? total.toFixed(0) : total.toFixed(2));
+  svg.append(txt);
+  return svg;
+}
+
+function toggleDetail(tr, r) {
+  if (tr.nextSibling && tr.nextSibling.classList.contains("detail-row")) {
+    tr.nextSibling.remove(); tr.classList.remove("open"); return;
+  }
+  tr.classList.add("open");
+  const dtr = el("tr", "detail-row");
+  const td = el("td"); td.colSpan = COLS.length;
+  const box = el("div", "detail");
+
+  const compTotal = (r.comp || []).reduce((a, v) => a + v, 0);
+  if (compTotal > 0.0005) {
+    const secC = el("div");
+    secC.append(el("h3", null, "Cost composition"));
+    const flex = el("div");
+    flex.style.cssText = "display:flex;gap:16px;align-items:center;";
+    flex.append(donutSvg(r.comp, compTotal));
+    const ct = el("table");
+    r.comp.forEach((v, i) => {
+      if (v <= 0) return;
+      const [name, slot] = COMP[i];
+      const row = el("tr");
+      const tdN = el("td");
+      tdN.append(el("span", "sw sw-s" + slot), document.createTextNode(" " + name));
+      tdN.firstChild.style.cssText = "display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;";
+      row.append(tdN,
+                 el("td", "num", "$" + v.toFixed(v >= 10 ? 1 : 2)),
+                 el("td", "num", (100 * v / compTotal).toFixed(0) + "%"));
+      ct.append(row);
+    });
+    if (r.alt > compTotal + 0.01) {
+      const row = el("tr");
+      row.append(el("td", "muted", "without caching"),
+                 el("td", "muted num", "$" + r.alt.toFixed(2)),
+                 el("td", "muted num", "−" + (100 * (r.alt - compTotal) / r.alt).toFixed(0) + "%"));
+      ct.append(row);
+    }
+    flex.append(ct);
+    secC.append(flex);
+    box.append(secC);
+  }
+
+  const secM = el("div");
+  secM.append(el("h3", null, "Per-model breakdown"));
+  const mt = el("table");
+  const hr = el("tr");
+  for (const h of ["Model", "Calls", "Input", "Output", "Cache read", "Cache write", "Cost"])
+    hr.append(el("th", null, h));
+  mt.append(hr);
+  for (const m of r.models) {
+    const row = el("tr");
+    row.append(el("td", null, shortModel(m.model)));
+    for (const v of [fmtFull(m.calls), fmtFull(m.in), fmtFull(m.out), fmtFull(m.cr), fmtFull(m.cw)])
+      row.append(el("td", "num", v));
+    row.append(el("td", "num", fmtCost(m.cost, r.est)));
+    mt.append(row);
+  }
+  secM.append(mt); box.append(secM);
+
+  if (r.file_list && r.file_list.length) {
+    const secF = el("div");
+    secF.append(el("h3", null, "Files changed (" + fmtFull(r.chars) + " chars)"));
+    const ft = el("table");
+    const fh = el("tr");
+    for (const h of ["File", "+", "−"]) fh.append(el("th", null, h));
+    ft.append(fh);
+    for (const [path, a, d] of r.file_list) {
+      const row = el("tr");
+      const parts = String(path).split(/[\\/]/);
+      const short = parts.slice(-3).join("/");
+      const tdF = el("td", null, short); tdF.title = path;
+      row.append(tdF, el("td", "num", "+" + fmtFull(a)), el("td", "num", "−" + fmtFull(d)));
+      ft.append(row);
+    }
+    if (r.files > r.file_list.length)
+      ft.append(el("tr")).appendChild(el("td", "muted", "… " + (r.files - r.file_list.length) + " more"));
+    secF.append(ft); box.append(secF);
+  }
+  if (r.tools.length) {
+    const secT = el("div");
+    secT.append(el("h3", null, "Tool calls"));
+    const tt = el("table");
+    for (const [name, n] of r.tools.slice(0, 15)) {
+      const row = el("tr");
+      row.append(el("td", null, name), el("td", "num", String(n)));
+      tt.append(row);
+    }
+    secT.append(tt); box.append(secT);
+  }
+  if (r.agents.length) {
+    const secA = el("div");
+    secA.append(el("h3", null, "Subagents"));
+    for (const a of r.agents) secA.append(el("div", "muted", a.replace(/^agent-/, "")));
+    box.append(secA);
+  }
+  td.append(box); dtr.append(td);
+  tr.after(dtr);
+}
+
+/* ---------- render ---------- */
+function render() {
+  const rs = filtered();
+  renderTiles(rs);
+  renderChart(rs);
+  renderTable(rs);
+}
+
+$("generated-at").textContent = "generated " + (DATA.generated_at || "").replace("T", " ").slice(0, 16);
+initFilters();
+renderWindow();
+render();
+addEventListener("resize", () => renderChart(filtered()));
+</script>
+</body>
+</html>
