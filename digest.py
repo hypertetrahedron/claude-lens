@@ -151,9 +151,9 @@ def build_digest(now=None):
     period = f"{start.date()} – {(end - timedelta(days=1)).date()}"
     doc = f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Claude Code digest {period}</title><style>{CSS}</style></head><body>
+<title>Claude Lens digest {period}</title><style>{CSS}</style></head><body>
 <div class="wrap">
-<h1>Claude Code weekly digest</h1>
+<h1>Claude Lens weekly digest</h1>
 <div class="sub">{period} (UTC) · generated {now.strftime('%Y-%m-%d %H:%M')} ·
 <a href="index.html">all digests</a></div>
 <div class="tiles">{tiles}</div>
@@ -181,8 +181,8 @@ def rebuild_index():
     items = "".join(f"<tr><td><a href='{html.escape(f)}'>{html.escape(f[:-5])}</a></td></tr>"
                     for f in files)
     doc = f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
-<title>Claude Code digests</title><style>{CSS}</style></head><body>
-<div class="wrap"><h1>Weekly digests</h1><div class="sub">{len(files)} reports</div>
+<title>Claude Lens digests</title><style>{CSS}</style></head><body>
+<div class="wrap"><h1>Claude Lens — weekly digests</h1><div class="sub">{len(files)} reports</div>
 <table><tr><th>Digest</th></tr>{items}</table></div></body></html>"""
     with open(os.path.join(REPORTS, "index.html"), "w", encoding="utf-8") as f:
         f.write(doc)

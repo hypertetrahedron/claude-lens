@@ -123,8 +123,14 @@ available; cost views show the "without caching" counterfactual.
 - **Per-prompt detail** (click a row) — cost-composition donut + table,
   per-model breakdown, files changed with lines +/−, tool-call histogram,
   subagents.
+- **Configurable columns** — the ⚙ button opens a panel to add, remove, and
+  reorder table columns (persisted). Beyond the defaults, opt-in columns
+  include per-prompt derived metrics: tokens/min and lines/min (over the
+  prompt's own duration), cache hit %, cost per 1K lines, subagent share,
+  cost without caching, API calls, cache-read tokens, chars written.
 - **Group by project** — subtotal header rows, ordered by cost, click to
-  collapse.
+  collapse; subtotals follow the configured columns (rates aggregate at the
+  group level).
 - **Export CSV** — the current filtered/sorted view, incl. cost components.
 - **Auto-refresh** — the page reloads every 5 minutes; filters, chart choice,
   and grouping persist (localStorage). Light/dark theme with toggle.
@@ -136,6 +142,24 @@ Edit/Write tool results leave in transcripts (subagent edits included).
 Changes made via Bash (git operations, scripts, generators) leave no diff in
 transcripts and aren't counted. These columns update on ingest/reconcile, not
 via OTel (its tool events carry no diffs).
+
+## Database versioning
+
+The schema version lives in SQLite's `PRAGMA user_version`. Databases created
+before version tracking (user_version 0) are treated as **v1**. Every entry
+point opens the DB through `db.connect()`, which runs any pending migrations
+automatically — updating an older instance "just works" on the next run; a
+database *newer* than the code refuses to open with a clear error.
+
+**Contributors:** any schema change must ship as a `_migrate_to_N()` function
+registered in `MIGRATIONS` in `db.py`, bump `SCHEMA_VERSION`, update the
+`CREATE TABLE` statements to match (fresh databases are created current), and
+add a changelog line in `db.py` and below.
+
+| Version | Change |
+|---|---|
+| 1 | Initial schema |
+| 2 | `tool_calls.detail` (skill names); transcript-derived tool names upgrade generic live-telemetry rows (`mcp_tool` → `mcp__server__tool`); one-time transcript re-parse to backfill |
 
 ## Known limitations
 
