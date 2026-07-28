@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="300">
-<title>Claude Code Usage</title>
+<title>Claude Lens</title>
 <style>
   :root {
     color-scheme: light;
@@ -137,6 +137,26 @@
   }
   .btn:hover { background: var(--hover-wash); }
   .btn[aria-pressed="true"] { color: var(--text-primary); font-weight: 600; }
+  .head-right { position: relative; display: inline-flex; gap: 8px; }
+  #col-panel {
+    position: absolute; right: 0; top: calc(100% + 6px); z-index: 30;
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 10px; box-shadow: 0 6px 22px rgba(0,0,0,0.25);
+    padding: 10px 12px; min-width: 240px; max-height: 420px; overflow-y: auto;
+    font-size: 13px;
+  }
+  #col-panel h4 { margin: 6px 0 4px; font-size: 11px; color: var(--text-muted);
+    text-transform: uppercase; letter-spacing: .04em; font-weight: 600; }
+  .col-row { display: flex; align-items: center; gap: 6px; padding: 2px 0; }
+  .col-row label { flex: 1; cursor: pointer; }
+  .col-row .mv {
+    background: none; border: none; color: var(--text-muted); cursor: pointer;
+    padding: 0 3px; font-size: 12px;
+  }
+  .col-row .mv:hover { color: var(--text-primary); }
+  .col-row .mv:disabled { opacity: .25; cursor: default; }
+  #col-panel .panel-foot { display: flex; justify-content: space-between; gap: 8px;
+    margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--grid); }
 
   #tooltip {
     position: absolute; pointer-events: none; z-index: 10; display: none;
@@ -190,7 +210,7 @@
 <body>
 <div class="wrap">
   <header>
-    <h1>Claude Code Usage</h1>
+    <h1>Claude Lens</h1>
     <span class="sub" id="generated-at"></span>
     <span class="spacer"></span>
     <button id="theme-btn" type="button">Theme</button>
@@ -240,7 +260,11 @@
   <div class="card">
     <div class="card-head">
       <button class="btn" id="group-btn" type="button" aria-pressed="false">Group by project</button>
-      <button class="btn" id="csv-btn" type="button">Export CSV</button>
+      <span class="head-right">
+        <button class="btn" id="csv-btn" type="button">Export CSV</button>
+        <button class="btn" id="cols-btn" type="button" title="Configure columns" aria-label="Configure columns" aria-expanded="false">⚙</button>
+        <div id="col-panel" hidden></div>
+      </span>
     </div>
     <div class="tbl-scroll">
       <table id="tbl">
@@ -303,10 +327,11 @@ const dayOf = (iso) => iso ? iso.slice(0, 10) : "";
 const saved = (() => { try { return JSON.parse(localStorage.getItem("ccu-state")) || {}; } catch { return {}; } })();
 const state = { range: saved.range ?? 30, project: saved.project || "all",
                 model: saved.model || "all", q: "", sort: "ts", dir: -1,
-                chart: saved.chart || "out", group: !!saved.group };
+                chart: saved.chart || "out", group: !!saved.group,
+                cols: saved.cols };
 const persist = () => localStorage.setItem("ccu-state", JSON.stringify(
   { range: state.range, project: state.project, model: state.model,
-    chart: state.chart, group: state.group }));
+    chart: state.chart, group: state.group, cols: state.cols }));
 const rows = DATA.rows;
 
 function initFilters() {
@@ -350,6 +375,7 @@ function initFilters() {
     persist(); renderTable(filtered());
   });
   $("csv-btn").addEventListener("click", exportCsv);
+  initColPanel();
 }
 
 function filtered() {
@@ -644,35 +670,122 @@ function renderChart(rs) {
 }
 
 /* ---------- table ---------- */
-const COLS = [
-  { k: "ts", label: "Time" },
-  { k: "project", label: "Project" },
-  { k: "text", label: "Prompt" },
-  { k: "models", label: "Models" },
-  { k: "inp", label: "Input", num: true },
-  { k: "out", label: "Output", num: true },
-  { k: "tools", label: "Tools", num: true },
-  { k: "agents", label: "Agents", num: true },
-  { k: "files", label: "Files", num: true },
-  { k: "lines", label: "Lines ±", num: true },
-  { k: "cost", label: "Cost", num: true },
-  { k: "wall_s", label: "Time to done", num: true },
-];
-const sortVal = (r, k) => {
-  if (k === "models") return r.models.length;
-  if (k === "tools") return r.tools.reduce((a, t) => a + t[1], 0);
-  if (k === "agents") return r.agents.length;
-  if (k === "lines") return (r.ladd || 0) + (r.lrem || 0);
-  return r[k] ?? "";
-};
 const fmtLines = (r) => {
   if (!r.ladd && !r.lrem) return "–";
   return "+" + fmtC(r.ladd) + " −" + fmtC(r.lrem);
 };
+const toolN = (r) => r.tools.reduce((a, t) => a + t[1], 0);
+const lineN = (r) => (r.ladd || 0) + (r.lrem || 0);
+// derived per-prompt rates: over THIS prompt's own duration/volume
+// (the chart's versions of these are per day). Guards avoid silly spikes.
+const rTpm = (r) => (r.wall_s || 0) >= 10 ? r.out / (r.wall_s / 60) : null;
+const rLpm = (r) => (r.wall_s || 0) >= 10 && lineN(r) ? lineN(r) / (r.wall_s / 60) : null;
+const rCache = (r) => r.inp > 0 ? 100 * (r.cr || 0) / r.inp : null;
+const rCpk = (r) => lineN(r) >= 10 ? r.cost / (lineN(r) / 1000) : null;
+const rAshare = (r) => r.out > 0 ? 100 * (r.agent_out || 0) / r.out : null;
+const numCell = (text, title) => {
+  const td = el("td", "num", text);
+  if (title) td.title = title;
+  return td;
+};
+const dash = (v, f) => v == null ? "–" : f(v);
+
+/* Column catalog. def:true columns form the default layout; the rest are
+   opt-in via the column-config panel. val() drives sorting; cell() renders;
+   groupVal(list) renders the group-by-project subtotal (blank if absent). */
+const COLCAT = [
+  { k: "ts", label: "Time", def: true, val: r => r.ts || "",
+    cell: r => { const t = el("td", null, r.ts ? r.ts.slice(0, 16).replace("T", " ") : "–"); t.style.whiteSpace = "nowrap"; return t; } },
+  { k: "project", label: "Project", def: true, val: r => r.project,
+    cell: r => el("td", "muted", r.project) },
+  { k: "text", label: "Prompt", def: true, val: r => r.text,
+    cell: r => { const td = el("td", "prompt"); td.append(el("div", "txt", r.text || "(empty)")); return td; } },
+  { k: "models", label: "Models", def: true, val: r => r.models.length,
+    cell: r => {
+      const td = el("td");
+      for (const m of r.models) {
+        const pill = el("span", "pill");
+        pill.append(el("span", "dot"), document.createTextNode(shortModel(m.model)));
+        pill.title = `${m.calls} calls · ${fmtFull(m.out)} out`;
+        td.append(pill);
+      }
+      return td;
+    } },
+  { k: "inp", label: "Input", num: true, def: true, val: r => r.inp,
+    cell: r => numCell(fmtC(r.inp), fmtFull(r.inp)),
+    groupVal: l => fmtC(l.reduce((s, r) => s + r.inp, 0)) },
+  { k: "out", label: "Output", num: true, def: true, val: r => r.out,
+    cell: r => numCell(fmtC(r.out), fmtFull(r.out)),
+    groupVal: l => fmtC(l.reduce((s, r) => s + r.out, 0)) },
+  { k: "tools", label: "Tools", num: true, def: true, val: toolN,
+    cell: r => numCell(String(toolN(r))),
+    groupVal: l => fmtFull(l.reduce((s, r) => s + toolN(r), 0)) },
+  { k: "agents", label: "Agents", num: true, def: true, val: r => r.agents.length,
+    cell: r => numCell(String(r.agents.length)),
+    groupVal: l => fmtFull(l.reduce((s, r) => s + r.agents.length, 0)) },
+  { k: "files", label: "Files", num: true, def: true, val: r => r.files,
+    cell: r => numCell(r.files ? String(r.files) : "–"),
+    groupVal: l => fmtFull(l.reduce((s, r) => s + (r.files || 0), 0)) },
+  { k: "lines", label: "Lines ±", num: true, def: true, val: lineN,
+    cell: r => numCell(fmtLines(r), r.chars ? fmtFull(r.chars) + " chars written" : ""),
+    groupVal: l => "+" + fmtC(l.reduce((s, r) => s + (r.ladd || 0), 0)) +
+                   " −" + fmtC(l.reduce((s, r) => s + (r.lrem || 0), 0)) },
+  { k: "cost", label: "Cost", num: true, def: true, val: r => r.cost,
+    cell: r => numCell(fmtCost(r.cost, r.est)),
+    groupVal: l => fmtCost(l.reduce((s, r) => s + r.cost, 0), l.some(r => r.est)) },
+  { k: "wall_s", label: "Time to done", num: true, def: true, val: r => r.wall_s ?? -1,
+    cell: r => numCell(fmtDur(r.wall_s)),
+    groupVal: l => fmtDur(l.reduce((s, r) => s + (r.wall_s || 0), 0)) },
+  // ---- optional / derived (per prompt) ----
+  { k: "api_calls", label: "API calls", num: true, val: r => r.api_calls,
+    cell: r => numCell(String(r.api_calls)),
+    groupVal: l => fmtFull(l.reduce((s, r) => s + r.api_calls, 0)) },
+  { k: "tpm", label: "Tokens/min", num: true, val: r => rTpm(r) ?? -1,
+    cell: r => numCell(dash(rTpm(r), fmtRate)),
+    groupVal: l => { const w = l.reduce((s, r) => s + (r.wall_s || 0), 0);
+                     return w >= 60 ? fmtRate(l.reduce((s, r) => s + r.out, 0) / (w / 60)) : ""; } },
+  { k: "lpm", label: "Lines/min", num: true, val: r => rLpm(r) ?? -1,
+    cell: r => numCell(dash(rLpm(r), fmtRate)),
+    groupVal: l => { const w = l.reduce((s, r) => s + (r.wall_s || 0), 0);
+                     return w >= 60 ? fmtRate(l.reduce((s, r) => s + lineN(r), 0) / (w / 60)) : ""; } },
+  { k: "cache", label: "Cache hit %", num: true, val: r => rCache(r) ?? -1,
+    cell: r => numCell(dash(rCache(r), fmtPct)),
+    groupVal: l => { const i = l.reduce((s, r) => s + r.inp, 0);
+                     return i > 0 ? fmtPct(100 * l.reduce((s, r) => s + (r.cr || 0), 0) / i) : ""; } },
+  { k: "cpk", label: "Cost/1K lines", num: true, val: r => rCpk(r) ?? -1,
+    cell: r => numCell(dash(rCpk(r), fmtUsd)),
+    groupVal: l => { const n = l.reduce((s, r) => s + lineN(r), 0);
+                     return n >= 50 ? fmtUsd(l.reduce((s, r) => s + r.cost, 0) / (n / 1000)) : ""; } },
+  { k: "ashare", label: "Subagent %", num: true, val: r => rAshare(r) ?? -1,
+    cell: r => numCell(dash(rAshare(r), fmtPct)),
+    groupVal: l => { const o = l.reduce((s, r) => s + r.out, 0);
+                     return o > 0 ? fmtPct(100 * l.reduce((s, r) => s + (r.agent_out || 0), 0) / o) : ""; } },
+  { k: "alt", label: "Cost w/o cache", num: true, val: r => r.alt || 0,
+    cell: r => numCell(fmtUsd(r.alt || 0)),
+    groupVal: l => fmtUsd(l.reduce((s, r) => s + (r.alt || 0), 0)) },
+  { k: "cr", label: "Cache read", num: true, val: r => r.cr || 0,
+    cell: r => numCell(fmtC(r.cr || 0), fmtFull(r.cr || 0)),
+    groupVal: l => fmtC(l.reduce((s, r) => s + (r.cr || 0), 0)) },
+  { k: "chars", label: "Chars written", num: true, val: r => r.chars || 0,
+    cell: r => numCell(fmtC(r.chars || 0), fmtFull(r.chars || 0)),
+    groupVal: l => fmtC(l.reduce((s, r) => s + (r.chars || 0), 0)) },
+];
+const COL_BY_KEY = Object.fromEntries(COLCAT.map(c => [c.k, c]));
+const DEFAULT_COLS = COLCAT.filter(c => c.def).map(c => c.k);
+if (!Array.isArray(state.cols) || !state.cols.length ||
+    !state.cols.every(k => COL_BY_KEY[k]))
+  state.cols = state.cols && Array.isArray(state.cols)
+    ? state.cols.filter(k => COL_BY_KEY[k]) : null;
+if (!state.cols || !state.cols.length) state.cols = [...DEFAULT_COLS];
+const visibleCols = () => state.cols.map(k => COL_BY_KEY[k]).filter(Boolean);
+const sortVal = (r, k) => {
+  const c = COL_BY_KEY[k];
+  return c ? c.val(r) : (r[k] ?? "");
+};
 
 function renderHead() {
   const tr = $("tbl-head"); tr.replaceChildren();
-  for (const c of COLS) {
+  for (const c of visibleCols()) {
     const th = el("th", c.num ? "num" : null, c.label + " ");
     if (state.sort === c.k) th.append(el("span", "arrow", state.dir < 0 ? "▼" : "▲"));
     th.addEventListener("click", () => {
@@ -690,29 +803,7 @@ function shortModel(m) {
 
 function appendRow(body, r) {
     const tr = el("tr", "data-row");
-    const t = el("td", null, r.ts ? r.ts.slice(0, 16).replace("T", " ") : "–");
-    t.style.whiteSpace = "nowrap";
-    tr.append(t);
-    tr.append(el("td", "muted", r.project));
-    const tdP = el("td", "prompt"); tdP.append(el("div", "txt", r.text || "(empty)")); tr.append(tdP);
-    const tdM = el("td");
-    for (const m of r.models) {
-      const pill = el("span", "pill");
-      pill.append(el("span", "dot"), document.createTextNode(shortModel(m.model)));
-      pill.title = `${m.calls} calls · ${fmtFull(m.out)} out`;
-      tdM.append(pill);
-    }
-    tr.append(tdM);
-    const tdIn = el("td", "num", fmtC(r.inp)); tdIn.title = fmtFull(r.inp); tr.append(tdIn);
-    const tdOut = el("td", "num", fmtC(r.out)); tdOut.title = fmtFull(r.out); tr.append(tdOut);
-    tr.append(el("td", "num", String(r.tools.reduce((a, x) => a + x[1], 0))));
-    tr.append(el("td", "num", String(r.agents.length)));
-    tr.append(el("td", "num", r.files ? String(r.files) : "–"));
-    const tdL = el("td", "num", fmtLines(r));
-    tdL.title = r.chars ? fmtFull(r.chars) + " chars written" : "";
-    tr.append(tdL);
-    tr.append(el("td", "num", fmtCost(r.cost, r.est)));
-    tr.append(el("td", "num", fmtDur(r.wall_s)));
+    for (const c of visibleCols()) tr.append(c.cell(r));
     tr.addEventListener("click", () => toggleDetail(tr, r));
     body.append(tr);
     return tr;
@@ -740,20 +831,19 @@ function renderTable(rs) {
   const order = [...groups.entries()].sort((a, b) =>
     b[1].reduce((s, r) => s + r.cost, 0) - a[1].reduce((s, r) => s + r.cost, 0));
   for (const [proj, list] of order) {
-    const sum = (k) => list.reduce((s, r) => s + (r[k] || 0), 0);
     const gtr = el("tr", "group-row");
+    const cols = visibleCols();
+    // label cell spans the leading columns that have no subtotal
+    let firstSub = cols.findIndex(c => c.groupVal);
+    if (firstSub === -1) firstSub = cols.length;
+    const span = Math.max(firstSub, 1);
     const first = el("td", null, proj + " ");
-    first.colSpan = 4;
+    first.colSpan = span;
     first.append(el("span", "cnt", "— " + list.length + " prompts"));
     gtr.append(first);
-    gtr.append(el("td", "num", fmtC(sum("inp"))));
-    gtr.append(el("td", "num", fmtC(sum("out"))));
-    gtr.append(el("td", "num", fmtFull(list.reduce((s, r) => s + r.tools.reduce((a, t) => a + t[1], 0), 0))));
-    gtr.append(el("td", "num", fmtFull(list.reduce((s, r) => s + r.agents.length, 0))));
-    gtr.append(el("td", "num", fmtFull(sum("files"))));
-    gtr.append(el("td", "num", "+" + fmtC(sum("ladd")) + " −" + fmtC(sum("lrem"))));
-    gtr.append(el("td", "num", fmtCost(sum("cost"), list.some(r => r.est))));
-    gtr.append(el("td", "num", fmtDur(sum("wall_s"))));
+    for (const c of cols.slice(span)) {
+      gtr.append(el("td", "num", c.groupVal ? c.groupVal(list) : ""));
+    }
     body.append(gtr);
     const rowEls = list.slice(0, 200).map(r => appendRow(body, r));
     gtr.addEventListener("click", () => {
@@ -766,6 +856,92 @@ function renderTable(rs) {
       }
     });
   }
+}
+
+/* ---------- column configuration panel ---------- */
+function renderColPanel() {
+  const panel = $("col-panel");
+  panel.replaceChildren();
+  const move = (k, dir) => {
+    const i = state.cols.indexOf(k);
+    const j = i + dir;
+    if (i < 0 || j < 0 || j >= state.cols.length) return;
+    [state.cols[i], state.cols[j]] = [state.cols[j], state.cols[i]];
+    persist(); renderColPanel(); renderTable(filtered());
+  };
+  const toggle = (k, on) => {
+    if (on) { if (!state.cols.includes(k)) state.cols.push(k); }
+    else {
+      state.cols = state.cols.filter(x => x !== k);
+      if (!state.cols.length) state.cols = ["text"];   // never fully empty
+    }
+    persist(); renderColPanel(); renderTable(filtered());
+  };
+  const rowFor = (c, visible, idx) => {
+    const row = el("div", "col-row");
+    const cb = el("input");
+    cb.type = "checkbox"; cb.checked = visible; cb.id = "colcb-" + c.k;
+    cb.addEventListener("change", () => toggle(c.k, cb.checked));
+    const lab = el("label", null, c.label);
+    lab.htmlFor = cb.id;
+    row.append(cb, lab);
+    if (visible) {
+      const up = el("button", "mv", "▲"); up.type = "button";
+      up.title = "Move left"; up.disabled = idx === 0;
+      up.addEventListener("click", () => move(c.k, -1));
+      const dn = el("button", "mv", "▼"); dn.type = "button";
+      dn.title = "Move right"; dn.disabled = idx === state.cols.length - 1;
+      dn.addEventListener("click", () => move(c.k, 1));
+      row.append(up, dn);
+    }
+    return row;
+  };
+  panel.append(el("h4", null, "Shown (order = left to right)"));
+  visibleCols().forEach((c, i) => panel.append(rowFor(c, true, i)));
+  const hidden = COLCAT.filter(c => !state.cols.includes(c.k));
+  if (hidden.length) {
+    panel.append(el("h4", null, "Available"));
+    for (const c of hidden) panel.append(rowFor(c, false, -1));
+  }
+  const foot = el("div", "panel-foot");
+  const reset = el("button", "btn", "Reset");
+  reset.type = "button";
+  reset.addEventListener("click", () => {
+    state.cols = [...DEFAULT_COLS];
+    persist(); renderColPanel(); renderTable(filtered());
+  });
+  const done = el("button", "btn", "Done");
+  done.type = "button";
+  done.addEventListener("click", closeColPanel);
+  foot.append(reset, done);
+  panel.append(foot);
+}
+function closeColPanel() {
+  $("col-panel").hidden = true;
+  $("cols-btn").setAttribute("aria-expanded", "false");
+}
+function initColPanel() {
+  $("cols-btn").addEventListener("click", (e) => {
+    e.stopPropagation();
+    const panel = $("col-panel");
+    if (panel.hidden) {
+      renderColPanel();
+      panel.hidden = false;
+      $("cols-btn").setAttribute("aria-expanded", "true");
+    } else {
+      closeColPanel();
+    }
+  });
+  document.addEventListener("click", (e) => {
+    const panel = $("col-panel");
+    if (panel.hidden) return;
+    // Use the propagation path captured at dispatch time: clicking an arrow or
+    // checkbox rebuilds the panel, detaching the clicked node before this
+    // handler runs — panel.contains(e.target) would wrongly report "outside".
+    const path = e.composedPath();
+    if (!path.includes(panel) && !path.includes($("cols-btn")))
+      closeColPanel();
+  });
 }
 
 /* ---------- CSV export of the current filtered view ---------- */
@@ -856,7 +1032,7 @@ function toggleDetail(tr, r) {
   }
   tr.classList.add("open");
   const dtr = el("tr", "detail-row");
-  const td = el("td"); td.colSpan = COLS.length;
+  const td = el("td"); td.colSpan = visibleCols().length;
   const box = el("div", "detail");
 
   const compTotal = (r.comp || []).reduce((a, v) => a + v, 0);
