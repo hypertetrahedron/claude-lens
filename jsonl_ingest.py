@@ -66,8 +66,14 @@ def handle_assistant(con, entry, prompt_id, session_id, agent=None):
     ts = entry.get("timestamp")
     for blk in msg.get("content") or []:
         if isinstance(blk, dict) and blk.get("type") == "tool_use" and blk.get("id"):
+            name = blk.get("name", "?")
+            detail = None
+            if name == "Skill":
+                inp = blk.get("input")
+                if isinstance(inp, dict):
+                    detail = inp.get("skill")
             db.insert_tool_call(con, blk["id"], prompt_id, session_id, ts,
-                                blk.get("name", "?"), agent, "jsonl")
+                                name, agent, "jsonl", detail=detail)
     usage = msg.get("usage")
     rid = entry.get("requestId")
     if not usage or not rid:
