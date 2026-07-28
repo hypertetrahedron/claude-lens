@@ -173,11 +173,12 @@ def collect(con):
         if dt and dt >= window_cutoff:
             recent.append((dt, out or 0, cost))
 
-    for tuid, pid, name, agent in con.execute(
-            "SELECT tool_use_id, prompt_id, tool_name, agent_name FROM tool_calls "
-            "WHERE prompt_id IS NOT NULL"):
+    for tuid, pid, name, agent, detail in con.execute(
+            "SELECT tool_use_id, prompt_id, tool_name, agent_name, detail "
+            "FROM tool_calls WHERE prompt_id IS NOT NULL"):
         r = bucket(pid)
-        r["tools"][name or "?"] += 1
+        display = f"Skill:{detail}" if (name == "Skill" and detail) else (name or "?")
+        r["tools"][display] += 1
         if agent:
             r["agents"].add(agent)
 

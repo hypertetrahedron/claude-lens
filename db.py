@@ -13,6 +13,28 @@ import sqlite3
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics.db")
 
+# ---------------------------------------------------------------------------
+# Schema versioning (stored in SQLite's PRAGMA user_version).
+#
+# A database with user_version 0 predates version tracking and is treated as
+# VERSION 1. connect() migrates any older database up to SCHEMA_VERSION before
+# returning, so every entry point (ingester, receiver, dashboard, digest) is
+# covered automatically.
+#
+# To change the schema: add a _migrate_to_N() function, register it in
+# MIGRATIONS, bump SCHEMA_VERSION, update the CREATE TABLE statements below to
+# match (fresh databases are created current and stamped directly), and add a
+# line to the changelog here and in README.md.
+#
+# Version changelog:
+#   1 — initial schema (implicit; user_version 0)
+#   2 — tool_calls.detail column (skill name for Skill calls); tool-name
+#       upserts so transcript-derived specifics (mcp__server__tool, skill
+#       names) upgrade generic live-telemetry rows; clears ingest_state to
+#       force a one-time transcript re-parse that backfills both.
+# ---------------------------------------------------------------------------
+SCHEMA_VERSION = 2
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS prompts (
     prompt_id     TEXT PRIMARY KEY,
@@ -49,7 +71,8 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     ts          TEXT,
     tool_name   TEXT,
     agent_name  TEXT,
-    source      TEXT
+    source      TEXT,
+    detail      TEXT
 );
 CREATE TABLE IF NOT EXISTS edits (
     tool_use_id  TEXT PRIMARY KEY,
@@ -81,13 +104,44 @@ CREATE INDEX IF NOT EXISTS idx_prompt_ts ON prompts(ts);
 """
 
 
+def _migrate_to_2(con):
+    """tool_calls.detail + one-time re-parse to backfill skill/MCP names."""
+    cols = [r[1] for r in con.execute("PRAGMA table_info(tool_calls)")]
+    if "detail" not in cols:
+        con.execute("ALTER TABLE tool_calls ADD COLUMN detail TEXT")
+    con.execute("DELETE FROM ingest_state")
+
+
+MIGRATIONS = {2: _migrate_to_2}
+
+
 def connect(path=DB_PATH, cross_thread=False):
     # cross_thread=True is safe only when the caller serializes all access
     # (the receiver guards every use with a lock).
     con = sqlite3.connect(path, timeout=30, check_same_thread=not cross_thread)
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
+    fresh = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='prompts'"
+    ).fetchone() is None
     con.executescript(SCHEMA)
+    if fresh:
+        con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        con.commit()
+        return con
+    version = con.execute("PRAGMA user_version").fetchone()[0]
+    if version == 0:
+        version = 1  # databases from before version tracking
+    if version > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"metrics.db is schema v{version} but this code only knows "
+            f"v{SCHEMA_VERSION} — update the project before running.")
+    while version < SCHEMA_VERSION:
+        version += 1
+        MIGRATIONS[version](con)
+        con.execute(f"PRAGMA user_version = {version}")
+        con.commit()
+        print(f"metrics.db migrated to schema v{version}")
     return con
 
 
@@ -129,12 +183,22 @@ def upsert_request(con, row, source):
 
 
 def insert_tool_call(con, tool_use_id, prompt_id, session_id, ts, tool_name,
-                     agent_name, source):
+                     agent_name, source, detail=None):
+    # OTel tool_result events name MCP calls generically ('mcp_tool') and know
+    # nothing of skill names; the transcript carries the specifics. On conflict,
+    # let a specific name upgrade the generic one and fill a missing detail.
     con.execute(
-        """INSERT OR IGNORE INTO tool_calls
-           (tool_use_id, prompt_id, session_id, ts, tool_name, agent_name, source)
-           VALUES (?,?,?,?,?,?,?)""",
-        (tool_use_id, prompt_id, session_id, ts, tool_name, agent_name, source),
+        """INSERT INTO tool_calls
+           (tool_use_id, prompt_id, session_id, ts, tool_name, agent_name, source, detail)
+           VALUES (?,?,?,?,?,?,?,?)
+           ON CONFLICT(tool_use_id) DO UPDATE SET
+             tool_name = CASE
+               WHEN tool_calls.tool_name = 'mcp_tool'
+                    AND excluded.tool_name LIKE 'mcp__%'
+               THEN excluded.tool_name ELSE tool_calls.tool_name END,
+             detail = COALESCE(tool_calls.detail, excluded.detail)""",
+        (tool_use_id, prompt_id, session_id, ts, tool_name, agent_name, source,
+         detail),
     )
 
 
