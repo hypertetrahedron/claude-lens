@@ -7,6 +7,7 @@ in the template. `collect()` is shared with digest.py.
 """
 import json
 import os
+import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -21,12 +22,50 @@ MAX_TEXT = 400
 WINDOW_HOURS = 5          # Anthropic rate-limit window length
 WINDOW_LOOKBACK_H = 36    # how far back to scan when locating the current window
 
+# Models seen during the last collect() that pricing.py has no entry for,
+# as {model: {"rows", "uncosted_rows", "tokens"}}. A new model launch lands
+# here: backfilled rows fall back to $0.00 and OTel rows keep their reported
+# total but lose the cost-composition split, so both under-report silently
+# unless we say something. Populated by collect(), reported by warn_unpriced().
+UNPRICED = {}
+
 
 def parse_ts(ts):
     try:
         return datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return None
+
+
+def note_unpriced(model, tokens, uncosted):
+    e = UNPRICED.setdefault(model or "?",
+                            {"rows": 0, "uncosted_rows": 0, "tokens": 0})
+    e["rows"] += 1
+    e["uncosted_rows"] += int(uncosted)
+    e["tokens"] += tokens
+
+
+def warn_unpriced(stream=sys.stderr):
+    """Print a warning for unpriced models that actually billed tokens.
+
+    Zero-token entries are placeholders rather than real models (Claude Code
+    writes '<synthetic>' rows for harness-generated turns), so they are ignored
+    to keep the warning free of false positives.
+    """
+    real = {m: e for m, e in UNPRICED.items() if e["tokens"] > 0}
+    if not real:
+        return real
+    # ASCII only: this goes to a console that may be cp1252 (Windows default).
+    print(f"WARNING: no pricing entry for {len(real)} model(s) in pricing.py.",
+          file=stream)
+    for m, e in sorted(real.items(), key=lambda kv: -kv[1]["tokens"]):
+        note = (f", {e['uncosted_rows']:,} counted as $0.00"
+                if e["uncosted_rows"] else ", cost breakdown omitted")
+        print(f"  {m:<28} {e['rows']:>6,} rows, "
+              f"{e['tokens'] / 1e6:.1f}M tokens{note}", file=stream)
+    print("  Add them to PRICES; the next build reprices all history.",
+          file=stream)
+    return real
 
 
 def resolve_map(con):
@@ -67,6 +106,7 @@ def compute_window(recent):
 
 def collect(con):
     """Aggregate the DB into per-prompt rows + current-window stats."""
+    UNPRICED.clear()
     # Display name for a project: the basename of the session's working
     # directory (portable), falling back to the transcript-folder slug.
     session_project = {}
@@ -134,9 +174,13 @@ def collect(con):
         m["calls"] += 1
         r["api_calls"] += 1
         unsplit = max((cw or 0) - (c5 or 0) - (c1 or 0), 0)
+        p = pricing.lookup(model, ts)
+        if p is None:
+            note_unpriced(model, (inp or 0) + (out or 0) + (cr or 0) + (cw or 0),
+                          uncosted=cost is None)
         if cost is None:
             cost = pricing.estimate_cost(model, inp or 0, out or 0, cr or 0,
-                                         c5 or 0, c1 or 0, unsplit)
+                                         c5 or 0, c1 or 0, unsplit, ts)
             if cost is None:
                 cost = 0.0
             r["est"] = True
@@ -144,7 +188,6 @@ def collect(con):
         r["cost"] += cost
         # Cost components from the pricing table; when the CLI reported an
         # authoritative total, scale the split so components sum to it.
-        p = pricing.lookup(model)
         if p:
             pi, po = p
             comp = [
@@ -236,6 +279,7 @@ def collect(con):
             "alt": round(r["alt"], 4),
         })
     out_rows.sort(key=lambda r: r["ts"], reverse=True)
+    warn_unpriced()
     return out_rows, compute_window(recent)
 
 
@@ -259,7 +303,11 @@ def build(con=None):
     os.replace(tmp, OUTPUT)
     if own:
         con.close()
-    return {"rows": len(out_rows), "output": OUTPUT}
+    result = {"rows": len(out_rows), "output": OUTPUT}
+    unpriced = {m: e for m, e in UNPRICED.items() if e["tokens"] > 0}
+    if unpriced:
+        result["unpriced_models"] = unpriced
+    return result
 
 
 if __name__ == "__main__":
