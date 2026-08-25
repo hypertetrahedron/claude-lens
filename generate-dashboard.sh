@@ -1,26 +1,49 @@
 #!/usr/bin/env bash
 # Generate the Claude Code usage dashboard (Linux/macOS).
 #
-# One-shot: parses every Claude Code transcript for the signed-in user
-# (~/.claude/projects, or $CLAUDE_CONFIG_DIR/projects if set) into a local
-# SQLite DB, renders dashboard.html next to this script, and opens it when a
-# desktop session is available. Re-running is incremental and always safe.
-# Requires Python 3.9+ (stdlib only).
+# One-shot: parses every Claude Code transcript it can find into a local SQLite
+# DB, renders dashboard.html and index.html next to this script, and opens the
+# dashboard when a desktop session is available. Re-running is incremental and
+# always safe. Requires Python 3.9+ (stdlib only).
 #
-#   ./generate-dashboard.sh            # ingest new activity + rebuild + open
-#   ./generate-dashboard.sh --no-open  # skip opening the browser
-#   ./generate-dashboard.sh --force    # re-parse all transcripts from scratch
+# By default it reads ~/.claude (or $CLAUDE_CONFIG_DIR) plus any sibling
+# .claude* directory. Standing configuration for extra locations and remote
+# machines lives in sources.json (see sources.example.json); the flags below
+# add to it for a single run.
+#
+#   ./generate-dashboard.sh                    # ingest + rebuild + open
+#   ./generate-dashboard.sh --no-open          # skip the browser
+#   ./generate-dashboard.sh --index            # open index.html instead
+#   ./generate-dashboard.sh --force            # re-parse all transcripts
+#   ./generate-dashboard.sh --extra-dir ~/bkp  # also search a location
+#   ./generate-dashboard.sh --remote box1      # also collect over SSH
+#   ./generate-dashboard.sh --ssh-config       # ...every ~/.ssh/config host
 set -euo pipefail
 cd "$(dirname "$0")"
 
 NO_OPEN=0
-FORCE=""
-for arg in "$@"; do
-    case "$arg" in
-        --no-open) NO_OPEN=1 ;;
-        --force)   FORCE="--force" ;;
-        *) echo "unknown option: $arg" >&2; exit 2 ;;
+OPEN_INDEX=0
+INGEST_ARGS=()
+
+usage() {
+    # the header comment block, minus the shebang, verbatim
+    awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"
+    exit "${1:-0}"
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-open)      NO_OPEN=1 ;;
+        --index)        OPEN_INDEX=1 ;;
+        --force|--no-siblings|--ssh-config|--remote-full)
+                        INGEST_ARGS+=("$1") ;;
+        --extra-dir|--remote|--depth|--ssh-timeout)
+                        [ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; }
+                        INGEST_ARGS+=("$1" "$2"); shift ;;
+        -h|--help)      usage 0 ;;
+        *) echo "unknown option: $1" >&2; usage 2 ;;
     esac
+    shift
 done
 
 PY="$(command -v python3 || command -v python || true)"
@@ -34,17 +57,21 @@ if ! "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)'; th
 fi
 
 echo "Ingesting Claude Code transcripts..."
-"$PY" jsonl_ingest.py $FORCE
+"$PY" jsonl_ingest.py ${INGEST_ARGS+"${INGEST_ARGS[@]}"}
 
 echo "Building dashboard..."
 "$PY" build_dashboard.py
 
 DASH="$(pwd)/dashboard.html"
+IDX="$(pwd)/index.html"
 echo "Dashboard ready: $DASH"
+echo "All reports:     $IDX"
+TARGET="$DASH"
+[ "$OPEN_INDEX" -eq 1 ] && TARGET="$IDX"
 if [ "$NO_OPEN" -eq 0 ]; then
     if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v xdg-open >/dev/null 2>&1; then
-        xdg-open "$DASH" >/dev/null 2>&1 || true
+        xdg-open "$TARGET" >/dev/null 2>&1 || true
     elif [ "$(uname)" = "Darwin" ]; then
-        open "$DASH" || true
+        open "$TARGET" || true
     fi
 fi

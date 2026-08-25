@@ -3,7 +3,8 @@
 Each digest is written to reports/digest-<YYYY>-W<week>.html; if that name is
 already taken (re-run, manual run) a -HHMMSS suffix is added so an existing
 digest is NEVER overwritten. reports/index.html (regenerated each run) links
-every digest, newest first.
+every digest, newest first, and the project-root index.html is refreshed too
+so the new digest shows up next to the live dashboard.
 
 Run manually:  python digest.py
 Scheduled:     Task Scheduler job ClaudeMetricsDigest (Mondays 08:00)
@@ -17,33 +18,13 @@ from datetime import datetime, timedelta, timezone
 
 import build_dashboard
 import db
+import report_index
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 REPORTS = os.path.join(BASE, "reports")
 
-CSS = """
-:root { color-scheme: light; --page:#f9f9f7; --surface:#fcfcfb; --ink:#0b0b0b;
-  --ink2:#52514e; --muted:#898781; --grid:#e1e0d9; --border:rgba(11,11,11,.10); }
-@media (prefers-color-scheme: dark) { :root { color-scheme: dark; --page:#0d0d0d;
-  --surface:#1a1a19; --ink:#fff; --ink2:#c3c2b7; --grid:#2c2c2a;
-  --border:rgba(255,255,255,.10); } }
-* { box-sizing:border-box; }
-body { margin:0; padding:24px; background:var(--page); color:var(--ink);
-  font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
-.wrap { max-width:900px; margin:0 auto; }
-h1 { font-size:20px; margin:0 0 2px; } .sub { color:var(--muted); font-size:12px; margin-bottom:18px; }
-h2 { font-size:13px; color:var(--ink2); margin:22px 0 8px; }
-.tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:10px; }
-.tile { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:10px 12px; }
-.tile .l { color:var(--muted); font-size:11px; } .tile .v { font-size:22px; font-weight:600; }
-table { border-collapse:collapse; width:100%; font-size:13px; background:var(--surface);
-  border:1px solid var(--border); border-radius:10px; overflow:hidden; }
-th,td { text-align:left; padding:6px 10px; border-bottom:1px solid var(--grid); }
-th { color:var(--muted); font-weight:500; font-size:12px; }
-td.n,th.n { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
-tr:last-child td { border-bottom:none; }
-.muted { color:var(--muted); } a { color:inherit; }
-"""
+# Shared with index.html so every generated page looks like one system.
+CSS = report_index.CSS
 
 
 def fmt(n):
@@ -155,7 +136,7 @@ def build_digest(now=None):
 <div class="wrap">
 <h1>Claude Lens weekly digest</h1>
 <div class="sub">{period} (UTC) · generated {now.strftime('%Y-%m-%d %H:%M')} ·
-<a href="index.html">all digests</a></div>
+<a href="index.html">all digests</a> · <a href="../index.html">all reports</a></div>
 <div class="tiles">{tiles}</div>
 <h2>By project</h2>
 {table(['Project', 'Prompts', 'Input', 'Output', 'Lines ±', 'Cost'], proj_rows, {1,2,3,4,5})}
@@ -171,7 +152,8 @@ def build_digest(now=None):
     with open(path, "w", encoding="utf-8") as f:
         f.write(doc)
     rebuild_index()
-    return {"digest": path, "prompts": tot["prompts"]}
+    index = report_index.build()
+    return {"digest": path, "prompts": tot["prompts"], "index": index}
 
 
 def rebuild_index():

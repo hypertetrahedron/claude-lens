@@ -32,8 +32,17 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics.db")
 #       upserts so transcript-derived specifics (mcp__server__tool, skill
 #       names) upgrade generic live-telemetry rows; clears ingest_state to
 #       force a one-time transcript re-parse that backfills both.
+#   3 — multi-source ingest: sessions.source_label records which Claude
+#       directory (or remote machine) a session came from, and remote_state
+#       tracks the last successful SSH fetch per host so transfers stay
+#       incremental. Existing rows keep an empty label = the primary
+#       ~/.claude, which is exactly what they were.
+#   4 - remote_state.fail_count / next_attempt: a host that cannot be reached
+#       (missing key, powered off, no Claude directory) is backed off instead
+#       of retried on every pass, so a misconfigured remote costs the
+#       background receiver nothing.
 # ---------------------------------------------------------------------------
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS prompts (
@@ -89,9 +98,17 @@ CREATE TABLE IF NOT EXISTS edits (
 );
 CREATE INDEX IF NOT EXISTS idx_edit_prompt ON edits(prompt_id);
 CREATE TABLE IF NOT EXISTS sessions (
-    session_id TEXT PRIMARY KEY,
-    project    TEXT,
-    cwd        TEXT
+    session_id   TEXT PRIMARY KEY,
+    project      TEXT,
+    cwd          TEXT,
+    source_label TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS remote_state (
+    host         TEXT PRIMARY KEY,
+    last_fetch   REAL,
+    last_error   TEXT,
+    fail_count   INTEGER DEFAULT 0,
+    next_attempt REAL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS ingest_state (
     path  TEXT PRIMARY KEY,
@@ -112,7 +129,27 @@ def _migrate_to_2(con):
     con.execute("DELETE FROM ingest_state")
 
 
-MIGRATIONS = {2: _migrate_to_2}
+def _migrate_to_3(con):
+    """sessions.source_label + remote_state (multi-source ingest)."""
+    cols = [r[1] for r in con.execute("PRAGMA table_info(sessions)")]
+    if "source_label" not in cols:
+        con.execute("ALTER TABLE sessions ADD COLUMN source_label TEXT DEFAULT ''")
+    con.execute("""CREATE TABLE IF NOT EXISTS remote_state (
+                       host       TEXT PRIMARY KEY,
+                       last_fetch REAL,
+                       last_error TEXT)""")
+
+
+def _migrate_to_4(con):
+    """remote_state gains failure backoff (fail_count + next_attempt)."""
+    cols = [r[1] for r in con.execute("PRAGMA table_info(remote_state)")]
+    if "fail_count" not in cols:
+        con.execute("ALTER TABLE remote_state ADD COLUMN fail_count INTEGER DEFAULT 0")
+    if "next_attempt" not in cols:
+        con.execute("ALTER TABLE remote_state ADD COLUMN next_attempt REAL DEFAULT 0")
+
+
+MIGRATIONS = {2: _migrate_to_2, 3: _migrate_to_3, 4: _migrate_to_4}
 
 
 def connect(path=DB_PATH, cross_thread=False):
@@ -214,11 +251,70 @@ def insert_edit(con, tool_use_id, prompt_id, session_id, ts, file_path, kind,
     )
 
 
-def upsert_session(con, session_id, project=None, cwd=None):
+def upsert_session(con, session_id, project=None, cwd=None, source_label=None):
+    # source_label is authoritative on every write: it names the Claude
+    # directory the transcript was just read from, so a session whose origin
+    # is renamed (a host alias changed in ~/.ssh/config, a folder relabeled)
+    # re-labels instead of keeping a stale prefix. NULL = caller doesn't know.
     con.execute(
-        """INSERT INTO sessions (session_id, project, cwd) VALUES (?,?,?)
+        """INSERT INTO sessions (session_id, project, cwd, source_label)
+           VALUES (?,?,?,COALESCE(?,''))
            ON CONFLICT(session_id) DO UPDATE SET
-             project = COALESCE(sessions.project, excluded.project),
-             cwd     = COALESCE(sessions.cwd, excluded.cwd)""",
-        (session_id, project, cwd),
+             project      = COALESCE(sessions.project, excluded.project),
+             cwd          = COALESCE(sessions.cwd, excluded.cwd),
+             source_label = COALESCE(?, sessions.source_label)""",
+        (session_id, project, cwd, source_label, source_label),
     )
+
+
+REMOTE_STATE_DEFAULT = {"last_fetch": 0.0, "last_error": None,
+                        "fail_count": 0, "next_attempt": 0.0}
+
+
+def get_remote_state(con, host):
+    """Fetch bookkeeping for one host; defaults for a host never contacted."""
+    row = con.execute(
+        """SELECT last_fetch, last_error, fail_count, next_attempt
+           FROM remote_state WHERE host=?""", (host,)).fetchone()
+    if not row:
+        return dict(REMOTE_STATE_DEFAULT)
+    return {"last_fetch": row[0] or 0.0, "last_error": row[1],
+            "fail_count": row[2] or 0, "next_attempt": row[3] or 0.0}
+
+
+def all_remote_state(con):
+    """Every host's bookkeeping, for `--remote-status`."""
+    return [{"host": r[0], "last_fetch": r[1] or 0.0, "last_error": r[2],
+             "fail_count": r[3] or 0, "next_attempt": r[4] or 0.0}
+            for r in con.execute(
+                """SELECT host, last_fetch, last_error, fail_count, next_attempt
+                   FROM remote_state ORDER BY host""")]
+
+
+def record_remote_success(con, host, when):
+    """Clear the failure state and advance the incremental watermark."""
+    con.execute(
+        """INSERT INTO remote_state
+             (host, last_fetch, last_error, fail_count, next_attempt)
+           VALUES (?,?,NULL,0,0)
+           ON CONFLICT(host) DO UPDATE SET
+             last_fetch = excluded.last_fetch,
+             last_error = NULL, fail_count = 0, next_attempt = 0""",
+        (host, when))
+
+
+def record_remote_failure(con, host, error, next_attempt):
+    """Count the failure and park the host until `next_attempt`.
+
+    last_fetch is deliberately left alone: whatever this attempt would have
+    brought is simply requested again by the run that eventually succeeds.
+    """
+    con.execute(
+        """INSERT INTO remote_state
+             (host, last_fetch, last_error, fail_count, next_attempt)
+           VALUES (?,NULL,?,1,?)
+           ON CONFLICT(host) DO UPDATE SET
+             last_error   = excluded.last_error,
+             fail_count   = remote_state.fail_count + 1,
+             next_attempt = excluded.next_attempt""",
+        (host, error, next_attempt))
