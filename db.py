@@ -41,8 +41,13 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics.db")
 #       (missing key, powered off, no Claude directory) is backed off instead
 #       of retried on every pass, so a misconfigured remote costs the
 #       background receiver nothing.
+#   5 - no column change: clears ingest_state to force one re-parse of every
+#       transcript. Transcripts written before the origin marker existed had
+#       their human prompts go unrecognised, so their API usage was dropped
+#       entirely; the ingester now recognises them, and only a re-parse can
+#       backfill what was missed.
 # ---------------------------------------------------------------------------
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS prompts (
@@ -149,7 +154,13 @@ def _migrate_to_4(con):
         con.execute("ALTER TABLE remote_state ADD COLUMN next_attempt REAL DEFAULT 0")
 
 
-MIGRATIONS = {2: _migrate_to_2, 3: _migrate_to_3, 4: _migrate_to_4}
+def _migrate_to_5(con):
+    """One-time re-parse so legacy transcripts are picked up (see changelog)."""
+    con.execute("DELETE FROM ingest_state")
+
+
+MIGRATIONS = {2: _migrate_to_2, 3: _migrate_to_3, 4: _migrate_to_4,
+              5: _migrate_to_5}
 
 
 def connect(path=DB_PATH, cross_thread=False):
