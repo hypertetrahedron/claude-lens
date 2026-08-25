@@ -1,16 +1,33 @@
 # Generate the Claude Code usage dashboard (Windows).
 #
-# One-shot: parses every Claude Code transcript for the signed-in user
-# (~\.claude\projects, or $env:CLAUDE_CONFIG_DIR\projects if set) into a local
-# SQLite DB, renders dashboard.html next to this script, and opens it.
-# Re-running is incremental and always safe. Requires Python 3.9+ (stdlib only).
+# One-shot: parses every Claude Code transcript it can find into a local SQLite
+# DB, renders dashboard.html and index.html next to this script, and opens the
+# dashboard. Re-running is incremental and always safe. Requires Python 3.9+
+# (stdlib only).
 #
-#   .\generate-dashboard.ps1           # ingest new activity + rebuild + open
-#   .\generate-dashboard.ps1 -NoOpen   # skip opening the browser
-#   .\generate-dashboard.ps1 -Force    # re-parse all transcripts from scratch
+# By default it reads ~\.claude (or $env:CLAUDE_CONFIG_DIR) plus any sibling
+# .claude* directory. Standing configuration for extra locations and remote
+# machines lives in sources.json (see sources.example.json); the switches below
+# add to it for a single run.
+#
+#   .\generate-dashboard.ps1                      # ingest + rebuild + open
+#   .\generate-dashboard.ps1 -NoOpen              # skip the browser
+#   .\generate-dashboard.ps1 -Index               # open index.html instead
+#   .\generate-dashboard.ps1 -Force               # re-parse all transcripts
+#   .\generate-dashboard.ps1 -ExtraDir D:\backups # also search a location
+#   .\generate-dashboard.ps1 -Remote box1,box2    # also collect over SSH
+#   .\generate-dashboard.ps1 -SshConfig           # ...every ~\.ssh\config host
 param(
     [switch]$NoOpen,
-    [switch]$Force
+    [switch]$Index,
+    [switch]$Force,
+    [string[]]$ExtraDir,
+    [int]$Depth,
+    [switch]$NoSiblings,
+    [string[]]$Remote,
+    [switch]$SshConfig,
+    [switch]$RemoteFull,
+    [int]$SshTimeout
 )
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -27,8 +44,18 @@ if ($LASTEXITCODE -ne 0) {
     Write-Error "Python 3.9 or newer is required (found: $(& $py --version))."
 }
 
+$ingestArgs = @()
+if ($Force)      { $ingestArgs += "--force" }
+if ($NoSiblings) { $ingestArgs += "--no-siblings" }
+if ($SshConfig)  { $ingestArgs += "--ssh-config" }
+if ($RemoteFull) { $ingestArgs += "--remote-full" }
+foreach ($d in $ExtraDir) { $ingestArgs += @("--extra-dir", $d) }
+foreach ($h in $Remote)   { $ingestArgs += @("--remote", $h) }
+if ($PSBoundParameters.ContainsKey("Depth"))      { $ingestArgs += @("--depth", $Depth) }
+if ($PSBoundParameters.ContainsKey("SshTimeout")) { $ingestArgs += @("--ssh-timeout", $SshTimeout) }
+
 Write-Host "Ingesting Claude Code transcripts..." -ForegroundColor Cyan
-if ($Force) { & $py jsonl_ingest.py --force } else { & $py jsonl_ingest.py }
+& $py jsonl_ingest.py @ingestArgs
 if ($LASTEXITCODE -ne 0) { Write-Error "Transcript ingestion failed." }
 
 Write-Host "Building dashboard..." -ForegroundColor Cyan
@@ -36,5 +63,7 @@ Write-Host "Building dashboard..." -ForegroundColor Cyan
 if ($LASTEXITCODE -ne 0) { Write-Error "Dashboard build failed." }
 
 $dash = Join-Path $PSScriptRoot "dashboard.html"
+$idx = Join-Path $PSScriptRoot "index.html"
 Write-Host "Dashboard ready: $dash" -ForegroundColor Green
-if (-not $NoOpen) { Start-Process $dash }
+Write-Host "All reports:     $idx" -ForegroundColor Green
+if (-not $NoOpen) { Start-Process $(if ($Index) { $idx } else { $dash }) }

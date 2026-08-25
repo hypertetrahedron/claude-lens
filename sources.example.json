@@ -1,0 +1,18 @@
+{
+  "_comment": "Copy to sources.json to aggregate more than the local ~/.claude. All keys are optional; CLI flags on jsonl_ingest.py override these. This file is also how the live receiver learns about extra sources.",
+
+  "extra_locations": [
+    "D:/backups/claude-machines"
+  ],
+  "scan_sibling_claude_dirs": true,
+  "depth": 4,
+
+  "remotes": ["build-server", "mac-mini"],
+  "use_ssh_config": false,
+  "ssh_options": [],
+
+  "_timing_comment": "How hard a bad host is allowed to make anyone wait. ssh_connect_timeout bounds reaching a machine that is off; ssh_timeout bounds one whole transfer; remote_budget caps the time all hosts together may take in a single background pass.",
+  "ssh_connect_timeout": 8,
+  "ssh_timeout": 300,
+  "remote_budget": 600
+}

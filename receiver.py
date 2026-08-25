@@ -22,6 +22,7 @@ from logging.handlers import RotatingFileHandler
 import build_dashboard
 import db
 import jsonl_ingest
+import sources
 
 HOST, PORT = "127.0.0.1", 4318
 REBUILD_CHECK = 60          # seconds between dirty-checks for dashboard rebuild
@@ -155,14 +156,39 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def reconcile():
+    """One reconciliation pass over every configured source.
+
+    Remote machines (sources.json) are fetched *before* the DB lock is taken:
+    an SSH transfer can run for minutes, and holding the lock that long would
+    stall the live telemetry the receiver exists to accept. The fetch touches
+    only the remote_state bookkeeping, on its own short-lived connection.
+    """
+    cfg = sources.SourceConfig.load()
+    if cfg.hosts():
+        # Wrapped on its own: a remote that misbehaves, or a hiccup writing
+        # its bookkeeping, must never cost us the local reconcile below -
+        # that is the part that matters on this machine.
+        try:
+            con = db.connect()
+            try:
+                log.info("remote fetch: %s", jsonl_ingest.fetch_remotes(
+                    con, cfg, respect_backoff=True))
+            finally:
+                con.close()
+        except Exception:
+            log.exception("remote fetch failed; continuing with local sources")
+    with _db_lock:
+        return jsonl_ingest.run(config=cfg, skip_remote_fetch=True)
+
+
 def maintenance_loop():
     last_reconcile = 0.0
     while True:
         try:
             now = time.time()
             if now - last_reconcile >= RECONCILE_EVERY:
-                with _db_lock:
-                    stats = jsonl_ingest.run()
+                stats = reconcile()
                 last_reconcile = now
                 _dirty.set()
                 log.info("reconcile: %s", stats)

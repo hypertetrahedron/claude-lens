@@ -3,6 +3,11 @@ metrics.db
 metrics.db-shm
 metrics.db-wal
 dashboard.html
+index.html
 receiver.log*
 reports/
+remote-cache/
 __pycache__/
+
+# local source configuration (machine names, paths) — see sources.example.json
+sources.json

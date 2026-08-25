@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 import db
 import pricing
+import report_index
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE = os.path.join(BASE, "template.html")
@@ -109,11 +110,20 @@ def collect(con):
     UNPRICED.clear()
     # Display name for a project: the basename of the session's working
     # directory (portable), falling back to the transcript-folder slug.
+    #
+    # Sessions from anywhere but the primary ~/.claude carry a source_label
+    # (a remote host name, or a second .claude* directory). That label is
+    # prepended here because cwd basenames collide freely across machines -
+    # every box has a `src` or a `web` - and because the origin is worth
+    # seeing. Stored project slugs are already qualified by the ingester, so
+    # slug_display keys stay unique per source.
     session_project = {}
     slug_display = {}
-    for sid, proj, cwd in con.execute(
-            "SELECT session_id, project, cwd FROM sessions"):
-        disp = os.path.basename((cwd or "").rstrip("\\/")) or proj
+    for sid, proj, cwd, label in con.execute(
+            "SELECT session_id, project, cwd, source_label FROM sessions"):
+        label = label or ""
+        base = os.path.basename((cwd or "").rstrip("\\/"))
+        disp = f"{label}/{base}" if (label and base) else (base or proj)
         session_project[sid] = disp
         if proj and disp:
             slug_display[proj] = disp
@@ -303,7 +313,10 @@ def build(con=None):
     os.replace(tmp, OUTPUT)
     if own:
         con.close()
-    result = {"rows": len(out_rows), "output": OUTPUT}
+    # The landing page is rebuilt alongside the dashboard so a single
+    # bookmark always reaches every report, however many digests pile up.
+    index = report_index.build()
+    result = {"rows": len(out_rows), "output": OUTPUT, "index": index}
     unpriced = {m: e for m, e in UNPRICED.items() if e["tokens"] > 0}
     if unpriced:
         result["unpriced_models"] = unpriced
