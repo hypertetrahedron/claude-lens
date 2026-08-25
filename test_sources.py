@@ -120,9 +120,12 @@ class MultiSourceIngest(unittest.TestCase):
             MultiSourceIngest._connect(path, cross_thread)
 
         import jsonl_ingest
+        # cowork=False keeps this hermetic: without it the run would pick up
+        # a real Claude Desktop install on the developer's machine.
         cls.stats = jsonl_ingest.run(
             force=True,
-            config=sources.SourceConfig(extra_locations=[cls.backup_root]))
+            config=sources.SourceConfig(extra_locations=[cls.backup_root],
+                                        cowork=False))
 
     @classmethod
     def tearDownClass(cls):
@@ -361,6 +364,122 @@ class LegacyTranscripts(unittest.TestCase):
                          ["first prompt", "second prompt"])
         self.assertEqual(reqs, 2, "usage must attach, not be dropped")
         self.assertEqual(out, 40)
+
+
+class CoworkSupport(unittest.TestCase):
+    """Claude Desktop's Cowork sandboxes.
+
+    Each is a full Claude directory, but they are 14 sessions rather than 14
+    sources, and every sandbox's cwd is the same ".../outputs" path - so the
+    naming is the whole point of treating them specially.
+    """
+
+    def setUp(self):
+        import jsonl_ingest
+        self.ji = jsonl_ingest
+        self.tmp = tempfile.mkdtemp(prefix="claude-lens-cowork-")
+        self.store = os.path.join(self.tmp, "local-agent-mode-sessions")
+        self.org = os.path.join(self.store, "owner-uuid", "org-uuid")
+        os.makedirs(self.org)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _session(self, sid, title=None, cwd=None, n=1):
+        """One sandbox: a .claude dir plus the metadata file beside it."""
+        sandbox = os.path.join(self.org, sid)
+        write_transcript(os.path.join(sandbox, ".claude"),
+                         "C--sandbox-outputs", f"s-{sid}",
+                         cwd or os.path.join(sandbox, "outputs"),
+                         f"p-{sid}", f"req-{sid}")
+        if title is not None:
+            with open(sandbox + ".json", "w", encoding="utf-8") as f:
+                json.dump({"sessionId": sid, "title": title,
+                           "processName": "some-process-name"}, f)
+        return sandbox
+
+    def test_finds_sandboxes_and_their_titles(self):
+        self._session("local_aaaa", "Install SearXNG search provider")
+        self._session("local_bbbb", "Vercel domain setup")
+        found = sources.cowork_sessions([self.store])
+        self.assertEqual([s.title for s in found],
+                         ["Install SearXNG search provider",
+                          "Vercel domain setup"])
+        for s in found:
+            self.assertTrue(s.claude_dir.endswith(".claude"))
+
+    def test_falls_back_when_metadata_is_missing_or_broken(self):
+        self._session("local_cccc", title=None)          # no metadata file
+        bad = self._session("local_dddd", "ok")
+        with open(bad + ".json", "w", encoding="utf-8") as f:
+            f.write("{ not json")
+        titles = {s.title for s in sources.cowork_sessions([self.store])}
+        self.assertEqual(titles, {"local_cccc", "local_dddd"})
+
+    def test_title_is_made_safe_for_a_project_name(self):
+        self.assertEqual(sources.clean_title("a/b\\c"), "a-b-c")
+        self.assertEqual(sources.clean_title("  spaced \n out  "), "spaced out")
+        self.assertEqual(len(sources.clean_title("x" * 200)),
+                         sources.COWORK_TITLE_MAX)
+
+    def test_missing_store_is_silent(self):
+        self.assertEqual(sources.cowork_stores([os.path.join(self.tmp, "nope")]),
+                         [])
+        self.assertEqual(sources.cowork_sessions([os.path.join(self.tmp, "no")]),
+                         [])
+
+    def test_ingest_names_sessions_by_title_not_by_sandbox(self):
+        self._session("local_eeee", "Install SearXNG search provider")
+        self._session("local_ffff", "Vercel domain setup")
+        tmpdb = os.path.join(self.tmp, "m.db")
+        empty = os.path.join(self.tmp, "empty-claude")
+        orig = db.connect
+        db.connect = lambda path=tmpdb, cross_thread=False: orig(path, cross_thread)
+        os.environ["CLAUDE_CONFIG_DIR"] = empty
+        try:
+            import build_dashboard
+            cfg = sources.SourceConfig(scan_siblings=False,
+                                       cowork_paths=[self.store])
+            stats = self.ji.run(force=True, config=cfg)
+            cowork = [s for s in stats["sources"] if s["origin"] == "cowork"]
+            self.assertEqual(len(cowork), 1, "one source, not one per sandbox")
+            self.assertEqual(cowork[0]["sessions"], 2)
+
+            con = db.connect()
+            rows, _ = build_dashboard.collect(con)
+            labels = dict(con.execute(
+                "SELECT session_id, source_label FROM sessions"))
+            cwds = dict(con.execute("SELECT session_id, cwd FROM sessions"))
+            con.close()
+        finally:
+            db.connect = orig
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+
+        self.assertEqual(sorted(r["project"] for r in rows),
+                         ["cowork/Install SearXNG search provider",
+                          "cowork/Vercel domain setup"])
+        self.assertEqual(set(labels.values()), {"cowork"})
+        # the sandbox cwd is deliberately not recorded: it is the same
+        # ".../outputs" for every session and would override the title
+        self.assertEqual(set(cwds.values()), {None})
+
+    def test_can_be_turned_off(self):
+        self._session("local_gggg", "Vercel domain setup")
+        tmpdb = os.path.join(self.tmp, "off.db")
+        empty = os.path.join(self.tmp, "empty2")
+        orig = db.connect
+        db.connect = lambda path=tmpdb, cross_thread=False: orig(path, cross_thread)
+        os.environ["CLAUDE_CONFIG_DIR"] = empty
+        try:
+            cfg = sources.SourceConfig(scan_siblings=False, cowork=False,
+                                       cowork_paths=[self.store])
+            stats = self.ji.run(force=True, config=cfg)
+        finally:
+            db.connect = orig
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        self.assertEqual([s for s in stats["sources"]
+                          if s["origin"] == "cowork"], [])
+        self.assertEqual(stats["prompts"], 0)
 
 
 class SshConfig(unittest.TestCase):

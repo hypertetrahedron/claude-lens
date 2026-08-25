@@ -298,14 +298,23 @@ def mark_ingested(con, path):
                 (path, st.st_size, st.st_mtime))
 
 
-def ingest_main_file(con, path, label=""):
-    project = qualify(label, os.path.basename(os.path.dirname(path)))
+def ingest_main_file(con, path, label="", project_override=None):
+    """Ingest one main transcript.
+
+    project_override names the project explicitly instead of deriving it from
+    the transcript folder. Cowork uses it: every sandbox's cwd is the same
+    ".../outputs" path, so the recorded cwd is suppressed too, letting the
+    dashboard fall back to this name rather than showing 14 projects all
+    called "outputs".
+    """
+    project = qualify(label, project_override or
+                      os.path.basename(os.path.dirname(path)))
     session, legacy = scan_header(
         path, os.path.splitext(os.path.basename(path))[0])
     current_pid = None
     for e in iter_jsonl(path):
         cwd = e.get("cwd")
-        if cwd:
+        if cwd and not project_override:
             db.upsert_session(con, session, project=project, cwd=cwd,
                               source_label=label)
         if is_human_prompt(e, legacy):
@@ -341,7 +350,7 @@ def ingest_subagent_file(con, path):
             handle_tool_result(con, e, e.get("promptId") or pid, session, agent=agent)
 
 
-def ingest_tree(con, projects_dir, label="", force=False):
+def ingest_tree(con, projects_dir, label="", force=False, project_override=None):
     """Ingest every transcript under one `projects/` directory."""
     scanned = ingested = 0
     pattern = os.path.join(projects_dir, "**", "*.jsonl")
@@ -352,10 +361,30 @@ def ingest_tree(con, projects_dir, label="", force=False):
         if os.sep + "subagents" + os.sep in path:
             ingest_subagent_file(con, path)
         else:
-            ingest_main_file(con, path, label)
+            ingest_main_file(con, path, label, project_override)
         mark_ingested(con, path)
         ingested += 1
     return scanned, ingested
+
+
+def ingest_cowork(con, cfg, force=False):
+    """Ingest Claude Desktop's Cowork sandboxes as one labeled source.
+
+    Every sandbox is its own Claude directory, but they are not 14 separate
+    sources to a reader - they are 14 Cowork sessions. They therefore share
+    the `cowork` label and are told apart by the desktop app's own session
+    title, giving `cowork/Install SearXNG search provider` rather than
+    `local_ff2ffe59-.../outputs`.
+    """
+    scanned = ingested = 0
+    sessions = sources.cowork_sessions(cfg.cowork_paths)
+    for sess in sessions:
+        n_scanned, n_ingested = ingest_tree(
+            con, os.path.join(sess.claude_dir, "projects"),
+            sources.COWORK_LABEL, force, project_override=sess.title)
+        scanned += n_scanned
+        ingested += n_ingested
+    return scanned, ingested, len(sessions)
 
 
 def fetch_remotes(con, cfg, respect_backoff=False):
@@ -457,6 +486,15 @@ def run(force=False, root=None, config=None, skip_remote_fetch=False):
         used.append({"label": target.label or "(primary)",
                      "origin": target.origin, "path": target.path,
                      "transcripts": n_scanned})
+
+    if root is None and cfg.cowork:
+        n_scanned, n_ingested, n_sessions = ingest_cowork(con, cfg, force)
+        if n_sessions:
+            scanned += n_scanned
+            ingested += n_ingested
+            used.append({"label": sources.COWORK_LABEL, "origin": "cowork",
+                         "path": ", ".join(sources.cowork_stores(cfg.cowork_paths)),
+                         "sessions": n_sessions, "transcripts": n_scanned})
     con.commit()
     counts = {t: con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
               for t in ("prompts", "api_requests", "tool_calls", "edits", "sessions")}
@@ -480,6 +518,12 @@ def parse_args(argv=None):
                          f"(default {sources.DEFAULT_DEPTH})")
     ap.add_argument("--no-siblings", action="store_true",
                     help="skip sibling .claude* directories next to ~/.claude")
+    ap.add_argument("--no-cowork", action="store_true",
+                    help="skip Claude Desktop's Cowork sessions (on by default "
+                         "when the desktop app is installed)")
+    ap.add_argument("--cowork-dir", action="append", default=[], metavar="PATH",
+                    help="Cowork session store to read instead of the "
+                         "platform default (repeatable)")
     ap.add_argument("--remote", action="append", default=[], metavar="HOST",
                     help="collect usage from HOST over SSH (repeatable)")
     ap.add_argument("--ssh-config", action="store_true",
@@ -509,6 +553,10 @@ def config_from_args(args):
         cfg.ssh_timeout = args.ssh_timeout
     if args.no_siblings:
         cfg.scan_siblings = False
+    if args.no_cowork:
+        cfg.cowork = False
+    cfg.cowork_paths += [d for d in args.cowork_dir
+                         if d not in cfg.cowork_paths]
     if args.ssh_config:
         cfg.use_ssh_config = True
     cfg.remote_full = args.remote_full

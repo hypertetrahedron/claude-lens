@@ -6,10 +6,10 @@
 # dashboard when a desktop session is available. Re-running is incremental and
 # always safe. Requires Python 3.9+ (stdlib only).
 #
-# By default it reads ~/.claude (or $CLAUDE_CONFIG_DIR) plus any sibling
-# .claude* directory. Standing configuration for extra locations and remote
-# machines lives in sources.json (see sources.example.json); the flags below
-# add to it for a single run.
+# By default it reads ~/.claude (or $CLAUDE_CONFIG_DIR), any sibling .claude*
+# directory, and Claude Desktop's Cowork sessions if installed. Standing
+# configuration for extra locations and remote machines lives in sources.json
+# (see sources.example.json); the flags below add to it for a single run.
 #
 #   ./generate-dashboard.sh                    # ingest + rebuild + open
 #   ./generate-dashboard.sh --no-open          # skip the browser
@@ -18,6 +18,7 @@
 #   ./generate-dashboard.sh --extra-dir ~/bkp  # also search a location
 #   ./generate-dashboard.sh --remote box1      # also collect over SSH
 #   ./generate-dashboard.sh --ssh-config       # ...every ~/.ssh/config host
+#   ./generate-dashboard.sh --no-cowork        # skip Cowork sessions
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -35,9 +36,9 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --no-open)      NO_OPEN=1 ;;
         --index)        OPEN_INDEX=1 ;;
-        --force|--no-siblings|--ssh-config|--remote-full)
+        --force|--no-siblings|--no-cowork|--ssh-config|--remote-full)
                         INGEST_ARGS+=("$1") ;;
-        --extra-dir|--remote|--depth|--ssh-timeout)
+        --extra-dir|--cowork-dir|--remote|--depth|--ssh-timeout)
                         [ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; }
                         INGEST_ARGS+=("$1" "$2"); shift ;;
         -h|--help)      usage 0 ;;

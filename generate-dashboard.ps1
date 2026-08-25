@@ -5,10 +5,11 @@
 # dashboard. Re-running is incremental and always safe. Requires Python 3.9+
 # (stdlib only).
 #
-# By default it reads ~\.claude (or $env:CLAUDE_CONFIG_DIR) plus any sibling
-# .claude* directory. Standing configuration for extra locations and remote
-# machines lives in sources.json (see sources.example.json); the switches below
-# add to it for a single run.
+# By default it reads ~\.claude (or $env:CLAUDE_CONFIG_DIR), any sibling
+# .claude* directory, and Claude Desktop's Cowork sessions if installed.
+# Standing configuration for extra locations and remote machines lives in
+# sources.json (see sources.example.json); the switches below add to it for a
+# single run.
 #
 #   .\generate-dashboard.ps1                      # ingest + rebuild + open
 #   .\generate-dashboard.ps1 -NoOpen              # skip the browser
@@ -17,6 +18,7 @@
 #   .\generate-dashboard.ps1 -ExtraDir D:\backups # also search a location
 #   .\generate-dashboard.ps1 -Remote box1,box2    # also collect over SSH
 #   .\generate-dashboard.ps1 -SshConfig           # ...every ~\.ssh\config host
+#   .\generate-dashboard.ps1 -NoCowork            # skip Cowork sessions
 param(
     [switch]$NoOpen,
     [switch]$Index,
@@ -24,6 +26,8 @@ param(
     [string[]]$ExtraDir,
     [int]$Depth,
     [switch]$NoSiblings,
+    [switch]$NoCowork,
+    [string[]]$CoworkDir,
     [string[]]$Remote,
     [switch]$SshConfig,
     [switch]$RemoteFull,
@@ -47,9 +51,11 @@ if ($LASTEXITCODE -ne 0) {
 $ingestArgs = @()
 if ($Force)      { $ingestArgs += "--force" }
 if ($NoSiblings) { $ingestArgs += "--no-siblings" }
+if ($NoCowork)   { $ingestArgs += "--no-cowork" }
 if ($SshConfig)  { $ingestArgs += "--ssh-config" }
 if ($RemoteFull) { $ingestArgs += "--remote-full" }
-foreach ($d in $ExtraDir) { $ingestArgs += @("--extra-dir", $d) }
+foreach ($d in $ExtraDir)  { $ingestArgs += @("--extra-dir", $d) }
+foreach ($d in $CoworkDir) { $ingestArgs += @("--cowork-dir", $d) }
 foreach ($h in $Remote)   { $ingestArgs += @("--remote", $h) }
 if ($PSBoundParameters.ContainsKey("Depth"))      { $ingestArgs += @("--depth", $Depth) }
 if ($PSBoundParameters.ContainsKey("SshTimeout")) { $ingestArgs += @("--ssh-timeout", $SshTimeout) }
