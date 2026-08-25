@@ -7,6 +7,10 @@
   "scan_sibling_claude_dirs": true,
   "depth": 4,
 
+  "_cowork_comment": "Claude Desktop's Cowork sessions are auto-detected at the platform path; set false to skip, or give explicit stores.",
+  "cowork": true,
+  "cowork_paths": [],
+
   "remotes": ["build-server", "mac-mini"],
   "use_ssh_config": false,
   "ssh_options": [],

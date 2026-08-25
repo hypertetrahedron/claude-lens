@@ -493,6 +493,102 @@ def fetch_remote(host, since=0, depth=DEFAULT_REMOTE_DEPTH,
     return done()
 
 
+# ---------------------------------------------------------------------------
+# Cowork (Claude Desktop "local agent mode")
+# ---------------------------------------------------------------------------
+#
+# Cowork runs Claude Code inside a per-session sandbox, and each sandbox keeps
+# a complete Claude directory of its own:
+#
+#   <store>/<owner>/<org>/local_<uuid>/.claude/projects/<slug>/<session>.jsonl
+#   <store>/<owner>/<org>/local_<uuid>.json          <- session metadata
+#
+# The transcripts are the ordinary format, so nothing special is needed to read
+# them. What is needed is naming: the sandbox cwd is always ".../outputs", so
+# every session would otherwise show up as a project called "outputs" under a
+# label like "local_ff2ffe59-...". The metadata file beside each sandbox
+# carries the human-readable title the desktop app shows, which is used as the
+# project name instead.
+COWORK_SUBDIR = "local-agent-mode-sessions"
+COWORK_LABEL = "cowork"
+COWORK_DEPTH = 4          # <store>/<owner>/<org>/local_<uuid>/.claude
+COWORK_TITLE_MAX = 60
+
+CoworkSession = namedtuple("CoworkSession", "claude_dir title session_id")
+
+
+def cowork_stores(paths=()):
+    """Cowork session-store directories: the given paths, else the platform's.
+
+    Only stores that exist are returned, so calling this on a machine without
+    Claude Desktop is free and silent.
+    """
+    if paths:
+        candidates = [os.path.expanduser(p) for p in paths]
+    else:
+        home = os.path.expanduser("~")
+        if sys.platform == "win32":
+            base = os.environ.get("APPDATA") or os.path.join(
+                home, "AppData", "Roaming")
+            roots = [os.path.join(base, "Claude")]
+        elif sys.platform == "darwin":
+            roots = [os.path.join(home, "Library", "Application Support",
+                                  "Claude")]
+        else:
+            cfg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+                home, ".config")
+            roots = [os.path.join(cfg, "Claude")]
+        candidates = [os.path.join(r, COWORK_SUBDIR) for r in roots]
+    return [p for p in candidates if os.path.isdir(p)]
+
+
+def clean_title(title):
+    """A session title made safe to use as a project name.
+
+    Slashes would read as the label separator, and newlines would wreck the
+    table, so both go; long titles are trimmed to keep grouping legible.
+    """
+    title = " ".join(str(title).split()).replace("/", "-").replace("\\", "-")
+    return title[:COWORK_TITLE_MAX].strip()
+
+
+def _cowork_title(session_dir):
+    """The desktop app's title for a sandbox, from the metadata file beside it.
+
+    Falls back to the sandbox's own name, which at least stays unique.
+    """
+    fallback = os.path.basename(os.path.normpath(session_dir))
+    try:
+        with open(session_dir + ".json", encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        return fallback
+    if not isinstance(meta, dict):
+        return fallback
+    for key in ("title", "processName"):
+        value = meta.get(key)
+        if isinstance(value, str) and value.strip():
+            return clean_title(value)
+    return fallback
+
+
+def cowork_sessions(paths=(), depth=COWORK_DEPTH):
+    """Every Cowork sandbox found, each with the title to show it under."""
+    out, seen = [], set()
+    for store in cowork_stores(paths):
+        for claude_dir in find_claude_dirs(store, depth):
+            key = os.path.normcase(os.path.realpath(claude_dir))
+            if key in seen:
+                continue
+            seen.add(key)
+            session_dir = os.path.dirname(os.path.normpath(claude_dir))
+            out.append(CoworkSession(
+                claude_dir=claude_dir,
+                title=_cowork_title(session_dir),
+                session_id=os.path.basename(session_dir)))
+    return sorted(out, key=lambda s: s.title.lower())
+
+
 def dedupe_labels(roots):
     """Make every label unique across roots that were discovered separately.
 
@@ -539,7 +635,9 @@ class SourceConfig:
           "remotes": ["build-server", "mac-mini"],
           "use_ssh_config": false,
           "ssh_timeout": 300,
-          "ssh_options": ["-i", "~/.ssh/id_claude"]
+          "ssh_options": ["-i", "~/.ssh/id_claude"],
+          "cowork": true,
+          "cowork_paths": []
         }
     """
 
@@ -548,7 +646,8 @@ class SourceConfig:
                  ssh_timeout=DEFAULT_SSH_TIMEOUT, ssh_options=(),
                  remote_full=False,
                  ssh_connect_timeout=DEFAULT_CONNECT_TIMEOUT,
-                 remote_budget=DEFAULT_REMOTE_BUDGET):
+                 remote_budget=DEFAULT_REMOTE_BUDGET,
+                 cowork=True, cowork_paths=()):
         self.extra_locations = list(extra_locations)
         self.scan_siblings = scan_siblings
         self.depth = depth
@@ -559,6 +658,10 @@ class SourceConfig:
         self.remote_budget = remote_budget
         self.ssh_options = [os.path.expanduser(o) for o in ssh_options]
         self.remote_full = remote_full
+        # Cowork lives at a known desktop-app path, so it is detected rather
+        # than configured; set cowork=false to leave it out.
+        self.cowork = cowork
+        self.cowork_paths = list(cowork_paths)
 
     @classmethod
     def load(cls, path=CONFIG_PATH):
@@ -581,6 +684,8 @@ class SourceConfig:
                                             DEFAULT_CONNECT_TIMEOUT)),
             remote_budget=int(raw.get("remote_budget", DEFAULT_REMOTE_BUDGET)),
             ssh_options=raw.get("ssh_options") or [],
+            cowork=bool(raw.get("cowork", True)),
+            cowork_paths=raw.get("cowork_paths") or [],
         )
 
     def hosts(self):

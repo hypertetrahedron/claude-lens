@@ -17,8 +17,27 @@ Last updated: 2026-08-25
 
 | Older transcript formats | Complete | Prompt-marker vintage is detected per file, not by version: files without an `origin` marker fall back to recognising prompts by shape, which recovers sessions whose usage was previously dropped wholesale. Modern files keep the strict rule (verified byte-identical: 256 prompts before and after). Also handles inline `isSidechain` subagent turns and session ids read from the transcript body. Schema v5 forces the one-time re-parse. Verified on real data: a 2.1.16x-2.1.17x remote went 209 -> 1,201 API requests and 25K -> 917K output tokens. |
 
+| Cowork (Claude Desktop) collection | Complete | Session sandboxes under the desktop app's `local-agent-mode-sessions` store are auto-detected per platform and ingested under one `cowork` label, each session named by the app's own title instead of `local_<uuid>/outputs`. `--no-cowork` / `--cowork-dir` to override. Verified live: 14 sessions, 22 transcripts, 27 prompts, $21.85. |
+| Claude Chat collection | Deferred | No local data exists to collect - see below. |
+
 ## Deferred
 
+- **Claude Chat usage** — conversations live server-side; the desktop app
+  keeps no local per-conversation or token record (Local Storage and IndexedDB
+  hold auth/UI state only, and the 211 MB HTTP cache carries no accounting).
+  The one local signal is `plan-usage-history.json`: percent-of-plan-limit for
+  the 5-hour and 7-day windows, sampled every 5 minutes on a 30-day rolling
+  window. It is account-wide and cannot be split by product or conversation,
+  so it would not answer "what did Chat cost". Charting it as a rate-limit
+  gauge is the only thing it could support, and that is a different feature.
+- **Cost from Cowork's `audit.jsonl`** — each sandbox logs a CLI-reported
+  `total_cost_usd`, which sounds authoritative but only exists for runs that
+  finished and reported. Measured here: audit accounted for $7.47 against the
+  transcripts' $21.85, the gap being one whole session — the most expensive
+  one — that audit never recorded. Across sessions audit does cover, our
+  estimate is within 3% ($7.23 vs $7.47). Would be worth revisiting with a
+  per-session coverage guard (audit run count == prompt count) that upgrades
+  only fully covered sessions.
 - **Windows remotes over SSH** — the collector assumes a POSIX remote (`sh`,
   `find`, `tar`). Supporting Windows would need a second, PowerShell-based
   collection path and a way to detect which to send. Workaround today: share

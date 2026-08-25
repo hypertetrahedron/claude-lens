@@ -43,7 +43,7 @@ are prefixed with a label** — `build-server/gem-trip`, `.claude-work/api` —
 so grouping, filtering and per-project costs stay honest even when two
 machines both have a project called `src`.
 
-The four places looked at:
+The places looked at:
 
 | Source | Found how | Label |
 |---|---|---|
@@ -51,6 +51,7 @@ The four places looked at:
 | Sibling directories | any `.claude*` folder next to the primary one, searched to the same depth as an extra location | the folder name |
 | Extra locations | each configured path searched a few levels deep | the folder name, or its parent when the folder is just `.claude` |
 | Remote machines | SSH, from `~/.ssh/config` or an explicit list | the host name |
+| **Cowork** | Claude Desktop's session store, auto-detected | `cowork` |
 
 A directory counts as a Claude directory when it has a `projects/`
 subdirectory **and** either a `.claude*` name, a known settings/state file, or
@@ -62,6 +63,39 @@ match and skips the usual heavy directories (`node_modules`, `.git`, …).
 Siblings get the same depth search, so `~/.claude-archive/oldbox/.claude`
 works as well as a plain `~/.claude-work`. Only the top-level name is filtered
 to `.claude*`, so this never walks the whole home directory.
+
+### Cowork (Claude Desktop)
+
+Cowork runs Claude Code inside a per-session sandbox, and each sandbox keeps a
+complete Claude directory of its own — ordinary transcripts, in the ordinary
+format. They are picked up automatically when Claude Desktop is installed, at:
+
+| Platform | Path |
+|---|---|
+| Windows | `%APPDATA%\Claude\local-agent-mode-sessions` |
+| macOS | `~/Library/Application Support/Claude/local-agent-mode-sessions` |
+| Linux | `~/.config/Claude/local-agent-mode-sessions` |
+
+All sandboxes share the single label `cowork`, and each session is named by
+the **title the desktop app shows** — `cowork/Refactor the billing module`.
+Without that, every session would appear as `local_9f3c1a20-…/outputs`, since
+each sandbox is its own directory and their working directory is always the
+same `outputs` path. That sandbox cwd is deliberately not recorded, so the
+title is what the dashboard groups on.
+
+Turn it off with `--no-cowork` (or `"cowork": false`); point it somewhere else
+with `--cowork-dir PATH`. Nothing happens on a machine without the desktop app.
+
+**Cost is estimated from `pricing.py`, the same as every other source**, even
+though each sandbox also has an `audit.jsonl` carrying a CLI-reported
+`total_cost_usd`. That looks like the better source and isn't: those records
+only exist for runs that finished and reported, and a run that never reported
+leaves no trace in them. On the machine this was built against, `audit.jsonl`
+accounted for $7.47 while the transcripts showed $21.85 — the difference was a
+single session, the most expensive one, that audit never recorded at all.
+Across the sessions audit *does* cover, the estimate lands within 3% in
+aggregate ($7.23 vs $7.47). Complete coverage with a small estimation error
+beats exact figures with a two-thirds hole in them.
 
 ### One-off, from the command line
 
@@ -75,6 +109,8 @@ to `.claude*`, so this never walks the whole home directory.
 | `-ExtraDir` / `--extra-dir` | also search this path for Claude directories (repeatable) |
 | `-Depth` / `--depth` | how many levels below an extra dir to search (default 4) |
 | `-NoSiblings` / `--no-siblings` | ignore sibling `.claude*` directories |
+| `-NoCowork` / `--no-cowork` | ignore Claude Desktop's Cowork sessions |
+| `-CoworkDir` / `--cowork-dir` | read a Cowork session store from this path instead |
 | `-Remote` / `--remote` | collect from this SSH host (repeatable) |
 | `-SshConfig` / `--ssh-config` | collect from every host named in `~/.ssh/config` |
 | `-RemoteFull` / `--remote-full` | re-fetch all remote transcripts, not just new ones |
@@ -100,7 +136,9 @@ sources, since it reconciles on its own schedule:
   "ssh_options": ["-i", "~/.ssh/id_claude"],
   "ssh_connect_timeout": 8,
   "ssh_timeout": 300,
-  "remote_budget": 600
+  "remote_budget": 600,
+  "cowork": true,
+  "cowork_paths": []
 }
 ```
 
@@ -360,6 +398,11 @@ add a changelog line in `db.py` and below.
   they have not been tested against real data.
 - A brand-new session may show project `?` until the next ingest maps its
   session to a working directory.
+- Claude Chat conversations are not collectable: they live server-side, and
+  the desktop app keeps no local per-conversation or token record. The only
+  local signal is `plan-usage-history.json` (percent-of-plan-limit, sampled
+  every 5 minutes, account-wide, 30-day rolling) — it cannot be attributed to
+  a product or a conversation, so it is not ingested.
 - Remote collection needs a POSIX remote reachable with key-based SSH;
   Windows remotes have to go through a shared folder and `--extra-dir`.
 - Remote rows are only as fresh as the last fetch — the live OTel receiver
