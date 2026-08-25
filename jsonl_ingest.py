@@ -37,6 +37,42 @@ import sources
 PROJECTS_ROOT = os.path.join(sources.primary_dir(), "projects")
 
 
+# origin.kind values meaning "a person typed this". Anything else on a modern
+# transcript is a harness-injected turn whose usage folds into the prompt that
+# caused it.
+HUMAN_ORIGINS = frozenset({"human"})
+
+# promptSource values the harness uses for turns it generated itself.
+SYSTEM_PROMPT_SOURCES = frozenset({"system"})
+
+# Openers of harness-injected turns, used two ways: receiver.py folds live
+# OTel prompts starting with these into their parent, and legacy transcripts
+# (which have no origin marker) are filtered by them. Every entry here was
+# observed in real transcripts, not guessed.
+INJECTED_PREFIXES = (
+    "<task-notification>",
+    "<teammate-message",
+    "<system-reminder>",
+    "<command-name>",
+    "<local-command-caveat>",
+    "<ide_opened_file>",
+    "Caveat: The messages below",
+    "This session is being continued",
+    "Another Claude session sent a message:",
+    "[Request interrupted",
+)
+
+
+def _loads(line):
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+
 def qualify(label, project):
     """Project name as stored: prefixed with its source label, if any.
 
@@ -71,11 +107,92 @@ def prompt_text(msg):
     return ""
 
 
-def is_human_prompt(entry):
+def has_tool_result(msg):
+    c = msg.get("content")
+    return isinstance(c, list) and any(
+        isinstance(b, dict) and b.get("type") == "tool_result" for b in c)
+
+
+def scan_header(path, default_session):
+    """One cheap pass to learn a transcript's session id and its vintage.
+
+    Returns (session_id, legacy). `legacy` is True when no user entry in the
+    file carries an origin marker, meaning human prompts have to be
+    recognised by shape instead (see is_human_prompt).
+
+    Detection is per file rather than by version number: the marker appeared
+    at some point during the 2.1.x series and the exact build is not worth
+    guessing, whereas "does this file use it" is directly observable. Only
+    lines that could hold the answer are parsed, so this costs a substring
+    scan rather than a full parse of the file.
+    """
+    session, legacy = None, True
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if session is None and '"sessionId"' in line:
+                    e = _loads(line)
+                    if isinstance(e, dict) and e.get("sessionId"):
+                        session = e["sessionId"]
+                if '"origin"' in line:
+                    e = _loads(line)
+                    if (isinstance(e, dict) and e.get("type") == "user"
+                            and isinstance(e.get("origin"), dict)
+                            and e["origin"].get("kind") in HUMAN_ORIGINS):
+                        legacy = False
+                        break
+    except OSError:
+        pass
+    return session or default_session, legacy
+
+
+def is_human_prompt(entry, legacy=False):
+    """Does this user entry start a new prompt?
+
+    Modern transcripts say so outright: origin.kind == "human". Transcripts
+    written before that marker existed carry no origin at all, and their real
+    prompts are indistinguishable from tool results by field presence alone -
+    both are type "user" with a promptId. For those, `legacy` switches to
+    recognising a prompt by shape: a user turn that is not a tool result, not
+    harness-injected, not a subagent's own turn, and actually has text.
+
+    The loose rule is deliberately NOT applied to modern transcripts. There it
+    would invent prompts out of /clear wrappers, compaction summaries and
+    "[Request interrupted by user]" notices, all of which are user entries
+    with plain text and no origin.
+    """
     if entry.get("type") != "user" or entry.get("isMeta"):
         return False
     origin = entry.get("origin")
-    return isinstance(origin, dict) and origin.get("kind") == "human"
+    if isinstance(origin, dict):
+        return origin.get("kind") in HUMAN_ORIGINS
+    if not legacy or entry.get("isSidechain"):
+        return False
+    msg = entry.get("message") or {}
+    if has_tool_result(msg):
+        return False
+    if entry.get("promptSource") in SYSTEM_PROMPT_SOURCES:
+        return False
+    text = prompt_text(msg).strip()
+    return bool(text) and not text.startswith(INJECTED_PREFIXES)
+
+
+def inline_agent(entry):
+    """Agent name for subagent work recorded inline in a main transcript.
+
+    Current CLIs write subagent turns to <session>/subagents/agent-*.jsonl;
+    older layouts interleaved them into the main file flagged isSidechain.
+    Naming the agent keeps that work attributed to a subagent instead of
+    silently inflating the main thread's own usage. Returns None for ordinary
+    main-thread entries, which is what `agent=` already expects.
+    """
+    if not entry.get("isSidechain"):
+        return None
+    for key in ("attributionAgent", "agentId"):
+        value = entry.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return "subagent"
 
 
 def handle_assistant(con, entry, prompt_id, session_id, agent=None):
@@ -183,24 +300,30 @@ def mark_ingested(con, path):
 
 def ingest_main_file(con, path, label=""):
     project = qualify(label, os.path.basename(os.path.dirname(path)))
-    session = os.path.splitext(os.path.basename(path))[0]
+    session, legacy = scan_header(
+        path, os.path.splitext(os.path.basename(path))[0])
     current_pid = None
     for e in iter_jsonl(path):
         cwd = e.get("cwd")
         if cwd:
             db.upsert_session(con, session, project=project, cwd=cwd,
                               source_label=label)
-        if is_human_prompt(e):
-            current_pid = e.get("promptId")
+        if is_human_prompt(e, legacy):
+            # promptId is universal on the transcripts seen so far; uuid is
+            # the fallback for any older build that predates it, and is
+            # equally unique per entry.
+            current_pid = e.get("promptId") or e.get("uuid")
             if current_pid:
                 db.upsert_prompt(con, current_pid, session_id=session,
                                  project=project, ts=e.get("timestamp"),
                                  text=prompt_text(e.get("message") or {}),
                                  source="jsonl")
         elif e.get("type") == "assistant" and current_pid:
-            handle_assistant(con, e, current_pid, session)
+            handle_assistant(con, e, current_pid, session,
+                             agent=inline_agent(e))
         elif e.get("type") == "user" and current_pid:
-            handle_tool_result(con, e, current_pid, session)
+            handle_tool_result(con, e, current_pid, session,
+                               agent=inline_agent(e))
     db.upsert_session(con, session, project=project, source_label=label)
 
 

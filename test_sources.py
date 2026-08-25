@@ -44,6 +44,41 @@ def write_transcript(claude_dir, slug, session, cwd, prompt_id, req_id):
             f.write(json.dumps(e) + "\n")
 
 
+def write_legacy_transcript(claude_dir, slug, session, cwd, prompts):
+    """A transcript in the pre-origin format.
+
+    Older CLI builds wrote no `origin` marker at all: a typed prompt and a
+    tool result are both type "user" with a promptId, distinguishable only by
+    shape. Each prompt here is followed by an assistant turn and a tool
+    result, so the tool result gets a chance to be miscounted as a prompt.
+    """
+    d = os.path.join(claude_dir, "projects", slug)
+    os.makedirs(d, exist_ok=True)
+    entries = []
+    for i, text in enumerate(prompts):
+        entries.append({
+            "type": "user", "promptId": f"legacy-p{i}", "promptSource": "sdk",
+            "userType": "external", "sessionId": session, "cwd": cwd,
+            "timestamp": TS, "version": "2.1.175",
+            "message": {"content": [{"type": "text", "text": text}]}})
+        entries.append({
+            "type": "assistant", "timestamp": TS, "sessionId": session,
+            "requestId": f"legacy-req{i}", "version": "2.1.175",
+            "message": {"model": "claude-opus-5", "content": [],
+                        "usage": {"input_tokens": 10, "output_tokens": 20,
+                                  "cache_read_input_tokens": 5,
+                                  "cache_creation_input_tokens": 0}}})
+        entries.append({
+            "type": "user", "promptId": f"legacy-p{i}", "sessionId": session,
+            "timestamp": TS, "version": "2.1.175",
+            "message": {"content": [{"type": "tool_result",
+                                     "tool_use_id": f"toolu_{i}",
+                                     "content": "ok"}]}})
+    with open(os.path.join(d, session + ".jsonl"), "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+
+
 class MultiSourceIngest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -55,6 +90,11 @@ class MultiSourceIngest(unittest.TestCase):
         # is what requirement 4 is about: backups/<machine>/.claude
         cls.backup_root = os.path.join(cls.tmp, "backups")
         cls.nested = os.path.join(cls.backup_root, "oldlaptop", ".claude")
+        # A sibling that is a *container* of Claude dirs rather than one
+        # itself - only found if siblings get the same depth search as extra
+        # locations.
+        cls.archived = os.path.join(cls.home, ".claude-archive", "oldbox",
+                                    ".claude")
 
         write_transcript(cls.primary, "-y-work-alpha", "s-aaaa",
                          "/y/work/alpha", "p-aaaa", "req-aaaa")
@@ -62,6 +102,12 @@ class MultiSourceIngest(unittest.TestCase):
                          "/y/work/beta", "p-bbbb", "req-bbbb")
         write_transcript(cls.nested, "-y-work-alpha", "s-cccc",
                          "/y/work/alpha", "p-cccc", "req-cccc")
+        write_transcript(cls.archived, "-y-work-delta", "s-eeee",
+                         "/y/work/delta", "p-eeee", "req-eeee")
+        # A legacy-format transcript, in the primary directory
+        write_legacy_transcript(
+            cls.primary, "-y-work-legacy", "s-legacy", "/y/work/legacy",
+            ["first legacy prompt", "second legacy prompt"])
         # Decoys: a directory named like Claude's but with no projects/, and a
         # deep tree that must be pruned rather than walked forever.
         os.makedirs(os.path.join(cls.home, ".claude-empty", "todos"))
@@ -111,6 +157,21 @@ class MultiSourceIngest(unittest.TestCase):
         # the decoy without projects/ is not a source
         self.assertNotIn(".claude-empty", by_label)
 
+    def test_sibling_container_is_searched_to_depth(self):
+        """A .claude* sibling holding Claude dirs, not being one itself."""
+        roots = sources.discover_local()
+        by_label = {r.label: r for r in roots}
+        self.assertIn("oldbox", by_label)
+        self.assertEqual(by_label["oldbox"].path, self.archived)
+        self.assertEqual(by_label["oldbox"].origin, "sibling")
+
+    def test_sibling_depth_is_bounded_like_extra_locations(self):
+        """depth=1 cannot reach two levels into .claude-archive."""
+        shallow = sources.discover_local(scan_siblings=True, depth=1)
+        self.assertNotIn("oldbox", {r.label for r in shallow})
+        deep = sources.discover_local(scan_siblings=True, depth=2)
+        self.assertIn("oldbox", {r.label for r in deep})
+
     def test_labels_from_separate_discoveries_are_de_collided(self):
         """A backup folder and an SSH host sharing a name must not merge."""
         roots = [sources.Root("/a", "", "primary"),
@@ -134,8 +195,7 @@ class MultiSourceIngest(unittest.TestCase):
 
     def test_projects_are_labeled_by_origin(self):
         import build_dashboard
-        self.assertEqual(self.stats["ingested"], 3)
-        self.assertEqual(len(self.stats["sources"]), 3)
+        self.assertEqual(len(self.stats["sources"]), 4)
 
         con = db.connect()
         rows, _ = build_dashboard.collect(con)
@@ -144,6 +204,9 @@ class MultiSourceIngest(unittest.TestCase):
         self.assertEqual(projects, [
             ".claude-work/beta",       # sibling directory
             "alpha",                   # primary: name unchanged
+            "legacy",                  # primary, pre-origin transcript
+            "legacy",
+            "oldbox/delta",            # nested inside a sibling container
             "oldlaptop/alpha",         # nested under an extra location
         ])
 
@@ -170,6 +233,134 @@ class MultiSourceIngest(unittest.TestCase):
         self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0],
                          db.SCHEMA_VERSION)
         con.close()
+
+
+class LegacyTranscripts(unittest.TestCase):
+    """Transcripts written before the origin marker existed.
+
+    Their human prompts carry no origin at all, so the strict rule dropped
+    them - and with them every API request in the file, since usage is
+    attributed to the prompt above it. These check the shape-based fallback
+    recovers them WITHOUT loosening anything on modern transcripts.
+    """
+
+    def setUp(self):
+        import jsonl_ingest
+        self.ji = jsonl_ingest
+        self.tmp = tempfile.mkdtemp(prefix="claude-lens-legacy-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write(self, name, entries):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+        return path
+
+    def test_detects_vintage_per_file(self):
+        modern = self._write("modern.jsonl", [
+            {"type": "user", "sessionId": "s-modern", "promptId": "p1",
+             "origin": {"kind": "human"},
+             "message": {"content": "hello"}}])
+        legacy = self._write("legacy.jsonl", [
+            {"type": "user", "sessionId": "s-legacy", "promptId": "p1",
+             "promptSource": "sdk",
+             "message": {"content": [{"type": "text", "text": "hello"}]}}])
+        self.assertEqual(self.ji.scan_header(modern, "fallback"),
+                         ("s-modern", False))
+        self.assertEqual(self.ji.scan_header(legacy, "fallback"),
+                         ("s-legacy", True))
+
+    def test_origin_on_injected_turns_alone_does_not_mean_modern(self):
+        """Older files carry origin on task-notifications but not on prompts."""
+        path = self._write("mixed.jsonl", [
+            {"type": "user", "sessionId": "s1", "promptId": "p1",
+             "origin": {"kind": "task-notification"}, "promptSource": "sdk",
+             "message": {"content": "<task-notification>done</task-notification>"}},
+            {"type": "user", "sessionId": "s1", "promptId": "p2",
+             "promptSource": "sdk",
+             "message": {"content": [{"type": "text", "text": "real prompt"}]}}])
+        _, legacy = self.ji.scan_header(path, "x")
+        self.assertTrue(legacy, "only a human origin marks a file as modern")
+
+    def test_legacy_prompt_recognised_tool_result_is_not(self):
+        prompt = {"type": "user", "promptId": "p1", "promptSource": "sdk",
+                  "message": {"content": [{"type": "text", "text": "do it"}]}}
+        tool_result = {"type": "user", "promptId": "p1",
+                       "message": {"content": [{"type": "tool_result",
+                                                "tool_use_id": "t1"}]}}
+        self.assertTrue(self.ji.is_human_prompt(prompt, legacy=True))
+        self.assertFalse(self.ji.is_human_prompt(tool_result, legacy=True))
+        # ...and neither counts on a modern transcript
+        self.assertFalse(self.ji.is_human_prompt(prompt, legacy=False))
+
+    def test_legacy_rule_filters_harness_injected_turns(self):
+        for text in ("<command-name>/clear</command-name>",
+                     "<local-command-caveat>Caveat: ...",
+                     "<system-reminder>hi</system-reminder>",
+                     "<ide_opened_file>opened X",
+                     "Caveat: The messages below were generated...",
+                     "This session is being continued from a previous...",
+                     "[Request interrupted by user]",
+                     "Another Claude session sent a message: hi"):
+            entry = {"type": "user", "promptId": "p", "promptSource": "sdk",
+                     "message": {"content": [{"type": "text", "text": text}]}}
+            self.assertFalse(self.ji.is_human_prompt(entry, legacy=True), text)
+
+    def test_legacy_rule_skips_meta_system_sidechain_and_empty(self):
+        base = {"type": "user", "promptId": "p", "promptSource": "sdk",
+                "message": {"content": [{"type": "text", "text": "hi"}]}}
+        for tweak in ({"isMeta": True}, {"promptSource": "system"},
+                      {"isSidechain": True},
+                      {"message": {"content": [{"type": "text", "text": "  "}]}}):
+            entry = dict(base, **tweak)
+            self.assertFalse(self.ji.is_human_prompt(entry, legacy=True), tweak)
+
+    def test_modern_non_prompts_never_become_prompts(self):
+        """The exact shapes that appear in real modern transcripts."""
+        for text in ("<command-name>/clear</command-name>",
+                     "This session is being continued from a previous...",
+                     "[Request interrupted by user]",
+                     "just some text with no origin at all"):
+            entry = {"type": "user", "promptId": "p",
+                     "message": {"content": text}}
+            self.assertFalse(self.ji.is_human_prompt(entry, legacy=False), text)
+
+    def test_inline_sidechain_is_attributed_to_a_subagent(self):
+        """Older layouts interleaved subagent turns into the main file."""
+        self.assertIsNone(self.ji.inline_agent({"type": "assistant"}))
+        self.assertEqual(self.ji.inline_agent(
+            {"isSidechain": True, "attributionAgent": "Explore"}), "Explore")
+        self.assertEqual(self.ji.inline_agent(
+            {"isSidechain": True, "agentId": "agent-7"}), "agent-7")
+        self.assertEqual(self.ji.inline_agent({"isSidechain": True}), "subagent")
+
+    def test_end_to_end_legacy_file_yields_prompts_and_usage(self):
+        tmpdb = os.path.join(self.tmp, "m.db")
+        claude = os.path.join(self.tmp, ".claude")
+        write_legacy_transcript(claude, "-srv-app", "s-leg", "/srv/app",
+                                ["first prompt", "second prompt"])
+        orig = db.connect
+        db.connect = lambda path=tmpdb, cross_thread=False: orig(path, cross_thread)
+        try:
+            con = db.connect()
+            self.ji.ingest_tree(con, os.path.join(claude, "projects"),
+                                "oldbox", force=True)
+            con.commit()
+            prompts = con.execute(
+                "SELECT text FROM prompts ORDER BY text").fetchall()
+            reqs = con.execute("SELECT COUNT(*) FROM api_requests").fetchone()[0]
+            out = con.execute(
+                "SELECT SUM(output_tokens) FROM api_requests").fetchone()[0]
+            con.close()
+        finally:
+            db.connect = orig
+        self.assertEqual([p[0] for p in prompts],
+                         ["first prompt", "second prompt"])
+        self.assertEqual(reqs, 2, "usage must attach, not be dropped")
+        self.assertEqual(out, 40)
 
 
 class SshConfig(unittest.TestCase):

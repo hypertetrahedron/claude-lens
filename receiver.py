@@ -39,14 +39,10 @@ _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 log.addHandler(_h)
 
 # Prompts injected by the harness (not typed by the user) get their own
-# prompt.id in telemetry; fold them into the preceding human prompt.
-INJECTED_PREFIXES = (
-    "<task-notification>",
-    "<teammate-message",
-    "<system-reminder>",
-    "<command-name>",
-    "Caveat: The messages below",
-)
+# prompt.id in telemetry; fold them into the preceding human prompt. Shared
+# with the transcript ingester, which needs the same list to recognise
+# injected turns in transcripts too old to carry an origin marker.
+INJECTED_PREFIXES = jsonl_ingest.INJECTED_PREFIXES
 
 _dirty = threading.Event()
 _db_lock = threading.Lock()

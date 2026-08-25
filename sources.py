@@ -248,8 +248,12 @@ def discover_local(extra_locations=(), scan_siblings=True,
                     continue
             except OSError:
                 continue
-            if looks_like_claude_dir(entry.path):
-                _add_root(roots, taken, entry.path, "sibling")
+            # Searched to the same depth as an extra location: a sibling may
+            # be a Claude directory itself, or a folder holding several of
+            # them (~/.claude-archive/oldlaptop/.claude). Only the top-level
+            # name is filtered, so this never walks the whole home directory.
+            for path in find_claude_dirs(entry.path, depth):
+                _add_root(roots, taken, path, "sibling")
 
     for location in extra_locations:
         hits = find_claude_dirs(location, depth)

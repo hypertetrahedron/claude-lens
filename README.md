@@ -48,7 +48,7 @@ The four places looked at:
 | Source | Found how | Label |
 |---|---|---|
 | Primary `~/.claude` | `CLAUDE_CONFIG_DIR`, else `~/.claude` | none (names unchanged) |
-| Sibling directories | any `.claude*` folder next to the primary one | the folder name |
+| Sibling directories | any `.claude*` folder next to the primary one, searched to the same depth as an extra location | the folder name |
 | Extra locations | each configured path searched a few levels deep | the folder name, or its parent when the folder is just `.claude` |
 | Remote machines | SSH, from `~/.ssh/config` or an explicit list | the host name |
 
@@ -58,6 +58,10 @@ actual transcripts inside `projects/`. That last rule is what lets an extra
 location point *above* the real directory — at a backup drive holding
 `backups/<machine>/.claude`, say — and still be found. Searching stops at each
 match and skips the usual heavy directories (`node_modules`, `.git`, …).
+
+Siblings get the same depth search, so `~/.claude-archive/oldbox/.claude`
+works as well as a plain `~/.claude-work`. Only the top-level name is filtered
+to `.claude*`, so this never walks the whole home directory.
 
 ### One-off, from the command line
 
@@ -167,6 +171,42 @@ build-server                 never                    3  backing off 6h - Permis
 
 An explicit `--remote HOST` run always ignores the backoff — if you just fixed
 the key, you do not have to wait for it.
+
+## Older transcript formats
+
+Claude Code's transcript format has changed over time, and Claude Lens reads
+the older shapes as well as the current one — worth knowing about if you have
+history going back a while, or you collect from a machine running an older
+CLI.
+
+The consequential difference is how a typed prompt is marked. Current builds
+tag it `origin.kind == "human"`. Builds before that wrote no `origin` at all,
+which makes a typed prompt and a tool result structurally alike — both are
+`type: "user"` carrying a `promptId`. Because every API request is attributed
+to the prompt above it, an unrecognised prompt did not merely go missing
+itself: **the whole session's token usage went with it.**
+
+Each transcript is therefore classified on its own, by whether any user entry
+in it actually uses the marker — not by version number, since the marker
+appeared mid-way through the 2.1.x series. Files that use it keep the strict
+rule. Files that don't fall back to recognising a prompt by shape: a user turn
+that is not a tool result, not harness-injected, not a subagent's own turn,
+and that has text.
+
+The loose rule is applied *only* where the marker is genuinely absent. Modern
+transcripts are full of user entries with plain text and no origin — `/clear`
+wrappers, compaction summaries, `[Request interrupted by user]` — and reading
+those as prompts would invent rows and misattribute usage.
+
+Also handled: subagent work interleaved into the main transcript (older
+layouts flagged it `isSidechain`; current ones use
+`<session>/subagents/agent-*.jsonl`), and session ids taken from the
+transcript body rather than assumed from the filename.
+
+Upgrading re-parses every transcript once (schema v5) to backfill what earlier
+versions dropped. On the machine this was developed against, one older remote
+went from 209 recorded API requests to 1,201, and from 25K output tokens to
+917K.
 
 ## Optional: live mode (OTel receiver)
 
@@ -309,11 +349,15 @@ add a changelog line in `db.py` and below.
 | 2 | `tool_calls.detail` (skill names); transcript-derived tool names upgrade generic live-telemetry rows (`mcp_tool` → `mcp__server__tool`); one-time transcript re-parse to backfill |
 | 3 | `sessions.source_label` (which Claude directory or remote machine a session came from) and `remote_state` (last successful SSH fetch per host, keeping transfers incremental). Existing rows keep an empty label, which is exactly what they were: the primary `~/.claude` |
 | 4 | `remote_state.fail_count` / `next_attempt`: an unreachable or unauthenticated host is backed off instead of retried every pass, so a misconfigured remote costs the background receiver nothing |
+| 5 | No column change — clears `ingest_state` to force one re-parse of every transcript, backfilling usage that older formats had dropped (see [Older transcript formats](#older-transcript-formats)) |
 
 ## Known limitations
 
 - Headless `claude -p` prompts that predate OTel enablement show
   "(prompt text unavailable)"; live sessions carry text via OTel.
+- Format handling is derived from transcripts written by CLI 2.1.168 and
+  later. Much older layouts may still parse — nothing assumes a version — but
+  they have not been tested against real data.
 - A brand-new session may show project `?` until the next ingest maps its
   session to a working directory.
 - Remote collection needs a POSIX remote reachable with key-based SSH;
