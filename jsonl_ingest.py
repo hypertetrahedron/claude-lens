@@ -29,6 +29,7 @@ import os
 import time
 
 import db
+import pricing
 import sources
 
 # Claude Code's config dir: ~/.claude by default, overridable via
@@ -224,12 +225,19 @@ def handle_assistant(con, entry, prompt_id, session_id, agent=None):
     if not usage or not rid:
         return
     cc = usage.get("cache_creation") or {}
+    # Store the id canonically with the original alongside: Bedrock and Vertex
+    # decorate the same model differently, and pricing is keyed on the plain
+    # Anthropic form.
+    raw_model = msg.get("model", "?")
+    canon, provider = pricing.canonical_model(raw_model)
     db.upsert_request(con, {
         "request_id": rid,
         "prompt_id": prompt_id,
         "session_id": session_id,
         "ts": ts,
-        "model": msg.get("model", "?"),
+        "model": canon or raw_model,
+        "model_raw": raw_model,
+        "provider": provider,
         "input_tokens": usage.get("input_tokens", 0) or 0,
         "output_tokens": usage.get("output_tokens", 0) or 0,
         "cache_read_tokens": usage.get("cache_read_input_tokens", 0) or 0,

@@ -246,6 +246,56 @@ versions dropped. On the machine this was developed against, one older remote
 went from 209 recorded API requests to 1,201, and from 25K output tokens to
 917K.
 
+## Bedrock and Vertex
+
+Claude Code can reach the same models through the Anthropic API, through
+Amazon Bedrock (`CLAUDE_CODE_USE_BEDROCK=1`) or through Vertex AI
+(`CLAUDE_CODE_USE_VERTEX=1`). **Collection is identical** — transcripts land in
+the same place in the same format — but each route decorates the model id
+differently, and that used to matter a great deal:
+
+| Route | Model id as recorded |
+|---|---|
+| Anthropic API | `claude-opus-4-5-20251101` |
+| Bedrock | `us.anthropic.claude-opus-4-5-20251101-v1:0` |
+| Bedrock (ARN) | `arn:aws:bedrock:…:inference-profile/us.anthropic.claude-…` |
+| Vertex AI | `claude-opus-4-5@20251101` |
+
+Pricing is keyed on the plain Anthropic form, so **every Bedrock id used to
+miss the table and be costed at $0.00** — silently, because the warning went
+to stderr and the receiver runs without a console. Ids are now canonicalised
+on the way in: the decoration is stripped, the original is kept in
+`api_requests.model_raw`, and the detected provider in `api_requests.provider`.
+Upgrading rewrites the ids already stored (schema v7), since transcript rows
+are insert-or-ignore and a re-parse would never touch them.
+
+What follows from the provider:
+
+- **Rates are per provider.** The Bedrock and Vertex tables start as copies of
+  the Anthropic list price, which is where they have historically sat. Treat
+  that as an assumption, not a measurement — Bedrock rates vary by region,
+  batch inference is discounted, and Provisioned Throughput bills per
+  model-unit-hour, where a per-token estimate means nothing at all. Paste your
+  own rate card into `pricing.local.json` (see `pricing.example.json`).
+- **Promotional pricing is first-party only.** A promotion on the Anthropic
+  API says nothing about a marketplace's rate card.
+- **Deployment ARNs are reported, not guessed.** An application inference
+  profile or provisioned-model ARN names a *deployment*, not a model — nothing
+  in the id says which model it serves. Those stay unpriced and are named in
+  the dashboard until you map them under `model_aliases`. An alias sets the
+  model; the provider still comes from the original id, so an aliased Bedrock
+  deployment is billed at Bedrock rates.
+- **Subscription-only tiles disappear.** The plan gauges and the 5-hour
+  rate-limit block describe a Claude subscription. Traffic billed to a cloud
+  account is governed by that account's throughput quotas instead, so those
+  tiles are hidden rather than shown as zero.
+- **Unpriced models are named on the page**, not just on stderr — the failure
+  that started all this was a confident, wrong $0.00 with nothing to explain
+  it. This applies to any unpriced model, not only Bedrock ones.
+
+Rows recorded before provider tracking carry no provider and are treated as
+first-party, so nothing changes for an existing install.
+
 ## Optional: live mode (OTel receiver)
 
 For minute-fresh data and exact CLI-reported costs, run the receiver
@@ -367,7 +417,8 @@ carry the CLI's authoritative `cost_usd`).
 | `receiver.py` | Optional live OTLP listener + scheduler |
 | `digest.py` | Weekly digest with collision-proof filenames |
 | `template.html` | Dashboard UI (no external deps) |
-| `db.py` / `pricing.py` | Storage / pricing table for estimates |
+| `db.py` / `pricing.py` | Storage / pricing, model-id canonicalisation |
+| `pricing.example.json` | Template for `pricing.local.json` rate + alias overrides |
 | `check_live.py` | Diagnostic: dump recent live rows |
 | `test_sources.py` | Tests for multi-source ingest and the report index |
 
@@ -480,6 +531,7 @@ add a changelog line in `db.py` and below.
 | 4 | `remote_state.fail_count` / `next_attempt`: an unreachable or unauthenticated host is backed off instead of retried every pass, so a misconfigured remote costs the background receiver nothing |
 | 5 | No column change — clears `ingest_state` to force one re-parse of every transcript, backfilling usage that older formats had dropped (see [Older transcript formats](#older-transcript-formats)) |
 | 6 | `sessions.title` (the name Claude Desktop gives a session), `run_cost` (a CLI-reported cost per session, spent only where it provably covers every run), and an index on `api_requests.session_id` |
+| 7 | `api_requests.provider` and `.model_raw` — model ids are stored canonically with the original kept alongside, so Bedrock and Vertex ids resolve against the pricing table. Existing rows are normalised in place |
 
 ## Known limitations
 

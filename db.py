@@ -50,8 +50,14 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics.db")
 #       session), run_cost (CLI-reported cost per session, used only where it
 #       provably covers every run), and an index on api_requests.session_id
 #       so per-session work stops being a full scan.
+#   7 - provider awareness: api_requests.provider and .model_raw. Claude Code
+#       can reach the same model through the Anthropic API, Bedrock or Vertex,
+#       and each decorates the id differently; ids are now stored canonically
+#       with the original kept alongside. Existing rows are normalised in
+#       place, which is the only way to reprice Bedrock history - api_requests
+#       rows are insert-or-ignore, so a re-parse would never touch them.
 # ---------------------------------------------------------------------------
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS prompts (
@@ -80,7 +86,9 @@ CREATE TABLE IF NOT EXISTS api_requests (
     duration_ms       INTEGER,
     query_source      TEXT,
     agent_name        TEXT,
-    source            TEXT
+    source            TEXT,
+    model_raw         TEXT,
+    provider          TEXT
 );
 CREATE TABLE IF NOT EXISTS tool_calls (
     tool_use_id TEXT PRIMARY KEY,
@@ -188,8 +196,33 @@ def _migrate_to_6(con):
                 "ON api_requests(session_id)")
 
 
+def _migrate_to_7(con):
+    """api_requests.provider / .model_raw, and normalise the ids already stored.
+
+    Rewriting in place rather than re-parsing: api_requests rows from
+    transcripts are insert-or-ignore, so a re-parse leaves an existing row's
+    model untouched and Bedrock history would stay uncosted forever.
+    """
+    import pricing
+    cols = [r[1] for r in con.execute("PRAGMA table_info(api_requests)")]
+    if "model_raw" not in cols:
+        con.execute("ALTER TABLE api_requests ADD COLUMN model_raw TEXT")
+    if "provider" not in cols:
+        con.execute("ALTER TABLE api_requests ADD COLUMN provider TEXT")
+    seen = [r[0] for r in con.execute(
+        "SELECT DISTINCT model FROM api_requests WHERE model IS NOT NULL")]
+    for raw in seen:
+        canon, provider = pricing.canonical_model(raw)
+        if canon is None and provider is None:
+            continue                      # "<synthetic>" and friends: leave be
+        con.execute(
+            """UPDATE api_requests SET model=?, model_raw=?, provider=?
+               WHERE model=?""",
+            (canon or raw, raw, provider, raw))
+
+
 MIGRATIONS = {2: _migrate_to_2, 3: _migrate_to_3, 4: _migrate_to_4,
-              5: _migrate_to_5, 6: _migrate_to_6}
+              5: _migrate_to_5, 6: _migrate_to_6, 7: _migrate_to_7}
 
 
 def connect(path=DB_PATH, cross_thread=False):
@@ -244,7 +277,8 @@ def upsert_request(con, row, source):
     cols = ("request_id", "prompt_id", "session_id", "ts", "model",
             "input_tokens", "output_tokens", "cache_read_tokens",
             "cache_create_tokens", "cache_5m_tokens", "cache_1h_tokens",
-            "cost_usd", "duration_ms", "query_source", "agent_name")
+            "cost_usd", "duration_ms", "query_source", "agent_name",
+            "model_raw", "provider")
     vals = [row.get(c) for c in cols]
     if source == "otel":
         con.execute(

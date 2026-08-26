@@ -495,6 +495,160 @@ class CoworkSupport(unittest.TestCase):
         self.assertEqual(stats["prompts"], 0)
 
 
+class ProviderModelIds(unittest.TestCase):
+    """Bedrock and Vertex decorate model ids; pricing is keyed on the plain form."""
+
+    def setUp(self):
+        import pricing
+        self.pricing = pricing
+        self.saved_aliases = dict(pricing.MODEL_ALIASES)
+
+    def tearDown(self):
+        self.pricing.MODEL_ALIASES.clear()
+        self.pricing.MODEL_ALIASES.update(self.saved_aliases)
+
+    def test_canonicalises_every_provider_form(self):
+        cases = {
+            "claude-opus-4-5-20251101":
+                ("claude-opus-4-5-20251101", "anthropic"),
+            "anthropic.claude-sonnet-4-5-20250929-v1:0":
+                ("claude-sonnet-4-5-20250929", "bedrock"),
+            "us.anthropic.claude-opus-4-5-20251101-v1:0":
+                ("claude-opus-4-5-20251101", "bedrock"),
+            "eu.anthropic.claude-haiku-4-5-20251001-v1:0":
+                ("claude-haiku-4-5-20251001", "bedrock"),
+            "global.anthropic.claude-sonnet-4-5-20250929-v1:0":
+                ("claude-sonnet-4-5-20250929", "bedrock"),
+            "arn:aws:bedrock:us-east-1:1:inference-profile/"
+            "us.anthropic.claude-opus-4-5-20251101-v1:0":
+                ("claude-opus-4-5-20251101", "bedrock"),
+            "claude-opus-4-5@20251101":
+                ("claude-opus-4-5-20251101", "vertex"),
+        }
+        for raw, want in cases.items():
+            self.assertEqual(self.pricing.canonical_model(raw), want, raw)
+
+    def test_every_provider_form_now_prices(self):
+        for raw in ("anthropic.claude-sonnet-4-5-20250929-v1:0",
+                    "us.anthropic.claude-opus-4-5-20251101-v1:0",
+                    "arn:aws:bedrock:us-east-1:1:inference-profile/"
+                    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+                    "claude-opus-4-5@20251101"):
+            self.assertIsNotNone(self.pricing.lookup(raw), raw)
+            self.assertIsNotNone(
+                self.pricing.estimate_cost(raw, input_tokens=1000), raw)
+
+    def test_deployment_arns_are_unpriced_not_guessed(self):
+        """These name a deployment, not a model - no id to infer from."""
+        for raw in ("arn:aws:bedrock:us-east-1:1:application-inference-profile/abc",
+                    "arn:aws:bedrock:us-east-1:1:provisioned-model/xyz"):
+            canon, provider = self.pricing.canonical_model(raw)
+            self.assertIsNone(canon, raw)
+            self.assertEqual(provider, "bedrock")
+            self.assertIsNone(self.pricing.lookup(raw), raw)
+
+    def test_alias_names_the_model_but_not_the_provider(self):
+        arn = "arn:aws:bedrock:us-east-1:1:application-inference-profile/abc"
+        self.pricing.MODEL_ALIASES[arn] = "claude-opus-4-5"
+        canon, provider = self.pricing.canonical_model(arn)
+        self.assertEqual(canon, "claude-opus-4-5")
+        self.assertEqual(provider, "bedrock",
+                         "an aliased deployment is still billed at Bedrock rates")
+
+    def test_placeholders_stay_out_of_the_provider_tally(self):
+        self.assertEqual(self.pricing.canonical_model("<synthetic>"), (None, None))
+        self.assertEqual(self.pricing.canonical_model(""), (None, None))
+        self.assertEqual(self.pricing.canonical_model(None), (None, None))
+
+    def test_provider_tables_are_independent(self):
+        import tempfile as tf
+        d = tf.mkdtemp()
+        try:
+            path = os.path.join(d, "pricing.local.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"prices": {"bedrock": {"claude-haiku-4-5": [9.0, 9.0]}}}, f)
+            self.pricing.load_overrides(path)
+            self.assertEqual(
+                self.pricing.lookup("claude-haiku-4-5-20251001", provider="bedrock"),
+                (9.0, 9.0))
+            self.assertEqual(
+                self.pricing.lookup("claude-haiku-4-5-20251001", provider="anthropic"),
+                (1.0, 5.0), "an override for one provider must not leak")
+        finally:
+            self.pricing.PROVIDER_PRICES["bedrock"] = dict(self.pricing.PRICES)
+            self.pricing._rebuild_indexes()
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_intro_pricing_is_first_party_only(self):
+        anthro = self.pricing.lookup("claude-sonnet-5", ts="2026-08-01",
+                                     provider="anthropic")
+        bedrock = self.pricing.lookup("claude-sonnet-5", ts="2026-08-01",
+                                      provider="bedrock")
+        self.assertEqual(anthro, (2.0, 10.0), "promo applies on the first party")
+        self.assertEqual(bedrock, (3.0, 15.0), "a marketplace has its own card")
+
+
+class BedrockIngest(unittest.TestCase):
+    """A Bedrock-routed transcript must cost something, not $0.00."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="claude-lens-bedrock-")
+        self.dbpath = os.path.join(self.tmp, "metrics.db")
+        self._connect = db.connect
+        db.connect = lambda path=self.dbpath, cross_thread=False:             self._connect(path, cross_thread)
+
+    def tearDown(self):
+        db.connect = self._connect
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _ingest(self, model):
+        import jsonl_ingest
+        root = os.path.join(self.tmp, "c")
+        d = os.path.join(root, "projects", "-srv-app")
+        os.makedirs(d, exist_ok=True)
+        entries = [
+            {"type": "user", "origin": {"kind": "human"}, "promptId": "p0",
+             "timestamp": TS, "cwd": "/srv/app", "sessionId": "s0",
+             "message": {"content": [{"type": "text", "text": "q"}]}},
+            {"type": "assistant", "timestamp": TS, "requestId": "r0",
+             "sessionId": "s0",
+             "message": {"model": model, "content": [],
+                         "usage": {"input_tokens": 50000, "output_tokens": 20000,
+                                   "cache_read_input_tokens": 800000,
+                                   "cache_creation_input_tokens": 100000}}}]
+        with open(os.path.join(d, "s0.jsonl"), "w", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e) + chr(10))
+        con = db.connect()
+        jsonl_ingest.ingest_tree(con, os.path.join(root, "projects"), "")
+        con.commit()
+        return con
+
+    def test_bedrock_rows_are_stored_canonically_and_costed(self):
+        import build_dashboard
+        con = self._ingest("us.anthropic.claude-opus-4-5-20251101-v1:0")
+        model, raw, provider = con.execute(
+            "SELECT model, model_raw, provider FROM api_requests").fetchone()
+        self.assertEqual(model, "claude-opus-4-5-20251101")
+        self.assertEqual(raw, "us.anthropic.claude-opus-4-5-20251101-v1:0")
+        self.assertEqual(provider, "bedrock")
+        rows, _ = build_dashboard.collect(con)
+        con.close()
+        self.assertGreater(sum(r["cost"] for r in rows), 0,
+                           "a Bedrock row used to be costed at $0.00")
+        self.assertEqual(build_dashboard.PROVIDERS, {"bedrock": 1})
+
+    def test_deployment_arn_is_reported_rather_than_silently_zero(self):
+        import build_dashboard
+        con = self._ingest(
+            "arn:aws:bedrock:us-east-1:1:application-inference-profile/abc")
+        rows, _ = build_dashboard.collect(con)
+        con.close()
+        self.assertEqual(sum(r["cost"] for r in rows), 0)
+        self.assertTrue(build_dashboard.unpriced_models(),
+                        "an uncostable model must be reported, not hidden")
+
+
 class DashboardPayload(unittest.TestCase):
     """The contract between collect() and the dashboard's product selector.
 

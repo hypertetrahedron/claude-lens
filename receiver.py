@@ -22,6 +22,7 @@ from logging.handlers import RotatingFileHandler
 import build_dashboard
 import db
 import jsonl_ingest
+import pricing
 import sources
 
 HOST, PORT = "127.0.0.1", 4318
@@ -142,12 +143,16 @@ def handle_record(con, rec):
                          canonical_id=canonical)
     elif body == "claude_code.api_request":
         agent = attrs.get("agent.name")
+        raw_model = attrs.get("model", "?")
+        canon, provider = pricing.canonical_model(raw_model)
         db.upsert_request(con, {
             "request_id": attrs.get("request_id"),
             "prompt_id": prompt_id,
             "session_id": session_id,
             "ts": ts,
-            "model": attrs.get("model", "?"),
+            "model": canon or raw_model,
+            "model_raw": raw_model,
+            "provider": provider,
             "input_tokens": attrs.get("input_tokens", 0),
             "output_tokens": attrs.get("output_tokens", 0),
             "cache_read_tokens": attrs.get("cache_read_tokens", 0),

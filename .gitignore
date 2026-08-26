@@ -11,3 +11,6 @@ __pycache__/
 
 # local source configuration (machine names, paths) — see sources.example.json
 sources.json
+
+# local pricing corrections (region rates, deployment-ARN mappings)
+pricing.local.json

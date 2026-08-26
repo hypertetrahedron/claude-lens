@@ -45,6 +45,11 @@ UNPRICED = {}
 # collect(); reported by build() so a run says how much of it is exact.
 REPRICED = {"rows": 0}
 
+# Provider -> request count from the last collect(). Bedrock and Vertex users
+# have no Claude subscription, so the plan gauges and the 5h rate-limit block
+# describe nothing for them and the dashboard hides those tiles.
+PROVIDERS = {}
+
 
 def parse_ts(ts):
     try:
@@ -53,12 +58,15 @@ def parse_ts(ts):
         return None
 
 
-def note_unpriced(model, tokens, uncosted):
+def note_unpriced(model, tokens, uncosted, provider=None):
     e = UNPRICED.setdefault(model or "?",
-                            {"rows": 0, "uncosted_rows": 0, "tokens": 0})
+                            {"rows": 0, "uncosted_rows": 0, "tokens": 0,
+                             "provider": provider})
     e["rows"] += 1
     e["uncosted_rows"] += int(uncosted)
     e["tokens"] += tokens
+    if provider and not e.get("provider"):
+        e["provider"] = provider
 
 
 def warn_unpriced(stream=sys.stderr):
@@ -189,13 +197,16 @@ def collect(con):
     window_cutoff = datetime.now(timezone.utc) - timedelta(hours=WINDOW_LOOKBACK_H)
     recent = []
 
+    providers = defaultdict(int)
     for (pid, sid, ts, model, inp, out, cr, cw, c5, c1, cost, dur,
-         qsrc, agent) in con.execute(
+         qsrc, agent, provider) in con.execute(
             """SELECT prompt_id, session_id, ts, model, input_tokens,
                       output_tokens, cache_read_tokens, cache_create_tokens,
                       cache_5m_tokens, cache_1h_tokens, cost_usd, duration_ms,
-                      query_source, agent_name
+                      query_source, agent_name, provider
                FROM api_requests WHERE prompt_id IS NOT NULL"""):
+        if provider:
+            providers[provider] += 1
         r = bucket(pid)
         if r["project"] == "?" and sid in session_project:
             r["project"] = session_project[sid] or "?"
@@ -207,13 +218,14 @@ def collect(con):
         m["calls"] += 1
         r["api_calls"] += 1
         unsplit = max((cw or 0) - (c5 or 0) - (c1 or 0), 0)
-        p = pricing.lookup(model, ts)
+        p = pricing.lookup(model, ts, provider)
         if p is None:
             note_unpriced(model, (inp or 0) + (out or 0) + (cr or 0) + (cw or 0),
-                          uncosted=cost is None)
+                          uncosted=cost is None, provider=provider)
         if cost is None:
             cost = pricing.estimate_cost(model, inp or 0, out or 0, cr or 0,
-                                         c5 or 0, c1 or 0, unsplit, ts)
+                                         c5 or 0, c1 or 0, unsplit, ts,
+                                         provider=provider)
             if cost is None:
                 cost = 0.0
             r["est"] = True
@@ -348,6 +360,8 @@ def collect(con):
         out_rows.append(row)
     out_rows.sort(key=lambda r: r["ts"], reverse=True)
     warn_unpriced()
+    PROVIDERS.clear()
+    PROVIDERS.update(providers)
     return out_rows, compute_window(recent)
 
 
@@ -400,6 +414,11 @@ def plan_usage(cfg=None):
     }
 
 
+def unpriced_models():
+    """Unpriced models that actually billed tokens (placeholders excluded)."""
+    return {m: e for m, e in UNPRICED.items() if e["tokens"] > 0}
+
+
 def build(con=None, max_rows=DEFAULT_MAX_ROWS, redact=False, cfg=None):
     """Render dashboard.html (and refresh index.html).
 
@@ -420,6 +439,12 @@ def build(con=None, max_rows=DEFAULT_MAX_ROWS, redact=False, cfg=None):
     if redact:
         for r in out_rows:
             r["text"] = ""
+    # A subscription concept (plan gauges, the 5h rate-limit block) only means
+    # something if some traffic actually went through the Anthropic API. Rows
+    # predating provider tracking carry no provider and are treated as
+    # first-party, so nothing changes for an existing install.
+    third_party = {p for p in PROVIDERS if p != pricing.ANTHROPIC}
+    subscription = bool(PROVIDERS.get(pricing.ANTHROPIC)) or not third_party
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "window": window,
@@ -427,7 +452,15 @@ def build(con=None, max_rows=DEFAULT_MAX_ROWS, redact=False, cfg=None):
         "total_rows": total,
         "truncated": truncated,
         "redacted": bool(redact),
-        "plan": plan_usage(cfg),
+        "plan": plan_usage(cfg) if subscription else None,
+        "providers": dict(PROVIDERS),
+        "subscription": subscription,
+        "unpriced": [
+            {"model": m, "rows": e["rows"], "tokens": e["tokens"],
+             "provider": e.get("provider")}
+            for m, e in sorted(unpriced_models().items(),
+                               key=lambda kv: -kv[1]["tokens"])[:6]
+        ],
     }
     with open(TEMPLATE, encoding="utf-8") as f:
         html = f.read()
@@ -456,9 +489,11 @@ def build(con=None, max_rows=DEFAULT_MAX_ROWS, redact=False, cfg=None):
         print("NOTE: a receiver is running on 127.0.0.1:4318. It rebuilds "
               "dashboard.html on its own; restart it to pick up code changes.",
               file=sys.stderr)
-    unpriced = {m: e for m, e in UNPRICED.items() if e["tokens"] > 0}
+    unpriced = unpriced_models()
     if unpriced:
         result["unpriced_models"] = unpriced
+    if PROVIDERS:
+        result["providers"] = dict(PROVIDERS)
     return result
 
 
