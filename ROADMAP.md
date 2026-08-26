@@ -17,6 +17,8 @@ Last updated: 2026-08-25
 
 | Older transcript formats | Complete | Prompt-marker vintage is detected per file, not by version: files without an `origin` marker fall back to recognising prompts by shape, which recovers sessions whose usage was previously dropped wholesale. Modern files keep the strict rule (verified byte-identical: 256 prompts before and after). Also handles inline `isSidechain` subagent turns and session ids read from the transcript body. Schema v5 forces the one-time re-parse. Verified on real data: a 2.1.16x-2.1.17x remote went 209 -> 1,201 API requests and 25K -> 917K output tokens. |
 
+| MTD date range | Complete | Calendar month-to-date alongside Today/7d/30d/90d/All. Kept as the string `"mtd"` rather than a day count, since `+"mtd"` is NaN; handler, aria state and persistence all compare as strings. |
+| Product selector (Code / Cowork) | Complete | Sits between the date range and the project list, scopes tiles/chart/table/CSV, narrows the project list and strips the redundant `cowork/` prefix. Defaults to Claude Code; hidden entirely when only one product has data. Filtering keys off the row's `kind` from `collect()`, not a name prefix. |
 | Cowork (Claude Desktop) collection | Complete | Session sandboxes under the desktop app's `local-agent-mode-sessions` store are auto-detected per platform and ingested under one `cowork` label, each session named by the app's own title instead of `local_<uuid>/outputs`. `--no-cowork` / `--cowork-dir` to override. Verified live: 14 sessions, 22 transcripts, 27 prompts, $21.85. |
 | Claude Chat collection | Deferred | No local data exists to collect - see below. |
 

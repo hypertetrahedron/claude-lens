@@ -353,6 +353,18 @@ available; cost views show the "without caching" counterfactual.
   include per-prompt derived metrics: tokens/min and lines/min (over the
   prompt's own duration), cache hit %, cost per 1K lines, subagent share,
   cost without caching, API calls, cache-read tokens, chars written.
+- **Date range** — Today, 7d, **MTD** (calendar month to date, in your own
+  timezone), 30d, 90d, All. MTD is a calendar period rather than a rolling
+  window, so early in the month it covers less than 7d.
+- **Product selector** — when a database holds more than one Claude product,
+  a selector appears between the date range and the project list to switch
+  between **Claude Code** and **Claude Cowork**. It scopes everything: tiles,
+  chart, table and CSV. The project list narrows to that product, and the
+  `cowork/` label prefix is dropped from names once it is redundant. Claude
+  Code is the default, so Cowork usage is not mixed into Code totals unless
+  you ask for it. On a Code-only install the selector stays hidden. Rows are
+  tagged by the ingester rather than matched on their name, so a local
+  project that happens to be called `cowork` is still Claude Code.
 - **Group by project** — subtotal header rows, ordered by cost, click to
   collapse; subtotals follow the configured columns (rates aggregate at the
   group level).
