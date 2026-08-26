@@ -81,6 +81,11 @@
     --iron-other:     #6f6d66;
   }
 
+  /* The hidden attribute only hides via a UA rule of attribute specificity,
+     which any id-based display rule outranks - #chart-legend { display: flex }
+     silently defeated legend.hidden for exactly that reason. Several elements
+     here are toggled by the attribute, so make it authoritative once. */
+  [hidden] { display: none !important; }
   * { box-sizing: border-box; }
   body {
     margin: 0; padding: 20px;
@@ -619,6 +624,13 @@ function renderChart(rs) {
   for (const n of [...wrap.children]) if (n.id !== "tooltip") n.remove();
   const chart = CHARTS[state.chart] || CHARTS.out;
   $("chart-title").textContent = chart.title;
+  /* Clear the legend up front. Only stacked charts refill it, and the
+     no-data path below returns early - without this, switching to a chart
+     that has no legend (or no data) left the previous chart's series
+     labelled underneath it. */
+  const legend = $("chart-legend");
+  legend.hidden = true;
+  legend.replaceChildren();
 
   const byDay = new Map();
   for (const r of rs) {
@@ -683,7 +695,6 @@ function renderChart(rs) {
   }
 
   // legend: only for stacked multi-series charts (single series needs none)
-  const legend = $("chart-legend");
   if (stackDefs && present.length) {
     legend.hidden = false;
     legend.replaceChildren(...present.map(([n, slot]) => {
@@ -691,8 +702,6 @@ function renderChart(rs) {
       s.append(el("span", "sw sw-i" + slot), document.createTextNode(n));
       return s;
     }));
-  } else {
-    legend.hidden = true;
   }
   const band = plotW / seq.length;
   const barW = Math.min(24, Math.max(2, band - 2));

@@ -1014,6 +1014,32 @@ class TemplateWiring(unittest.TestCase):
                       '["output", 4], ["uncached input", 2]];', self.html)
         self.assertIn("const COMP_STACK = [0, 3, 1, 2];", self.html)
 
+    def test_hidden_attribute_is_not_defeated_by_a_display_rule(self):
+        """#chart-legend { display: flex } outranked [hidden] and beat it."""
+        import re
+        css = self.html[self.html.index("<style>"):self.html.index("</style>")]
+        css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+        self.assertRegex(
+            css, r"\[hidden\]\s*\{\s*display:\s*none\s*!important",
+            "the hidden attribute must outrank id-based display rules")
+        # nothing else may use !important on display, or the tie returns
+        others = [s for s, b in re.findall(r"([^{}]+)\{([^{}]*)\}", css)
+                  if "display" in b and "!important" in b
+                  and s.strip() != "[hidden]"]
+        self.assertEqual(others, [])
+
+    def test_legend_is_reset_before_any_early_return(self):
+        """Switching charts must not leave the previous chart's series shown."""
+        reset = self.html.index("legend.replaceChildren();")
+        early = self.html.index("if (!days.length) return;")
+        populate = self.html.index("legend.hidden = false;")
+        self.assertLess(reset, early,
+                        "the no-data path returns before the legend is filled")
+        self.assertLess(early, populate)
+        # the old else-branch that only flipped the attribute is gone
+        self.assertNotIn("} else {" + chr(10) + "    legend.hidden = true;",
+                         self.html)
+
     def test_donut_matches_the_stacked_bars(self):
         """Same three properties: no gap, cost order, small slices survive."""
         self.assertNotIn('p.style.stroke = "var(--surface-1)"', self.html)
