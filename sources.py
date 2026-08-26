@@ -589,6 +589,132 @@ def cowork_sessions(paths=(), depth=COWORK_DEPTH):
     return sorted(out, key=lambda s: s.title.lower())
 
 
+# Claude Desktop also keeps, beside the Cowork store:
+#   plan-usage-history.json   - percent-of-plan-limit samples, every 5 minutes
+#   claude-code-sessions/     - metadata for CLI sessions launched from the app
+PLAN_USAGE_FILE = "plan-usage-history.json"
+CODE_SESSIONS_SUBDIR = "claude-code-sessions"
+
+
+def desktop_dirs():
+    """Claude Desktop's data directory for this platform, if it exists."""
+    home = os.path.expanduser("~")
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
+        roots = [os.path.join(base, "Claude")]
+    elif sys.platform == "darwin":
+        roots = [os.path.join(home, "Library", "Application Support", "Claude")]
+    else:
+        cfg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+        roots = [os.path.join(cfg, "Claude")]
+    return [r for r in roots if os.path.isdir(r)]
+
+
+def plan_usage_samples(paths=()):
+    """Percent-of-plan-limit history, oldest first.
+
+    Claude Desktop samples the account's rate-limit gauges every five minutes
+    and keeps a 30-day rolling window: `fh` is the 5-hour window, `sd` the
+    7-day one, both 0-100. This is the only usage signal the desktop app keeps
+    locally, and it is account-wide - it cannot be split by product, project
+    or conversation, so it is reported as a gauge and never mixed into
+    per-prompt cost.
+
+    Returns [(epoch_seconds, fh, sd), ...]; empty when the app is absent.
+    """
+    files = ([os.path.expanduser(p) for p in paths]
+             if paths else
+             [os.path.join(d, PLAN_USAGE_FILE) for d in desktop_dirs()])
+    out = []
+    for path in files:
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            continue
+        for s in (raw.get("samples") if isinstance(raw, dict) else None) or []:
+            u = s.get("u") if isinstance(s, dict) else None
+            if not isinstance(u, dict) or not isinstance(s.get("t"), (int, float)):
+                continue
+            if u.get("fh") is None and u.get("sd") is None:
+                continue        # a sample with no gauge is not a zero reading
+            out.append((s["t"] / 1000.0,
+                        _pct(u.get("fh")), _pct(u.get("sd"))))
+    out.sort()
+    return out
+
+
+def _pct(v):
+    try:
+        return max(0, min(100, int(v)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def code_session_titles(paths=()):
+    """cliSessionId -> title for CLI sessions launched from Claude Desktop.
+
+    The CLI itself never names a session; the desktop app does, and that name
+    is far more useful in a table than a UUID.
+    """
+    stores = ([os.path.expanduser(p) for p in paths]
+              if paths else
+              [os.path.join(d, CODE_SESSIONS_SUBDIR) for d in desktop_dirs()])
+    titles = {}
+    for store in stores:
+        if not os.path.isdir(store):
+            continue
+        for path in _glob.glob(os.path.join(store, "**", "*.json"),
+                               recursive=True):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    meta = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(meta, dict):
+                continue
+            sid = meta.get("cliSessionId")
+            title = meta.get("title")
+            if isinstance(sid, str) and isinstance(title, str) and title.strip():
+                titles[sid] = clean_title(title)
+    return titles
+
+
+def audit_run_costs(claude_dir):
+    """(cost_usd, runs) per CLI session from a Cowork sandbox's audit log.
+
+    Cowork writes a signed `audit.jsonl` beside each sandbox; its `result`
+    events carry the CLI's own `total_cost_usd` for one completed run. Those
+    figures are exact, but a run that never finished and reported leaves no
+    record at all, so the count is returned alongside the money and the caller
+    is expected to check it covers every run before trusting it.
+    """
+    path = os.path.join(os.path.dirname(os.path.normpath(claude_dir)),
+                        "audit.jsonl")
+    out = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"total_cost_usd"' not in line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if (not isinstance(e, dict) or e.get("type") != "result"
+                        or not isinstance(e.get("session_id"), str)):
+                    continue
+                cost = e.get("total_cost_usd")
+                if not isinstance(cost, (int, float)):
+                    continue
+                cur = out.setdefault(e["session_id"], [0.0, 0])
+                cur[0] += float(cost)
+                cur[1] += 1
+    except OSError:
+        return {}
+    return {k: (v[0], v[1]) for k, v in out.items()}
+
+
 def dedupe_labels(roots):
     """Make every label unique across roots that were discovered separately.
 
@@ -647,7 +773,8 @@ class SourceConfig:
                  remote_full=False,
                  ssh_connect_timeout=DEFAULT_CONNECT_TIMEOUT,
                  remote_budget=DEFAULT_REMOTE_BUDGET,
-                 cowork=True, cowork_paths=()):
+                 cowork=True, cowork_paths=(), code_session_paths=(),
+                 plan_usage_paths=()):
         self.extra_locations = list(extra_locations)
         self.scan_siblings = scan_siblings
         self.depth = depth
@@ -662,6 +789,8 @@ class SourceConfig:
         # than configured; set cowork=false to leave it out.
         self.cowork = cowork
         self.cowork_paths = list(cowork_paths)
+        self.code_session_paths = list(code_session_paths)
+        self.plan_usage_paths = list(plan_usage_paths)
 
     @classmethod
     def load(cls, path=CONFIG_PATH):
@@ -686,6 +815,8 @@ class SourceConfig:
             ssh_options=raw.get("ssh_options") or [],
             cowork=bool(raw.get("cowork", True)),
             cowork_paths=raw.get("cowork_paths") or [],
+            code_session_paths=raw.get("code_session_paths") or [],
+            plan_usage_paths=raw.get("plan_usage_paths") or [],
         )
 
     def hosts(self):

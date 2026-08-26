@@ -1,7 +1,7 @@
 # Roadmap
 
 Status legend: Not Started · In Progress · Complete · Deferred
-Last updated: 2026-08-25
+Last updated: 2026-08-26
 
 | Feature | Status | Notes |
 |---|---|---|
@@ -22,6 +22,18 @@ Last updated: 2026-08-25
 | Cowork (Claude Desktop) collection | Complete | Session sandboxes under the desktop app's `local-agent-mode-sessions` store are auto-detected per platform and ingested under one `cowork` label, each session named by the app's own title instead of `local_<uuid>/outputs`. `--no-cowork` / `--cowork-dir` to override. Verified live: 14 sessions, 22 transcripts, 27 prompts, $21.85. |
 | Claude Chat collection | Deferred | No local data exists to collect - see below. |
 
+| All-products view | Complete | The product selector gained an "All products" entry so combined totals are reachable again; Claude Code stays the default. Prefixes are kept under All, where they are what distinguishes two products' projects. |
+| Product-aware weekly digest | Complete | `digest.py` adds a "By product" section whenever a week covers more than one, instead of pooling Cowork spend into Claude Code totals. |
+| Product list derived from data | Complete | The selector is built from the `kind` values actually present, with `PRODUCT_META` supplying display names and falling back to the raw id, so a product added later is reachable rather than filtered into invisibility. |
+| Receiver staleness guard | Complete | The receiver fingerprints its own files and stops writing `dashboard.html` once they change, so a hand-run rebuild is never overwritten by older code; ingestion continues and the log says to restart. `build_dashboard.py` prints a matching note when a receiver is listening. Restarting itself was tried and rejected - see Deferred. |
+| Plan-limit gauges | Complete | Claude Desktop's `plan-usage-history.json` (5h and 7d percent-of-limit, every 5 min, 30-day rolling) drives a tile and two chart views. Account-wide by nature, so only the date range applies; the 5h window tile is now labelled account-wide for the same reason. Absent cleanly when the desktop app is not installed. |
+| Session names | Complete | Titles from Claude Desktop's `claude-code-sessions` metadata are stored on `sessions.title` and offered as an optional Session column. |
+| Audit-backed Cowork cost | Complete | `run_cost` holds each sandbox's CLI-reported `total_cost_usd` with its run count; `collect()` reprices a session only when that count matches the prompts found, otherwise the estimate stands. 22 of this machine's rows repriced to exact figures. |
+| Payload size cap | Complete | `--max-rows` (default 8000) embeds only the newest prompts; the page states when rows were dropped. |
+| Shareable builds | Complete | `--no-prompt-text` blanks prompt text while keeping every number, and the page says it was redacted. |
+| Single-pass transcript reads | Complete | `scan_header` returns the parsed entries it already read, bounded by a byte budget, so a transcript is parsed once instead of scanned then parsed. Oversized files fall back to streaming. |
+| Per-session index | Complete | `idx_req_session` on `api_requests(session_id)`; per-session work is no longer a full scan. |
+
 ## Deferred
 
 - **Claude Chat usage** — conversations live server-side; the desktop app
@@ -40,6 +52,15 @@ Last updated: 2026-08-25
   estimate is within 3% ($7.23 vs $7.47). Would be worth revisiting with a
   per-session coverage guard (audit run count == prompt count) that upgrades
   only fully covered sessions.
+- **Moving metrics.db off the network share** — the database lives on an SMB
+  share here, where SQLite WAL is not reliable (a transient `disk I/O error`
+  was seen once). A `--db` flag pointing at local disk, with only the reports
+  on the share, would remove the risk. Explicitly deferred by request.
+- **Receiver restarting itself on a code change** — tried twice and rejected.
+  Exiting with a non-zero code did not make Windows Task Scheduler restart the
+  task, and `os.execv` left nothing listening at all. Stopping rebuilds and
+  logging is the safe half; a supervisor that genuinely restarts (systemd
+  `Restart=on-failure`) could take the stricter behaviour later.
 - **Windows remotes over SSH** — the collector assumes a POSIX remote (`sh`,
   `find`, `tar`). Supporting Windows would need a second, PowerShell-based
   collection path and a way to detect which to send. Workaround today: share

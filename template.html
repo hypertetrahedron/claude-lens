@@ -78,6 +78,12 @@
     padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer;
   }
 
+  .notice {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-left: 3px solid var(--series-3); border-radius: 6px;
+    padding: 7px 11px; margin-bottom: 12px;
+    color: var(--text-secondary); font-size: 12px;
+  }
   .filters {
     display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
     margin-bottom: 16px;
@@ -216,6 +222,8 @@
     <button id="theme-btn" type="button">Theme</button>
   </header>
 
+  <div id="notice" class="notice" hidden></div>
+
   <div class="filters">
     <span class="seg" id="range-seg" role="group" aria-label="Date range">
       <button data-range="1">Today</button>
@@ -238,6 +246,7 @@
     <div class="tile"><div class="label">Lines written</div><div class="value" id="t-lines">–</div><div class="hint" id="t-lines-h"></div></div>
     <div class="tile"><div class="label">Cost</div><div class="value" id="t-cost">–</div><div class="hint" id="t-cost-h">actual + estimated</div></div>
     <div class="tile"><div class="label">Current 5h window</div><div class="value" id="t-window">–</div><div class="hint" id="t-window-h"></div></div>
+    <div class="tile" id="tile-plan" hidden><div class="label">Plan limits used</div><div class="value" id="t-plan">–</div><div class="hint" id="t-plan-h"></div></div>
   </div>
 
   <div class="card">
@@ -249,6 +258,8 @@
         <option value="lpm">Lines changed / active min</option>
         <option value="cost">Cost / day</option>
         <option value="comp">Cost composition / day</option>
+        <option value="plan5h" data-plan>Plan limit: 5h peak / day</option>
+        <option value="plan7d" data-plan>Plan limit: 7d peak / day</option>
         <option value="cache">Cache hit rate / day</option>
         <option value="cpk">Cost per 1K lines / day</option>
         <option value="mix">Model mix / day</option>
@@ -330,14 +341,22 @@ const saved = (() => { try { return JSON.parse(localStorage.getItem("ccu-state")
 /* Claude products that can appear in one database. Rows carry `kind` from the
    ingester; older payloads have none, so they read as Claude Code. `prefix` is
    the source label the ingester puts on project names - redundant once the
-   view is already filtered to that product, so it is stripped for display. */
-const PRODUCTS = [
-  { id: "code",   label: "Claude Code",   prefix: "" },
-  { id: "cowork", label: "Claude Cowork", prefix: "cowork/" },
-];
+   view is already filtered to that product, so it is stripped for display.
+   The option list comes from the data, not from this table: a product the
+   ingester learns about later still shows up, under its raw id, rather than
+   becoming invisible. */
+const PRODUCT_META = {
+  code:   { label: "Claude Code",   prefix: "" },
+  cowork: { label: "Claude Cowork", prefix: "cowork/" },
+};
+const ALL_KINDS = "all";
 const DEFAULT_KIND = "code";
 const kindOf = r => r.kind || DEFAULT_KIND;
-const product = id => PRODUCTS.find(p => p.id === id) || PRODUCTS[0];
+const kindLabel = id =>
+  id === ALL_KINDS ? "All products" : (PRODUCT_META[id] || {}).label || id;
+/* No prefix for "All products": there the label is what keeps two products'
+   projects apart, so it has to stay. */
+const kindPrefix = id => (PRODUCT_META[id] || {}).prefix || "";
 
 const state = { range: saved.range ?? 30, project: saved.project || "all",
                 kind: saved.kind || DEFAULT_KIND,
@@ -353,12 +372,13 @@ const rows = DATA.rows;
 /* Project name as shown: the active product's label prefix carries no
    information once every visible row belongs to that product. */
 function projLabel(p) {
-  const pre = product(state.kind).prefix;
+  const pre = kindPrefix(state.kind);
   return pre && p.startsWith(pre) ? p.slice(pre.length) : p;
 }
 
 const projectsFor = kind => [...new Set(
-  rows.filter(r => kindOf(r) === kind).map(r => r.project))].sort(
+  rows.filter(r => kind === ALL_KINDS || kindOf(r) === kind)
+      .map(r => r.project))].sort(
     (a, b) => projLabel(a).localeCompare(projLabel(b)));
 
 /* Repopulate the project list for the active product. A project saved from
@@ -389,16 +409,19 @@ function initFilters() {
 
   // The product selector only earns its place when more than one product has
   // data; on the overwhelmingly common Code-only install it stays hidden.
-  const present = PRODUCTS.filter(p => rows.some(r => kindOf(r) === p.id));
-  if (!present.some(p => p.id === state.kind)) state.kind = DEFAULT_KIND;
+  const present = [...new Set(rows.map(kindOf))].sort();
+  const choices = present.length > 1 ? [ALL_KINDS, ...present] : present;
+  if (!choices.includes(state.kind))
+    state.kind = present.includes(DEFAULT_KIND) ? DEFAULT_KIND
+                                                : (present[0] || DEFAULT_KIND);
   const kindSel = $("f-kind");
   kindSel.hidden = present.length <= 1;   // set outright, not left to the markup
   if (present.length > 1) {
-    for (const p of present) {
-      const o = el("option", null, p.label); o.value = p.id; kindSel.append(o);
+    for (const id of choices) {
+      const o = el("option", null, kindLabel(id)); o.value = id;
+      kindSel.append(o);
     }
     kindSel.value = state.kind;
-    kindSel.hidden = false;
     kindSel.addEventListener("change", e => {
       state.kind = e.target.value;
       refreshProjects();
@@ -422,6 +445,13 @@ function initFilters() {
     for (const x of $("range-seg").children) x.setAttribute("aria-pressed", x === b);
     persist(); render();
   });
+  // Plan gauges only exist when Claude Desktop is installed.
+  if (!(DATA.plan && DATA.plan.days && Object.keys(DATA.plan.days).length)) {
+    for (const o of [...$("chart-sel").options])
+      if (o.hasAttribute("data-plan")) o.remove();
+    if (state.chart.startsWith("plan")) state.chart = "out";
+  }
+  if (!CHARTS[state.chart]) state.chart = "out";
   $("chart-sel").value = state.chart;
   $("chart-sel").addEventListener("change", e => {
     state.chart = e.target.value;
@@ -437,19 +467,26 @@ function initFilters() {
   initColPanel();
 }
 
-function filtered() {
-  let cutoff = "";
+/* Start of the selected period as an ISO instant, or "" for All. Shared so
+   the account-wide plan charts use exactly the same window as the rows. */
+function rangeCutoff() {
   if (state.range === "mtd") {
     // calendar month to date, in the viewer's own timezone
     const d = new Date(); d.setDate(1); d.setHours(0, 0, 0, 0);
-    cutoff = d.toISOString();
-  } else if (state.range > 0) {
-    const d = new Date(); d.setDate(d.getDate() - (state.range - 1)); d.setHours(0, 0, 0, 0);
-    cutoff = d.toISOString();
+    return d.toISOString();
   }
+  if (state.range > 0) {
+    const d = new Date(); d.setDate(d.getDate() - (state.range - 1)); d.setHours(0, 0, 0, 0);
+    return d.toISOString();
+  }
+  return "";
+}
+
+function filtered() {
+  const cutoff = rangeCutoff();
   return rows.filter(r =>
     (!cutoff || r.ts >= cutoff) &&
-    kindOf(r) === state.kind &&
+    (state.kind === ALL_KINDS || kindOf(r) === state.kind) &&
     (state.project === "all" || r.project === state.project) &&
     (state.model === "all" || r.models.some(m => m.model === state.model)) &&
     (!state.q || r.text.toLowerCase().includes(state.q)));
@@ -522,6 +559,13 @@ const CHARTS = {
            val: b => b.out > 0 ? 100 * b.agentOut / b.out : null, fmt: fmtPct, top: 100 },
   mix:   { title: "Model mix per day (output tokens)", stacked: "fams" },
   comp:  { title: "Cost composition per day", stacked: "comp", fmt: fmtUsd },
+  // Plan gauges come from Claude Desktop, not from prompts: they are
+  // account-wide percentages of the rate limit, so project/product/model
+  // filters do not apply to them. Only the date range does.
+  plan5h:{ title: "Plan limit: peak 5-hour usage per day (account-wide)",
+           plan: 0, val: b => b.plan, fmt: fmtPct, top: 100 },
+  plan7d:{ title: "Plan limit: peak 7-day usage per day (account-wide)",
+           plan: 1, val: b => b.plan, fmt: fmtPct, top: 100 },
 };
 // Cost components: fixed name -> color-slot pairing, order matches row.comp
 const COMP = [["cache read", 1], ["cache write", 3], ["output", 5], ["uncached input", 2]];
@@ -558,6 +602,14 @@ function renderChart(rs) {
       b.fams[f] = (b.fams[f] || 0) + m.out;
     }
     byDay.set(d, b);
+  }
+  if (chart.plan != null) {
+    byDay.clear();
+    const from = (rangeCutoff() || "").slice(0, 10);
+    const src = (DATA.plan && DATA.plan.days) || {};
+    for (const day of Object.keys(src)) {
+      if (!from || day >= from) byDay.set(day, { plan: src[day][chart.plan] });
+    }
   }
   const days = [...byDay.keys()].sort();
   if (!days.length) return;
@@ -762,6 +814,8 @@ const COLCAT = [
     cell: r => { const t = el("td", null, r.ts ? r.ts.slice(0, 16).replace("T", " ") : "–"); t.style.whiteSpace = "nowrap"; return t; } },
   { k: "project", label: "Project", def: true, val: r => projLabel(r.project),
     cell: r => el("td", "muted", projLabel(r.project)) },
+  { k: "title", label: "Session", val: r => r.title || "",
+    cell: r => el("td", "muted", r.title || "–") },
   { k: "text", label: "Prompt", def: true, val: r => r.text,
     cell: r => { const td = el("td", "prompt"); td.append(el("div", "txt", r.text || "(empty)")); return td; } },
   { k: "models", label: "Models", def: true, val: r => r.models.length,
@@ -1189,6 +1243,34 @@ function toggleDetail(tr, r) {
   tr.after(dtr);
 }
 
+/* Anything the reader needs to know about the payload itself rather than the
+   numbers in it: rows dropped to keep the file loadable, prompt text withheld
+   so the file can be shared. Silence about either would be misleading. */
+function renderNotice() {
+  const bits = [];
+  if (DATA.truncated)
+    bits.push(`Showing the newest ${fmtFull(DATA.rows.length)} of ` +
+              `${fmtFull(DATA.total_rows)} prompts. Rebuild with ` +
+              `--max-rows to change that.`);
+  if (DATA.redacted)
+    bits.push("Prompt text was withheld from this build (--no-prompt-text).");
+  const box = $("notice");
+  box.textContent = bits.join(" ");
+  box.hidden = !bits.length;
+}
+
+/* Account-wide rate-limit gauges from Claude Desktop. Not filterable: they
+   describe the account, not this slice of prompts. */
+function renderPlanTile() {
+  const plan = DATA.plan && DATA.plan.latest;
+  const tile = $("tile-plan");
+  if (!plan) { tile.hidden = true; return; }
+  tile.hidden = false;
+  $("t-plan").textContent = plan.fh + "% / " + plan.sd + "%";
+  $("t-plan-h").textContent = "5h / 7d limit · account-wide · as of " +
+    (plan.ts || "").replace("T", " ").slice(0, 16);
+}
+
 /* ---------- render ---------- */
 function render() {
   const rs = filtered();
@@ -1198,8 +1280,10 @@ function render() {
 }
 
 $("generated-at").textContent = "generated " + (DATA.generated_at || "").replace("T", " ").slice(0, 16);
+renderNotice();
 initFilters();
 renderWindow();
+renderPlanTile();
 render();
 addEventListener("resize", () => renderChart(filtered()));
 </script>

@@ -113,37 +113,48 @@ def has_tool_result(msg):
         isinstance(b, dict) and b.get("type") == "tool_result" for b in c)
 
 
-def scan_header(path, default_session):
-    """One cheap pass to learn a transcript's session id and its vintage.
+# Parsed entries are handed back from the header scan when a transcript is
+# small enough to hold, so it is read once instead of twice. Past this many
+# bytes the entries are dropped and the caller streams the file again -
+# bounded memory matters more than one extra read of a huge transcript.
+SCAN_KEEP_BYTES = 16 * 1024 * 1024
 
-    Returns (session_id, legacy). `legacy` is True when no user entry in the
-    file carries an origin marker, meaning human prompts have to be
-    recognised by shape instead (see is_human_prompt).
 
-    Detection is per file rather than by version number: the marker appeared
-    at some point during the 2.1.x series and the exact build is not worth
-    guessing, whereas "does this file use it" is directly observable. Only
-    lines that could hold the answer are parsed, so this costs a substring
-    scan rather than a full parse of the file.
+def scan_header(path, default_session, keep_bytes=SCAN_KEEP_BYTES):
+    """One pass for a transcript's session id, its vintage, and its entries.
+
+    Returns (session_id, legacy, entries). `legacy` is True when no user entry
+    in the file carries an origin marker, meaning human prompts have to be
+    recognised by shape instead (see is_human_prompt). `entries` is the parsed
+    file, or None when it was too large to keep and the caller should stream
+    it instead.
+
+    Vintage is decided per file rather than by version number: the marker
+    appeared partway through the 2.1.x series and the exact build is not worth
+    guessing, whereas "does this file use it" is directly observable.
     """
-    session, legacy = None, True
+    session, legacy, entries, held = None, True, [], 0
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
-                if session is None and '"sessionId"' in line:
-                    e = _loads(line)
-                    if isinstance(e, dict) and e.get("sessionId"):
-                        session = e["sessionId"]
-                if '"origin"' in line:
-                    e = _loads(line)
-                    if (isinstance(e, dict) and e.get("type") == "user"
-                            and isinstance(e.get("origin"), dict)
-                            and e["origin"].get("kind") in HUMAN_ORIGINS):
-                        legacy = False
-                        break
+                e = _loads(line)
+                if e is None or not isinstance(e, dict):
+                    continue
+                if entries is not None:
+                    held += len(line)
+                    if held > keep_bytes:
+                        entries = None      # too big to hold; stream it later
+                    else:
+                        entries.append(e)
+                if session is None and e.get("sessionId"):
+                    session = e["sessionId"]
+                if (legacy and e.get("type") == "user"
+                        and isinstance(e.get("origin"), dict)
+                        and e["origin"].get("kind") in HUMAN_ORIGINS):
+                    legacy = False
     except OSError:
-        pass
-    return session or default_session, legacy
+        entries = None
+    return session or default_session, legacy, entries
 
 
 def is_human_prompt(entry, legacy=False):
@@ -309,10 +320,10 @@ def ingest_main_file(con, path, label="", project_override=None):
     """
     project = qualify(label, project_override or
                       os.path.basename(os.path.dirname(path)))
-    session, legacy = scan_header(
+    session, legacy, entries = scan_header(
         path, os.path.splitext(os.path.basename(path))[0])
     current_pid = None
-    for e in iter_jsonl(path):
+    for e in (entries if entries is not None else iter_jsonl(path)):
         cwd = e.get("cwd")
         if cwd and not project_override:
             db.upsert_session(con, session, project=project, cwd=cwd,
@@ -367,6 +378,25 @@ def ingest_tree(con, projects_dir, label="", force=False, project_override=None)
     return scanned, ingested
 
 
+def apply_session_titles(con, cfg):
+    """Name CLI sessions that Claude Desktop launched.
+
+    The desktop app titles every session it starts; the CLI does not. Applying
+    those titles turns a UUID column into something readable. Returns how many
+    known sessions were named.
+    """
+    titles = sources.code_session_titles(cfg.code_session_paths)
+    if not titles:
+        return 0
+    known = {r[0] for r in con.execute("SELECT session_id FROM sessions")}
+    n = 0
+    for sid, title in titles.items():
+        if sid in known:
+            db.set_session_title(con, sid, title)
+            n += 1
+    return n
+
+
 def ingest_cowork(con, cfg, force=False):
     """Ingest Claude Desktop's Cowork sandboxes as one labeled source.
 
@@ -384,6 +414,13 @@ def ingest_cowork(con, cfg, force=False):
             sources.COWORK_LABEL, force, project_override=sess.title)
         scanned += n_scanned
         ingested += n_ingested
+        # The sandbox's signed audit log knows what each completed run cost.
+        # Recorded with its run count; collect() spends it only where that
+        # count covers every prompt in the session.
+        for cli_sid, (cost, runs) in sources.audit_run_costs(
+                sess.claude_dir).items():
+            db.set_run_cost(con, cli_sid, cost, runs, "cowork-audit")
+            db.set_session_title(con, cli_sid, sess.title)
     return scanned, ingested, len(sessions)
 
 
@@ -495,11 +532,15 @@ def run(force=False, root=None, config=None, skip_remote_fetch=False):
             used.append({"label": sources.COWORK_LABEL, "origin": "cowork",
                          "path": ", ".join(sources.cowork_stores(cfg.cowork_paths)),
                          "sessions": n_sessions, "transcripts": n_scanned})
+
+    titled = apply_session_titles(con, cfg) if root is None else 0
     con.commit()
     counts = {t: con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
               for t in ("prompts", "api_requests", "tool_calls", "edits", "sessions")}
     con.close()
     out = {"scanned": scanned, "ingested": ingested, "sources": used, **counts}
+    if titled:
+        out["titled_sessions"] = titled
     if remotes:
         out["remotes"] = remotes
     return out

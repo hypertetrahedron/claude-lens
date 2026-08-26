@@ -5,6 +5,7 @@ prompt), with per-model token/cost breakdowns, tool-call counts, file-edit
 stats, and subagent attribution. All filtering/summarizing happens client-side
 in the template. `collect()` is shared with digest.py.
 """
+import argparse
 import json
 import os
 import sys
@@ -28,12 +29,21 @@ MAX_TEXT = 400
 WINDOW_HOURS = 5          # Anthropic rate-limit window length
 WINDOW_LOOKBACK_H = 36    # how far back to scan when locating the current window
 
+# The payload is parsed by the browser on every load and every auto-refresh,
+# and each prompt costs roughly a kilobyte. Newest rows are kept; the UI says
+# so when anything was dropped, so a shrinking "All" view is never a mystery.
+DEFAULT_MAX_ROWS = 8000
+
 # Models seen during the last collect() that pricing.py has no entry for,
 # as {model: {"rows", "uncosted_rows", "tokens"}}. A new model launch lands
 # here: backfilled rows fall back to $0.00 and OTel rows keep their reported
 # total but lose the cost-composition split, so both under-report silently
 # unless we say something. Populated by collect(), reported by warn_unpriced().
 UNPRICED = {}
+
+# Rows whose cost was replaced by a CLI-reported figure during the last
+# collect(); reported by build() so a run says how much of it is exact.
+REPRICED = {"rows": 0}
 
 
 def parse_ts(ts):
@@ -124,9 +134,12 @@ def collect(con):
     # slug_display keys stay unique per source.
     session_project = {}
     session_kind = {}
+    session_title = {}
     slug_display = {}
-    for sid, proj, cwd, label in con.execute(
-            "SELECT session_id, project, cwd, source_label FROM sessions"):
+    for sid, proj, cwd, label, title in con.execute(
+            "SELECT session_id, project, cwd, source_label, title FROM sessions"):
+        if title:
+            session_title[sid] = title
         label = label or ""
         base = os.path.basename((cwd or "").rstrip("\\/"))
         disp = f"{label}/{base}" if (label and base) else (base or proj)
@@ -257,6 +270,30 @@ def collect(con):
         if agent:
             r["agents"].add(agent)
 
+    # A CLI-reported session cost is exact, but only for runs that finished
+    # and reported one. Spending it when it covers fewer runs than the session
+    # actually has would silently under-report, so it is applied only where
+    # the run count matches the prompts we found - otherwise the estimate,
+    # which at least covers everything, stands.
+    emitted = defaultdict(list)
+    for r in rows.values():
+        if (r["api_calls"] or r["tools"]) and r["session"]:
+            emitted[r["session"]].append(r)
+    repriced = 0
+    for sid, auth_cost, runs in con.execute(
+            "SELECT session_id, cost_usd, runs FROM run_cost"):
+        group = emitted.get(sid) or []
+        est_total = sum(g["cost"] for g in group)
+        if not group or not auth_cost or runs != len(group) or est_total <= 0:
+            continue
+        factor = auth_cost / est_total
+        for g in group:
+            g["cost"] *= factor
+            g["comp"] = [c * factor for c in g["comp"]]
+            g["est"] = False
+        repriced += len(group)
+    REPRICED["rows"] = repriced
+
     out_rows = []
     for r in rows.values():
         if not r["api_calls"] and not r["tools"]:
@@ -280,7 +317,7 @@ def collect(con):
             kind = (COWORK_KIND
                     if project.startswith(sources.COWORK_LABEL + "/")
                     else CODE_KIND)
-        out_rows.append({
+        row = {
             "id": r["id"],
             "ts": r["ts"],
             "project": project,
@@ -304,21 +341,93 @@ def collect(con):
             "file_list": file_list,
             "comp": [round(c, 4) for c in r["comp"]],
             "alt": round(r["alt"], 4),
-        })
+        }
+        title = session_title.get(r["session"])
+        if title and title != project:
+            row["title"] = title
+        out_rows.append(row)
     out_rows.sort(key=lambda r: r["ts"], reverse=True)
     warn_unpriced()
     return out_rows, compute_window(recent)
 
 
-def build(con=None):
+RECEIVER_ADDR = ("127.0.0.1", 4318)
+
+
+def receiver_running(addr=RECEIVER_ADDR, timeout=0.2):
+    """Is a live receiver holding the OTel port?
+
+    Worth knowing at build time: a receiver started before this code was
+    edited will not pick the change up, and says so in its own log where
+    nobody looks. Mentioning it here puts the note in front of whoever just
+    ran the build.
+    """
+    import socket
+    try:
+        with socket.create_connection(addr, timeout):
+            return True
+    except OSError:
+        return False
+
+
+def plan_usage(cfg=None):
+    """Account-wide rate-limit gauges, bucketed by UTC day for the chart.
+
+    Claude Desktop samples the plan's 5-hour and 7-day limits every five
+    minutes. Per day we keep the peak of each - a limit you touched at noon
+    still shaped your day even if you were idle by evening. Returns None when
+    the desktop app is not installed.
+    """
+    cfg = cfg or sources.SourceConfig.load()
+    samples = sources.plan_usage_samples(cfg.plan_usage_paths)
+    if not samples:
+        return None
+    days = {}
+    for epoch, fh, sd in samples:
+        day = datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%d")
+        cur = days.setdefault(day, [0, 0])
+        cur[0] = max(cur[0], fh)
+        cur[1] = max(cur[1], sd)
+    last = samples[-1]
+    return {
+        "days": days,
+        "latest": {
+            "ts": datetime.fromtimestamp(last[0], timezone.utc)
+                          .isoformat(timespec="seconds"),
+            "fh": last[1], "sd": last[2],
+        },
+        "samples": len(samples),
+    }
+
+
+def build(con=None, max_rows=DEFAULT_MAX_ROWS, redact=False, cfg=None):
+    """Render dashboard.html (and refresh index.html).
+
+    max_rows caps how many prompts are embedded, newest first - the payload is
+    re-parsed by the browser on every auto-refresh, so it cannot grow without
+    limit. redact blanks prompt text, which makes the file safe to hand to
+    someone who should see the numbers but not the conversations.
+    """
     own = con is None
     if own:
         con = db.connect()
     out_rows, window = collect(con)
+    total = len(out_rows)
+    truncated = 0
+    if max_rows and total > max_rows:
+        out_rows = out_rows[:max_rows]      # already newest-first
+        truncated = total - max_rows
+    if redact:
+        for r in out_rows:
+            r["text"] = ""
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "window": window,
         "rows": out_rows,
+        "total_rows": total,
+        "truncated": truncated,
+        "redacted": bool(redact),
+        "plan": plan_usage(cfg),
     }
     with open(TEMPLATE, encoding="utf-8") as f:
         html = f.read()
@@ -334,11 +443,39 @@ def build(con=None):
     # bookmark always reaches every report, however many digests pile up.
     index = report_index.build()
     result = {"rows": len(out_rows), "output": OUTPUT, "index": index}
+    if truncated:
+        result["truncated"] = truncated
+        print(f"NOTE: embedded the newest {len(out_rows):,} of {total:,} "
+              f"prompts (--max-rows to change).", file=sys.stderr)
+    if redact:
+        result["redacted"] = True
+    if REPRICED["rows"]:
+        result["repriced_rows"] = REPRICED["rows"]
+    if receiver_running():
+        result["receiver_running"] = True
+        print("NOTE: a receiver is running on 127.0.0.1:4318. It rebuilds "
+              "dashboard.html on its own; restart it to pick up code changes.",
+              file=sys.stderr)
     unpriced = {m: e for m, e in UNPRICED.items() if e["tokens"] > 0}
     if unpriced:
         result["unpriced_models"] = unpriced
     return result
 
 
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(
+        description="Render metrics.db into a self-contained dashboard.html.")
+    ap.add_argument("--max-rows", type=int, default=DEFAULT_MAX_ROWS,
+                    metavar="N",
+                    help=f"most prompts to embed, newest first "
+                         f"(default {DEFAULT_MAX_ROWS}; 0 = no limit)")
+    ap.add_argument("--no-prompt-text", action="store_true",
+                    help="blank prompt text, so the file can be shared "
+                         "without disclosing what was typed")
+    return ap.parse_args(argv)
+
+
 if __name__ == "__main__":
-    print(json.dumps(build(), indent=2))
+    _args = parse_args()
+    print(json.dumps(build(max_rows=_args.max_rows,
+                           redact=_args.no_prompt_text), indent=2))
