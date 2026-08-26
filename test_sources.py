@@ -9,6 +9,7 @@ Runs entirely on the local temp disk: python test_sources.py
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -271,10 +272,22 @@ class LegacyTranscripts(unittest.TestCase):
             {"type": "user", "sessionId": "s-legacy", "promptId": "p1",
              "promptSource": "sdk",
              "message": {"content": [{"type": "text", "text": "hello"}]}}])
-        self.assertEqual(self.ji.scan_header(modern, "fallback"),
-                         ("s-modern", False))
-        self.assertEqual(self.ji.scan_header(legacy, "fallback"),
-                         ("s-legacy", True))
+        sid, legacy_flag, entries = self.ji.scan_header(modern, "fallback")
+        self.assertEqual((sid, legacy_flag), ("s-modern", False))
+        self.assertEqual(len(entries), 1, "entries come back for reuse")
+        sid, legacy_flag, entries = self.ji.scan_header(legacy, "fallback")
+        self.assertEqual((sid, legacy_flag), ("s-legacy", True))
+        self.assertEqual(len(entries), 1)
+
+    def test_a_huge_transcript_is_streamed_instead_of_held(self):
+        path = self._write("big.jsonl", [
+            {"type": "user", "sessionId": "s", "promptId": "p",
+             "promptSource": "sdk",
+             "message": {"content": [{"type": "text", "text": "x" * 200}]}}])
+        sid, legacy_flag, entries = self.ji.scan_header(path, "x", keep_bytes=10)
+        self.assertEqual(sid, "s")
+        self.assertTrue(legacy_flag, "vintage is still decided correctly")
+        self.assertIsNone(entries, "over budget: caller re-reads instead")
 
     def test_origin_on_injected_turns_alone_does_not_mean_modern(self):
         """Older files carry origin on task-notifications but not on prompts."""
@@ -285,7 +298,7 @@ class LegacyTranscripts(unittest.TestCase):
             {"type": "user", "sessionId": "s1", "promptId": "p2",
              "promptSource": "sdk",
              "message": {"content": [{"type": "text", "text": "real prompt"}]}}])
-        _, legacy = self.ji.scan_header(path, "x")
+        _, legacy, _entries = self.ji.scan_header(path, "x")
         self.assertTrue(legacy, "only a human origin marks a file as modern")
 
     def test_legacy_prompt_recognised_tool_result_is_not(self):
@@ -543,6 +556,238 @@ class DashboardPayload(unittest.TestCase):
         self.assertEqual([r["project"] for r in rows], ["cowork"])
 
 
+class DesktopExtras(unittest.TestCase):
+    """The three side files Claude Desktop keeps beside its Cowork store."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="claude-lens-desktop-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_plan_usage_samples_parse_and_clamp(self):
+        path = os.path.join(self.tmp, "plan.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"version": 2, "samples": [
+                {"t": 2_000_000_000_000, "u": {"fh": 5, "sd": 10}},
+                {"t": 1_000_000_000_000, "u": {"fh": 200, "sd": -4}},
+                {"t": 1_500_000_000_000, "u": {}},
+                {"t": 1_600_000_000_000},                 # no gauges at all
+                {"u": {"fh": 1, "sd": 1}},                # no timestamp
+            ]}, f)
+        got = sources.plan_usage_samples([path])
+        # samples carrying no gauge at all are dropped, not read as 0%
+        self.assertEqual([(t, a, b) for t, a, b in got],
+                         [(1_000_000_000.0, 100, 0),      # clamped to 0..100
+                          (2_000_000_000.0, 5, 10)])      # sorted oldest first
+
+    def test_plan_usage_is_absent_not_fatal(self):
+        self.assertEqual(sources.plan_usage_samples([os.path.join(self.tmp, "no")]), [])
+        for bad in ("not json", "[]", '{"samples": "nope"}'):
+            path = os.path.join(self.tmp, "bad.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(bad)
+            self.assertEqual(sources.plan_usage_samples([path]), [], bad)
+
+    def test_code_session_titles(self):
+        store = os.path.join(self.tmp, "claude-code-sessions", "o", "g")
+        os.makedirs(store)
+        with open(os.path.join(store, "a.json"), "w", encoding="utf-8") as f:
+            json.dump({"cliSessionId": "cli-1", "title": "Fix the parser"}, f)
+        with open(os.path.join(store, "b.json"), "w", encoding="utf-8") as f:
+            json.dump({"cliSessionId": "cli-2"}, f)          # untitled
+        with open(os.path.join(store, "c.json"), "w", encoding="utf-8") as f:
+            f.write("{ broken")
+        got = sources.code_session_titles(
+            [os.path.join(self.tmp, "claude-code-sessions")])
+        self.assertEqual(got, {"cli-1": "Fix the parser"})
+
+    def test_audit_run_costs_sum_per_session(self):
+        sandbox = os.path.join(self.tmp, "local_x")
+        os.makedirs(os.path.join(sandbox, ".claude"))
+        with open(os.path.join(sandbox, "audit.jsonl"), "w",
+                  encoding="utf-8") as f:
+            for e in [
+                {"type": "result", "session_id": "s1", "total_cost_usd": 1.5},
+                {"type": "result", "session_id": "s1", "total_cost_usd": 0.5},
+                {"type": "result", "session_id": "s2", "total_cost_usd": 2.0},
+                {"type": "assistant", "session_id": "s1",
+                 "total_cost_usd": 99},                       # not a result
+                {"type": "result", "session_id": "s3"},       # no cost
+            ]:
+                f.write(json.dumps(e) + "\n")
+        got = sources.audit_run_costs(os.path.join(sandbox, ".claude"))
+        self.assertEqual(got, {"s1": (2.0, 2), "s2": (2.0, 1)})
+
+    def test_audit_missing_file_is_empty(self):
+        self.assertEqual(
+            sources.audit_run_costs(os.path.join(self.tmp, "nope", ".claude")),
+            {})
+
+
+class AuthoritativeCost(unittest.TestCase):
+    """run_cost is spent only where it demonstrably covers every run."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="claude-lens-cost-")
+        self.dbpath = os.path.join(self.tmp, "metrics.db")
+        self._connect = db.connect
+        db.connect = lambda path=self.dbpath, cross_thread=False: \
+            self._connect(path, cross_thread)
+
+    def tearDown(self):
+        db.connect = self._connect
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _two_prompt_session(self):
+        import jsonl_ingest
+        root = os.path.join(self.tmp, "c")
+        d = os.path.join(root, "projects", "-p")
+        os.makedirs(d, exist_ok=True)
+        entries = []
+        for i in (0, 1):
+            entries += [
+                {"type": "user", "origin": {"kind": "human"},
+                 "promptId": f"p{i}", "timestamp": TS, "cwd": "/p",
+                 "sessionId": "sess",
+                 "message": {"content": [{"type": "text", "text": f"q{i}"}]}},
+                {"type": "assistant", "timestamp": TS, "requestId": f"r{i}",
+                 "sessionId": "sess",
+                 "message": {"model": "claude-opus-5", "content": [],
+                             "usage": {"input_tokens": 1000,
+                                       "output_tokens": 1000,
+                                       "cache_read_input_tokens": 0,
+                                       "cache_creation_input_tokens": 0}}}]
+        with open(os.path.join(d, "sess.jsonl"), "w", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+        con = db.connect()
+        jsonl_ingest.ingest_tree(con, os.path.join(root, "projects"), "")
+        con.commit()
+        return con
+
+    def test_full_coverage_reprices_and_marks_exact(self):
+        import build_dashboard
+        con = self._two_prompt_session()
+        base, _ = build_dashboard.collect(con)
+        estimated = sum(r["cost"] for r in base)
+        self.assertGreater(estimated, 0)
+
+        db.set_run_cost(con, "sess", 9.0, 2, "test")   # 2 runs, 2 prompts
+        con.commit()
+        rows, _ = build_dashboard.collect(con)
+        con.close()
+        self.assertAlmostEqual(sum(r["cost"] for r in rows), 9.0, places=6)
+        self.assertTrue(all(not r["est"] for r in rows))
+        # the composition is scaled with it, so the donut still sums to cost
+        self.assertAlmostEqual(sum(sum(r["comp"]) for r in rows), 9.0, places=2)
+
+    def test_partial_coverage_is_refused(self):
+        import build_dashboard
+        con = self._two_prompt_session()
+        base, _ = build_dashboard.collect(con)
+        estimated = sum(r["cost"] for r in base)
+
+        db.set_run_cost(con, "sess", 9.0, 1, "test")   # only 1 of 2 runs
+        con.commit()
+        rows, _ = build_dashboard.collect(con)
+        con.close()
+        self.assertAlmostEqual(sum(r["cost"] for r in rows), estimated, places=6,
+                               msg="a partial record must not be spent")
+        self.assertTrue(all(r["est"] for r in rows))
+
+
+class BuildOptions(unittest.TestCase):
+    """Payload shaping: the row cap and prompt-text redaction."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="claude-lens-build-")
+        self.dbpath = os.path.join(self.tmp, "metrics.db")
+        self._connect = db.connect
+        db.connect = lambda path=self.dbpath, cross_thread=False: \
+            self._connect(path, cross_thread)
+        import build_dashboard
+        import report_index
+        self.bd = build_dashboard
+        self._out, self._idx = build_dashboard.OUTPUT, report_index.OUTPUT
+        build_dashboard.OUTPUT = os.path.join(self.tmp, "dashboard.html")
+        report_index.OUTPUT = os.path.join(self.tmp, "index.html")
+        import jsonl_ingest
+        root = os.path.join(self.tmp, "c")
+        for i in range(5):
+            write_transcript(root, "-p", f"s{i}", "/p", f"p{i}", f"r{i}")
+        con = db.connect()
+        jsonl_ingest.ingest_tree(con, os.path.join(root, "projects"), "")
+        con.commit()
+        con.close()
+
+    def tearDown(self):
+        import report_index
+        self.bd.OUTPUT, report_index.OUTPUT = self._out, self._idx
+        db.connect = self._connect
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _payload(self):
+        with open(self.bd.OUTPUT, encoding="utf-8") as f:
+            html = f.read()
+        raw = re.search(r"const DATA = (\{.*?\});\n", html, re.S).group(1)
+        return json.loads(raw)
+
+    def test_cap_keeps_the_newest_and_reports_the_rest(self):
+        self.bd.build(max_rows=2)
+        p = self._payload()
+        self.assertEqual(len(p["rows"]), 2)
+        self.assertEqual(p["total_rows"], 5)
+        self.assertEqual(p["truncated"], 3)
+        self.assertEqual(p["rows"], sorted(p["rows"], key=lambda r: r["ts"],
+                                           reverse=True))
+
+    def test_no_cap_embeds_everything(self):
+        self.bd.build(max_rows=0)
+        p = self._payload()
+        self.assertEqual(len(p["rows"]), 5)
+        self.assertEqual(p["truncated"], 0)
+
+    def test_redaction_removes_prompt_text_only(self):
+        self.bd.build(redact=True)
+        p = self._payload()
+        self.assertTrue(p["redacted"])
+        self.assertTrue(all(r["text"] == "" for r in p["rows"]))
+        self.assertTrue(all(r["out"] > 0 for r in p["rows"]),
+                        "numbers must survive redaction")
+
+    def test_text_is_present_by_default(self):
+        self.bd.build()
+        p = self._payload()
+        self.assertFalse(p["redacted"])
+        self.assertTrue(any(r["text"] for r in p["rows"]))
+
+
+class ReceiverStaleness(unittest.TestCase):
+    """The receiver must not overwrite a rebuild made with newer code."""
+
+    def test_fingerprint_notices_a_changed_file(self):
+        import receiver
+        before = receiver.code_fingerprint()
+        self.assertTrue(all(v is not None for v in before.values()))
+        self.assertIn("template.html", before)
+        self.assertIn("build_dashboard.py", before)
+
+    def test_stale_is_latched_and_reported_once(self):
+        import receiver
+        saved_started, saved_stale = receiver._started_with, receiver._stale
+        try:
+            receiver._stale = False
+            receiver._started_with = dict(receiver.code_fingerprint())
+            self.assertFalse(receiver.code_is_stale())
+            receiver._started_with["template.html"] = -1     # pretend it moved
+            self.assertTrue(receiver.code_is_stale())
+            self.assertTrue(receiver._stale, "must latch")
+            self.assertTrue(receiver.code_is_stale())
+        finally:
+            receiver._started_with, receiver._stale = saved_started, saved_stale
+
+
 class TemplateWiring(unittest.TestCase):
     """Cheap guards that the dashboard controls are still wired up.
 
@@ -578,10 +823,35 @@ class TemplateWiring(unittest.TestCase):
         self.assertLess(seg, kind, "product selector comes after the range")
         self.assertLess(kind, project, "product selector comes before project")
 
+    def test_all_products_option_and_derived_list(self):
+        self.assertIn('const ALL_KINDS = "all"', self.html)
+        self.assertIn("state.kind === ALL_KINDS || kindOf(r) === state.kind",
+                      self.html)
+        # options come from the data, so an unknown product stays reachable
+        self.assertIn("const present = [...new Set(rows.map(kindOf))].sort()",
+                      self.html)
+        self.assertIn("(PRODUCT_META[id] || {}).label || id", self.html)
+
+    def test_plan_gauges_are_wired(self):
+        self.assertIn('value="plan5h"', self.html)
+        self.assertIn('value="plan7d"', self.html)
+        self.assertIn('id="tile-plan"', self.html)
+        self.assertIn("function renderPlanTile", self.html)
+        self.assertIn("chart.plan != null", self.html)
+        # the range must apply to plan charts, and nothing else should
+        self.assertIn("function rangeCutoff", self.html)
+
+    def test_notice_and_session_column_are_wired(self):
+        self.assertIn('id="notice"', self.html)
+        self.assertIn("function renderNotice", self.html)
+        self.assertIn("DATA.truncated", self.html)
+        self.assertIn("DATA.redacted", self.html)
+        self.assertIn('{ k: "title", label: "Session"', self.html)
+
     def test_product_filter_and_label_stripping_are_wired(self):
         self.assertIn("kindOf(r) === state.kind", self.html)
         self.assertIn("function projLabel", self.html)
-        self.assertIn('{ id: "cowork", label: "Claude Cowork", prefix: "cowork/" }',
+        self.assertIn('cowork: { label: "Claude Cowork", prefix: "cowork/" }',
                       self.html)
         self.assertIn('const DEFAULT_KIND = "code"', self.html)
         # every place a project name reaches the user goes through projLabel

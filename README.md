@@ -289,11 +289,54 @@ within a minute of new data.
 
    Only one receiver can run (port 4318 is the lock).
 
+## Sharing and size
+
+`build_dashboard.py` takes two options that matter once a dashboard leaves
+your machine or your history gets long:
+
+| Flag | Effect |
+|---|---|
+| `--no-prompt-text` | Blanks prompt text. Every number survives; nothing you typed is embedded. The page says it was redacted. |
+| `--max-rows N` | Embeds only the newest N prompts (default 8000; `0` for no limit). |
+
+The payload is re-parsed by the browser on every load and every 5-minute
+auto-refresh, and each prompt costs roughly a kilobyte — so an unbounded
+history eventually makes the page slow to open. When rows are dropped the
+dashboard says so, so a shrinking "All" view is never a mystery.
+
+Prompt text is otherwise embedded verbatim (first 400 characters), which is
+worth remembering before sending `dashboard.html` to anyone.
+
+## Keeping the receiver current
+
+The receiver owns `dashboard.html` — it rebuilds it about once a minute using
+the code it started with. Edit the builder or the template while it is
+running and it would otherwise overwrite your rebuild with output from the old
+code, which is a baffling way to lose work.
+
+So it fingerprints its own files at startup, and once any of them changes it
+**stops writing `dashboard.html`** and logs:
+
+```
+ERROR code changed on disk (template.html); no longer rebuilding
+dashboard.html - restart this receiver to pick up the new version
+```
+
+Ingestion carries on, and a rebuild you run by hand is left alone. Restart the
+receiver to resume live rebuilds. `build_dashboard.py` also prints a note when
+it sees a receiver listening on 127.0.0.1:4318, so the reminder appears where
+you are standing.
+
+(It does not restart itself. Exiting and re-execing were both tried: Windows
+Task Scheduler did not restart on a non-zero exit, and a re-exec left nothing
+running at all — worse than a stale page.)
+
 ## Optional: weekly digest
 
 `python digest.py` writes a self-contained report for the last 7 full days
 (UTC) to `reports/digest-<YYYY>-W<week>.html` — totals, per-project,
-per-model-family, top-10 most expensive prompts, daily breakdown. Existing
+per-product (when more than one is present), per-model-family, top-10 most
+expensive prompts, daily breakdown. Existing
 digests are **never overwritten** (same-week re-runs get a `-HHMMSS` suffix);
 `reports/index.html` links them all, and the top-level `index.html` is
 refreshed too so a new digest appears next to the live dashboard. Schedule it
@@ -357,18 +400,31 @@ available; cost views show the "without caching" counterfactual.
   timezone), 30d, 90d, All. MTD is a calendar period rather than a rolling
   window, so early in the month it covers less than 7d.
 - **Product selector** — when a database holds more than one Claude product,
-  a selector appears between the date range and the project list to switch
-  between **Claude Code** and **Claude Cowork**. It scopes everything: tiles,
-  chart, table and CSV. The project list narrows to that product, and the
-  `cowork/` label prefix is dropped from names once it is redundant. Claude
-  Code is the default, so Cowork usage is not mixed into Code totals unless
-  you ask for it. On a Code-only install the selector stays hidden. Rows are
-  tagged by the ingester rather than matched on their name, so a local
-  project that happens to be called `cowork` is still Claude Code.
+  a selector appears between the date range and the project list, offering
+  **All products**, **Claude Code** and **Claude Cowork**. It scopes
+  everything: tiles, chart, table and CSV. The project list narrows to the
+  selection, and the `cowork/` label prefix is dropped from names once it is
+  redundant — under *All products* it stays, because there it is what keeps
+  two products' projects apart. Claude Code is the default. On a Code-only
+  install the selector stays hidden. Rows are tagged by the ingester rather
+  than matched on their name, so a local project that happens to be called
+  `cowork` is still Claude Code; and the option list is built from the data,
+  so a product added later shows up rather than becoming unreachable.
+- **Plan-limit gauges** — when Claude Desktop is installed, a tile shows the
+  account's current 5-hour and 7-day rate-limit usage, and two chart views
+  show the daily peak of each. These come from the desktop app's own
+  sampling, are **account-wide**, and are not affected by the project,
+  product or model filters — only by the date range. The *Current 5h window*
+  tile is likewise account-wide (rate limits apply to the account, so
+  scoping it to a project would misrepresent it).
+- **Session names** — sessions started from Claude Desktop carry the title
+  the app shows. Add the optional **Session** column to see it.
 - **Group by project** — subtotal header rows, ordered by cost, click to
   collapse; subtotals follow the configured columns (rates aggregate at the
   group level).
 - **Export CSV** — the current filtered/sorted view, incl. cost components.
+- **Notices** — if a build embedded only the newest N prompts, or withheld
+  prompt text, the page says so rather than quietly showing less.
 - **Auto-refresh** — the page reloads every 5 minutes; filters, chart choice,
   and grouping persist (localStorage). Light/dark theme with toggle.
 
@@ -400,6 +456,7 @@ add a changelog line in `db.py` and below.
 | 3 | `sessions.source_label` (which Claude directory or remote machine a session came from) and `remote_state` (last successful SSH fetch per host, keeping transfers incremental). Existing rows keep an empty label, which is exactly what they were: the primary `~/.claude` |
 | 4 | `remote_state.fail_count` / `next_attempt`: an unreachable or unauthenticated host is backed off instead of retried every pass, so a misconfigured remote costs the background receiver nothing |
 | 5 | No column change — clears `ingest_state` to force one re-parse of every transcript, backfilling usage that older formats had dropped (see [Older transcript formats](#older-transcript-formats)) |
+| 6 | `sessions.title` (the name Claude Desktop gives a session), `run_cost` (a CLI-reported cost per session, spent only where it provably covers every run), and an index on `api_requests.session_id` |
 
 ## Known limitations
 

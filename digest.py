@@ -23,6 +23,10 @@ import report_index
 BASE = os.path.dirname(os.path.abspath(__file__))
 REPORTS = os.path.join(BASE, "reports")
 
+# Rows carry the product that produced them; a digest covering more than one
+# says so rather than silently pooling Cowork spend into Claude Code totals.
+PRODUCT_NAMES = {"code": "Claude Code", "cowork": "Claude Cowork"}
+
 # Shared with index.html so every generated page looks like one system.
 CSS = report_index.CSS
 
@@ -87,10 +91,14 @@ def build_digest(now=None):
         "agents": sum(len(r["agents"]) for r in rows),
     }
 
+    prod = defaultdict(lambda: defaultdict(float))
     proj = defaultdict(lambda: defaultdict(float))
     fam = defaultdict(lambda: defaultdict(float))
     days = defaultdict(lambda: defaultdict(float))
     for r in rows:
+        k = prod[PRODUCT_NAMES.get(r.get("kind"), r.get("kind") or "Claude Code")]
+        k["prompts"] += 1; k["out"] += r["out"]; k["inp"] += r["inp"]
+        k["cost"] += r["cost"]; k["lines"] += r["ladd"] + r["lrem"]
         p = proj[r["project"]]
         p["prompts"] += 1; p["out"] += r["out"]; p["inp"] += r["inp"]
         p["cost"] += r["cost"]; p["lines"] += r["ladd"] + r["lrem"]
@@ -105,6 +113,9 @@ def build_digest(now=None):
             fam[f]["out"] += m["out"]; fam[f]["cost"] += m["cost"]
             fam[f]["calls"] += m["calls"]
 
+    prod_rows = [[k, int(v["prompts"]), fmt(v["out"]), fmt(v["lines"]),
+                  fmt_cost(v["cost"], tot["est"])]
+                 for k, v in sorted(prod.items(), key=lambda kv: -kv[1]["cost"])]
     proj_rows = [[k, int(v["prompts"]), fmt(v["inp"]), fmt(v["out"]),
                   fmt(v["lines"]), fmt_cost(v["cost"], tot["est"])]
                  for k, v in sorted(proj.items(), key=lambda kv: -kv[1]["cost"])]
@@ -129,6 +140,10 @@ def build_digest(now=None):
             ("Cost", fmt_cost(tot["cost"], tot["est"])),
         ])
 
+    # only worth a section when more than one product is in play
+    by_product = ("<h2>By product</h2>" + table(
+        ["Product", "Prompts", "Output", "Lines +/-", "Cost"], prod_rows,
+        {1, 2, 3, 4})) if len(prod_rows) > 1 else ""
     period = f"{start.date()} – {(end - timedelta(days=1)).date()}"
     doc = f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -138,6 +153,7 @@ def build_digest(now=None):
 <div class="sub">{period} (UTC) · generated {now.strftime('%Y-%m-%d %H:%M')} ·
 <a href="index.html">all digests</a> · <a href="../index.html">all reports</a></div>
 <div class="tiles">{tiles}</div>
+{by_product}
 <h2>By project</h2>
 {table(['Project', 'Prompts', 'Input', 'Output', 'Lines ±', 'Cost'], proj_rows, {1,2,3,4,5})}
 <h2>By model family</h2>

@@ -46,8 +46,12 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics.db")
 #       their human prompts go unrecognised, so their API usage was dropped
 #       entirely; the ingester now recognises them, and only a re-parse can
 #       backfill what was missed.
+#   6 - sessions.title (the human-readable name Claude Desktop gives a
+#       session), run_cost (CLI-reported cost per session, used only where it
+#       provably covers every run), and an index on api_requests.session_id
+#       so per-session work stops being a full scan.
 # ---------------------------------------------------------------------------
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS prompts (
@@ -106,7 +110,17 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_id   TEXT PRIMARY KEY,
     project      TEXT,
     cwd          TEXT,
-    source_label TEXT DEFAULT ''
+    source_label TEXT DEFAULT '',
+    title        TEXT
+);
+-- Cost a CLI reported for a whole session, with the number of runs it covers.
+-- Only trusted when `runs` matches the prompts actually seen for that session;
+-- a partial record would silently under-report. See build_dashboard.collect().
+CREATE TABLE IF NOT EXISTS run_cost (
+    session_id TEXT PRIMARY KEY,
+    cost_usd   REAL,
+    runs       INTEGER,
+    source     TEXT
 );
 CREATE TABLE IF NOT EXISTS remote_state (
     host         TEXT PRIMARY KEY,
@@ -123,6 +137,7 @@ CREATE TABLE IF NOT EXISTS ingest_state (
 CREATE INDEX IF NOT EXISTS idx_req_prompt ON api_requests(prompt_id);
 CREATE INDEX IF NOT EXISTS idx_tool_prompt ON tool_calls(prompt_id);
 CREATE INDEX IF NOT EXISTS idx_prompt_ts ON prompts(ts);
+CREATE INDEX IF NOT EXISTS idx_req_session ON api_requests(session_id);
 """
 
 
@@ -159,8 +174,22 @@ def _migrate_to_5(con):
     con.execute("DELETE FROM ingest_state")
 
 
+def _migrate_to_6(con):
+    """sessions.title, run_cost, and an index on api_requests.session_id."""
+    cols = [r[1] for r in con.execute("PRAGMA table_info(sessions)")]
+    if "title" not in cols:
+        con.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
+    con.execute("""CREATE TABLE IF NOT EXISTS run_cost (
+                       session_id TEXT PRIMARY KEY,
+                       cost_usd   REAL,
+                       runs       INTEGER,
+                       source     TEXT)""")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_req_session "
+                "ON api_requests(session_id)")
+
+
 MIGRATIONS = {2: _migrate_to_2, 3: _migrate_to_3, 4: _migrate_to_4,
-              5: _migrate_to_5}
+              5: _migrate_to_5, 6: _migrate_to_6}
 
 
 def connect(path=DB_PATH, cross_thread=False):
@@ -260,6 +289,25 @@ def insert_edit(con, tool_use_id, prompt_id, session_id, ts, file_path, kind,
         (tool_use_id, prompt_id, session_id, ts, file_path, kind,
          lines_added, lines_removed, chars_added, agent_name, source),
     )
+
+
+def set_session_title(con, session_id, title):
+    """Name a session (Claude Desktop shows one; the CLI does not)."""
+    con.execute(
+        """INSERT INTO sessions (session_id, title) VALUES (?,?)
+           ON CONFLICT(session_id) DO UPDATE SET title = excluded.title""",
+        (session_id, title))
+
+
+def set_run_cost(con, session_id, cost_usd, runs, source):
+    """Record a CLI-reported cost covering `runs` completed runs."""
+    con.execute(
+        """INSERT INTO run_cost (session_id, cost_usd, runs, source)
+           VALUES (?,?,?,?)
+           ON CONFLICT(session_id) DO UPDATE SET
+             cost_usd = excluded.cost_usd, runs = excluded.runs,
+             source = excluded.source""",
+        (session_id, cost_usd, runs, source))
 
 
 def upsert_session(con, session_id, project=None, cwd=None, source_label=None):

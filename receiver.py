@@ -32,6 +32,21 @@ RECONCILE_EVERY = 3600  # seconds between JSONL reconciliation passes
 BASE = os.path.dirname(os.path.abspath(__file__))
 LOG_PATH = os.path.join(BASE, "receiver.log")
 
+# The receiver owns dashboard.html: it rebuilds it about once a minute using
+# whatever code it started with. Edit the builder or the template while it is
+# running and your rebuild is silently overwritten by the old one, which is a
+# genuinely baffling way to lose work. So the files are fingerprinted at
+# startup, and once they change this process stops writing dashboard.html.
+#
+# It does not try to restart itself. Exiting and re-execing were both tried:
+# Windows Task Scheduler did not restart on a non-zero exit, and a re-exec
+# left nothing running at all, which is far worse than a stale page. So the
+# safe half is kept - a rebuild you just ran by hand is never overwritten by
+# older code - ingestion carries on, and the log says to restart.
+WATCHED_FILES = ("receiver.py", "build_dashboard.py", "template.html",
+                 "jsonl_ingest.py", "sources.py", "db.py", "pricing.py",
+                 "report_index.py")
+
 log = logging.getLogger("receiver")
 log.setLevel(logging.INFO)
 _h = RotatingFileHandler(LOG_PATH, maxBytes=2_000_000, backupCount=2, encoding="utf-8")
@@ -44,6 +59,41 @@ log.addHandler(_h)
 # injected turns in transcripts too old to carry an origin marker.
 INJECTED_PREFIXES = jsonl_ingest.INJECTED_PREFIXES
 
+def code_fingerprint():
+    """mtimes of the files whose changes this process cannot pick up."""
+    out = {}
+    for name in WATCHED_FILES:
+        try:
+            out[name] = os.path.getmtime(os.path.join(BASE, name))
+        except OSError:
+            out[name] = None
+    return out
+
+
+_started_with = code_fingerprint()
+
+
+def code_is_stale():
+    """True once a watched file differs from what this process loaded.
+
+    Logged once, then remembered: from that point the dashboard is left alone
+    so a hand-run rebuild survives, while ingestion keeps going.
+    """
+    global _stale
+    if _stale:
+        return True
+    changed = [n for n, m in code_fingerprint().items()
+               if m != _started_with.get(n)]
+    if not changed:
+        return False
+    _stale = True
+    log.error("code changed on disk (%s); no longer rebuilding dashboard.html "
+              "- restart this receiver to pick up the new version",
+              ", ".join(sorted(changed)))
+    return True
+
+
+_stale = False            # set once watched files change under us
 _dirty = threading.Event()
 _db_lock = threading.Lock()
 _con = db.connect(cross_thread=True)
@@ -182,13 +232,14 @@ def maintenance_loop():
     last_reconcile = 0.0
     while True:
         try:
+            stale = code_is_stale()
             now = time.time()
             if now - last_reconcile >= RECONCILE_EVERY:
                 stats = reconcile()
                 last_reconcile = now
                 _dirty.set()
                 log.info("reconcile: %s", stats)
-            if _dirty.is_set():
+            if _dirty.is_set() and not stale:
                 _dirty.clear()
                 with _db_lock:
                     build_dashboard.build(_con)
