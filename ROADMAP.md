@@ -38,6 +38,8 @@ Last updated: 2026-08-26
 | Gapless, cost-ordered donuts | Complete | The per-prompt cost donut lost its 2px slice stroke, gained cheapest-first slice order matching the bars, and a MIN_SWEEP floor so a small component still draws. Measured: 289 of 494 prompts had a slice below the floor, and every ring still closes to an exact turn. |
 | Ironbow cost ramp | Complete | Stacked series are coloured by cost, darkest cheapest to brightest dearest, for both model families and cache/output components; stacking order matches. Replaces the old fixed palette where haiku and fable were both greens at opposite ends of the cost spectrum (now 126-148 dE apart). Ends trimmed per theme; all stops >= 3:1 on their background, adjacent stops >= 37 dE. |
 
+| Bedrock / Vertex support | Complete | Model ids from any provider are canonicalised at ingest (schema v7 stores `provider` and `model_raw`, and rewrites ids already in the DB). Rates are per provider with `pricing.local.json` overrides for region rate cards and deployment-ARN aliases; promotional pricing is first-party only. Subscription-only tiles hide when no first-party traffic exists, and unpriced models are named on the page rather than only on stderr. Verified: a Bedrock transcript that previously totalled $0.00 now costs correctly, and an opaque deployment ARN is reported as unpriced instead of silently zero. |
+
 ## Deferred
 
 - **Claude Chat usage** — conversations live server-side; the desktop app
@@ -56,6 +58,16 @@ Last updated: 2026-08-26
   estimate is within 3% ($7.23 vs $7.47). Would be worth revisiting with a
   per-session coverage guard (audit run count == prompt count) that upgrades
   only fully covered sessions.
+- **Bedrock cost verification against a live account** — the Bedrock and
+  Vertex rate tables default to Anthropic list prices, and provider behaviour
+  (whether Claude Code reports `cost_usd` over OTel on Bedrock, whether the 1h
+  cache tier exists there) has not been checked against a real deployment. The
+  override file exists precisely because these are assumptions. Would be
+  unblocked by access to an account on either route.
+- **Provisioned Throughput and batch billing** — both break the per-token
+  model entirely (hourly commitment; ~50% discount). Nothing here can estimate
+  them; reconciling against AWS Cost Explorer or the CUR would be the real
+  answer.
 - **Moving metrics.db off the network share** — the database lives on an SMB
   share here, where SQLite WAL is not reliable (a transient `disk I/O error`
   was seen once). A `--db` flag pointing at local disk, with only the reports

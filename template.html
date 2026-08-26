@@ -266,7 +266,7 @@
     <div class="tile"><div class="label">Input tokens</div><div class="value" id="t-in">–</div><div class="hint">incl. cache read/write</div></div>
     <div class="tile"><div class="label">Lines written</div><div class="value" id="t-lines">–</div><div class="hint" id="t-lines-h"></div></div>
     <div class="tile"><div class="label">Cost</div><div class="value" id="t-cost">–</div><div class="hint" id="t-cost-h">actual + estimated</div></div>
-    <div class="tile"><div class="label">Current 5h window</div><div class="value" id="t-window">–</div><div class="hint" id="t-window-h"></div></div>
+    <div class="tile" id="tile-window"><div class="label">Current 5h window</div><div class="value" id="t-window">–</div><div class="hint" id="t-window-h"></div></div>
     <div class="tile" id="tile-plan" hidden><div class="label">Plan limits used</div><div class="value" id="t-plan">–</div><div class="hint" id="t-plan-h"></div></div>
   </div>
 
@@ -1324,6 +1324,17 @@ function toggleDetail(tr, r) {
    so the file can be shared. Silence about either would be misleading. */
 function renderNotice() {
   const bits = [];
+  /* An unpriced model is costed at $0.00, which looks like a real number.
+     This used to be a stderr warning only - invisible under the receiver,
+     which runs without a console - so a Bedrock user saw a confident $0.00
+     and nothing else. */
+  const up = DATA.unpriced || [];
+  if (up.length) {
+    const names = up.map(u => u.model + (u.provider ? ` (${u.provider})` : ""));
+    bits.push(`${up.length} model${up.length > 1 ? "s have" : " has"} no ` +
+              `price entry and ${up.length > 1 ? "are" : "is"} counted as ` +
+              `$0.00: ${names.join(", ")}. Add rates in pricing.local.json.`);
+  }
   if (DATA.truncated)
     bits.push(`Showing the newest ${fmtFull(DATA.rows.length)} of ` +
               `${fmtFull(DATA.total_rows)} prompts. Rebuild with ` +
@@ -1338,13 +1349,24 @@ function renderNotice() {
 /* Account-wide rate-limit gauges from Claude Desktop. Not filterable: they
    describe the account, not this slice of prompts. */
 function renderPlanTile() {
-  const plan = DATA.plan && DATA.plan.latest;
+  const plan = DATA.subscription === false ? null : (DATA.plan && DATA.plan.latest);
   const tile = $("tile-plan");
   if (!plan) { tile.hidden = true; return; }
   tile.hidden = false;
   $("t-plan").textContent = plan.fh + "% / " + plan.sd + "%";
   $("t-plan-h").textContent = "5h / 7d limit · account-wide · as of " +
     (plan.ts || "").replace("T", " ").slice(0, 16);
+}
+
+/* The 5h block is a subscription rate-limit concept. Traffic routed through
+   Bedrock or Vertex is billed per token against a cloud account and governed
+   by that account's throughput quotas instead, so the tile would be
+   describing a limit that does not apply. */
+function hideSubscriptionTiles() {
+  if (DATA.subscription !== false) return false;
+  $("tile-window").hidden = true;
+  $("tile-plan").hidden = true;
+  return true;
 }
 
 /* ---------- render ---------- */
@@ -1358,8 +1380,7 @@ function render() {
 $("generated-at").textContent = "generated " + (DATA.generated_at || "").replace("T", " ").slice(0, 16);
 renderNotice();
 initFilters();
-renderWindow();
-renderPlanTile();
+if (!hideSubscriptionTiles()) { renderWindow(); renderPlanTile(); }
 render();
 addEventListener("resize", () => renderChart(filtered()));
 </script>
