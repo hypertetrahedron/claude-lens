@@ -860,6 +860,21 @@ class TemplateWiring(unittest.TestCase):
                       '["output", 4], ["uncached input", 2]];', self.html)
         self.assertIn("const COMP_STACK = [0, 3, 1, 2];", self.html)
 
+    def test_donut_matches_the_stacked_bars(self):
+        """Same three properties: no gap, cost order, small slices survive."""
+        self.assertNotIn('p.style.stroke = "var(--surface-1)"', self.html)
+        self.assertNotIn('p.style.strokeWidth = "2"', self.html)
+        self.assertIn("const MIN_SWEEP = 0.024;", self.html)
+        self.assertIn("function fitSweeps(fracs)", self.html)
+        # ring order and the table beside it both follow COMP_STACK
+        self.assertIn("const parts = COMP_STACK.map(i => ({ i, v: (comp || [])[i] || 0 }))",
+                      self.html)
+        self.assertIn("COMP_STACK.forEach((i) => {", self.html)
+
+    def test_truncated_file_list_does_not_break_the_detail_panel(self):
+        """append() returns undefined; chaining appendChild onto it threw."""
+        self.assertNotIn('ft.append(el("tr")).appendChild(', self.html)
+
     def test_ironbow_palette_is_defined_for_both_themes(self):
         for var in ("--iron-1", "--iron-2", "--iron-3", "--iron-4",
                     "--iron-other"):
