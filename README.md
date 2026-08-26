@@ -1,10 +1,16 @@
 # Claude Lens
 
-A local usage dashboard for Claude Code: per-prompt token/cost tracking for
-all Claude Code sessions of the signed-in user. One dashboard row per prompt, with per-model input/output/cache tokens,
-tool-call counts, file/line changes, cost (with cache-savings counterfactual),
-and duration — subagent work and harness-injected turns folded into the prompt
-that caused them. Only Claude Code is tracked; no other AI tools.
+A local usage dashboard for Claude Code: one row per prompt, with per-model
+input/output/cache tokens, tool-call counts, file/line changes, cost (with a
+cache-savings counterfactual) and duration — subagent work and
+harness-injected turns folded into the prompt that caused them.
+
+It reads every Claude Code transcript it can find: the signed-in user's
+`~/.claude`, other `.claude*` directories, backup or archive locations,
+**other machines over SSH**, and **Claude Cowork** sessions from the desktop
+app — all in one database, each row labelled with where it came from. Traffic
+routed through **Amazon Bedrock** or **Vertex AI** is recognised and costed
+too. Only Claude Code and Cowork are tracked; no other AI tools.
 
 Works on Windows and Linux/macOS. No dependencies beyond Python 3.9+ (stdlib
 only); the dashboard itself is a single self-contained HTML file.
@@ -395,12 +401,20 @@ weekly (Task Scheduler / cron) if wanted.
 ## Architecture
 
 ```
-Claude Code sessions ──OTLP/HTTP (json)──► receiver.py (127.0.0.1:4318, optional)
-                                              │  live events → metrics.db
-~/.claude/projects/**/*.jsonl      ──┐        │  + reconcile hourly
-.claude*/, extra locations         ──┼─ingest►│                dashboard.html
-remote hosts ──ssh──► remote-cache/──┘        ▼              ┌► index.html
-        (sources.py / generate-dashboard) build_dashboard.py ─┘
+sources.py discovers, jsonl_ingest.py parses:
+
+    ~/.claude/projects/**/*.jsonl        the signed-in user
+    other .claude*/ and extra locations  siblings, backups, archives
+    Cowork sandboxes                     Claude Desktop
+    remote hosts ──ssh──► remote-cache/  other machines
+    plan history, session names          Claude Desktop, optional
+                     │
+                     ▼
+Claude Code ──OTLP/HTTP (json)──►  receiver.py  ──►  metrics.db
+              (optional, live)          │                │
+        reconciles hourly, rebuilds ────┘                ├──► build_dashboard.py ──► dashboard.html
+        the dashboard within a minute                    └──► digest.py ──────────► reports/*.html
+                                                              both refresh ───────► index.html
 ```
 
 Both sources write the same SQLite DB; dedupe on Anthropic request ids and
@@ -410,7 +424,8 @@ carry the CLI's authoritative `cost_usd`).
 | File | Role |
 |---|---|
 | `generate-dashboard.ps1` / `.sh` | One-shot: ingest + build + open |
-| `sources.py` | Finds Claude directories: local, sibling, nested, remote |
+| `sources.py` | Finds Claude data: local, sibling, nested, remote, Cowork, plan history |
+| `sources.example.json` | Template for `sources.json` (extra dirs, remotes, Cowork) |
 | `jsonl_ingest.py` | Transcript ingest/reconcile (`--force` = full re-parse) |
 | `build_dashboard.py` | Aggregates metrics.db → dashboard.html |
 | `report_index.py` | Writes index.html linking every report |
@@ -420,17 +435,19 @@ carry the CLI's authoritative `cost_usd`).
 | `db.py` / `pricing.py` | Storage / pricing, model-id canonicalisation |
 | `pricing.example.json` | Template for `pricing.local.json` rate + alias overrides |
 | `check_live.py` | Diagnostic: dump recent live rows |
-| `test_sources.py` | Tests for multi-source ingest and the report index |
+| `test_sources.py` | Test suite (discovery, ingest, pricing, payload, template wiring) |
 
 ## Chart metrics
 
-The chart card offers nine views (dropdown, persisted): output tokens/day,
+The chart card offers eleven views (dropdown, persisted): output tokens/day,
 tokens & lines per **active minute** (day total ÷ summed wall-clock span of
 each prompt; days under a minute of activity are skipped), cost/day, **cost
 composition** (stacked $: cache read / cache write / output / uncached input —
 cache reads typically dominate despite the 0.1x discount because input volume
 dwarfs output), cache hit rate, cost per 1K lines written (≥50 lines/day),
-model mix (stacked by family), and subagent share.
+model mix (stacked by family), subagent share, and — when Claude Desktop is
+installed — the daily peak of the account's 5-hour and 7-day **plan limits**.
+The plan views are account-wide, so only the date range applies to them.
 
 **Stacked charts are coloured by cost, on an ironbow ramp** — darkest is
 cheapest, brightest is dearest. Model families run haiku → sonnet → opus →
@@ -453,9 +470,11 @@ slices ordered cheapest to dearest around the ring, and a minimum arc so a
 small component is still visible. The floor is paid for proportionally by the
 larger slices, so the ring closes exactly; with at most four components the
 distortion stays under about a degree per lifted slice, and the tooltip and
-the table beside the donut carry the exact figures either way. Cost components are derived
-from the pricing table and scaled to sum to the CLI-reported cost where
-available; cost views show the "without caching" counterfactual.
+the table beside the donut carry the exact figures either way.
+
+Cost components are derived from the pricing table and scaled to sum to the
+CLI-reported cost where available; cost views show the "without caching"
+counterfactual.
 
 ## Other dashboard features
 
@@ -543,10 +562,10 @@ add a changelog line in `db.py` and below.
 - A brand-new session may show project `?` until the next ingest maps its
   session to a working directory.
 - Claude Chat conversations are not collectable: they live server-side, and
-  the desktop app keeps no local per-conversation or token record. The only
-  local signal is `plan-usage-history.json` (percent-of-plan-limit, sampled
-  every 5 minutes, account-wide, 30-day rolling) — it cannot be attributed to
-  a product or a conversation, so it is not ingested.
+  the desktop app keeps no local per-conversation or token record. Its
+  `plan-usage-history.json` *is* read, but only as an account-wide rate-limit
+  gauge — it carries no per-product or per-conversation breakdown, so it can
+  never say what Chat itself cost.
 - Remote collection needs a POSIX remote reachable with key-based SSH;
   Windows remotes have to go through a shared folder and `--extra-dir`.
 - Remote rows are only as fresh as the last fetch — the live OTel receiver
@@ -554,5 +573,11 @@ add a changelog line in `db.py` and below.
 - A remote parked by backoff stays stale until its retry window opens; run
   `--remote HOST` explicitly (or check `--remote-status`) if that is a
   surprise.
-- Costs for backfilled rows are estimates (`~` prefix); keep `pricing.py`
-  current if models change. Live rows use the CLI's own cost figure.
+- Costs for backfilled rows are estimates (`~` prefix); live rows use the
+  CLI's own figure. Keep `pricing.py` current as models change, and put local
+  corrections — a region's Bedrock rate card, a deployment-ARN mapping — in
+  `pricing.local.json` rather than editing the table. Any model with no rate
+  is named on the page and counted as $0.00 rather than guessed at.
+- Bedrock rates here default to Anthropic list prices and are unverified
+  against a live account; Provisioned Throughput and batch billing cannot be
+  estimated per token at all.
