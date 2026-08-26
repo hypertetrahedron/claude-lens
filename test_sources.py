@@ -841,6 +841,34 @@ class TemplateWiring(unittest.TestCase):
         # the range must apply to plan charts, and nothing else should
         self.assertIn("function rangeCutoff", self.html)
 
+    def test_stacked_segments_have_no_gap(self):
+        """A 2px gap erased any series small enough to be worth noticing."""
+        self.assertIn("yCursor = yTop;", self.html)
+        self.assertNotIn("yCursor = yTop - 2;", self.html)
+        self.assertNotIn("height: Math.max(1, h - 2)", self.html)
+        self.assertIn("height: h,", self.html)
+
+    def test_ironbow_ramp_is_ordered_by_cost(self):
+        # cheapest -> dearest by output rate: haiku, sonnet, opus, fable
+        for fam, slot in (("haiku", 1), ("sonnet", 2), ("opus", 3), ("fable", 4)):
+            self.assertRegex(self.html,
+                             r'\["%s",\s+m => [^,]+,\s*%d\]' % (fam, slot))
+        # unknown cost is not the same as expensive
+        self.assertIn('["other",  () => true, "o"]', self.html)
+        # per-token cost order for the cache/output components
+        self.assertIn('const COMP = [["cache read", 1], ["cache write", 3], '
+                      '["output", 4], ["uncached input", 2]];', self.html)
+        self.assertIn("const COMP_STACK = [0, 3, 1, 2];", self.html)
+
+    def test_ironbow_palette_is_defined_for_both_themes(self):
+        for var in ("--iron-1", "--iron-2", "--iron-3", "--iron-4",
+                    "--iron-other"):
+            # once for light, twice for dark (media query + explicit toggle)
+            self.assertEqual(self.html.count(var + ":"), 3, var)
+        self.assertIn(".fill-i1 { fill: var(--iron-1); }", self.html)
+        self.assertIn(".sw-io { background: var(--iron-other); }", self.html)
+        self.assertNotIn("fill-s1", self.html)   # old palette fully retired
+
     def test_notice_and_session_column_are_wired(self):
         self.assertIn('id="notice"', self.html)
         self.assertIn("function renderNotice", self.html)

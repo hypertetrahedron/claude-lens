@@ -92,8 +92,14 @@ def entries():
     return out + archived
 
 
-def build(output=OUTPUT):
-    """(Re)write index.html. Returns the path written."""
+def build(output=None):
+    """(Re)write index.html. Returns the path written.
+
+    The destination is resolved at call time rather than bound as a default,
+    so redirecting the module's OUTPUT actually takes effect - which is what
+    tests need in order not to write into the working copy.
+    """
+    output = output or OUTPUT
     items = entries()
     rows = "".join(
         "<tr class='{cls}'><td><a href='{href}'>{title}</a></td>"

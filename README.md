@@ -379,7 +379,23 @@ each prompt; days under a minute of activity are skipped), cost/day, **cost
 composition** (stacked $: cache read / cache write / output / uncached input —
 cache reads typically dominate despite the 0.1x discount because input volume
 dwarfs output), cache hit rate, cost per 1K lines written (≥50 lines/day),
-model mix (stacked by family), and subagent share. Cost components are derived
+model mix (stacked by family), and subagent share.
+
+**Stacked charts are coloured by cost, on an ironbow ramp** — darkest is
+cheapest, brightest is dearest. Model families run haiku → sonnet → opus →
+fable (roughly $5 → $50 per Mtok of output), and cost components run cache
+read → uncached input → cache write → output (0.1x → ~5x the input rate).
+Stacking follows the same order, so a bar reads bottom-to-top as a cost
+gradient. A model whose price is unknown gets a neutral grey rather than a
+place on the ramp — unknown is not the same as expensive. The ramp's extreme
+ends are trimmed per theme, because near-black vanishes on the dark page and
+pale yellow vanishes on the light one; every stop clears 3:1 against its
+background, and adjacent stops are at least 37 ΔE apart.
+
+Segments in a stacked bar sit flush against each other. They used to be
+separated by a 2px gap, which looked tidy on large segments and erased small
+ones outright — a series one pixel tall minus a two-pixel gap is not there at
+all. Colour does the separating now, and every segment keeps a 1px floor. Cost components are derived
 from the pricing table and scaled to sum to the CLI-reported cost where
 available; cost views show the "without caching" counterfactual.
 

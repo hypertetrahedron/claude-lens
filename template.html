@@ -22,6 +22,17 @@
     --series-4:       #008300;
     --series-5:       #4a3aa7;
     --hover-wash:     rgba(11,11,11,0.04);
+    /* Ironbow ramp for stacked series, ordered by cost: darkest is cheapest,
+       brightest is dearest. The classic palette runs black -> purple ->
+       orange -> white; both extremes are trimmed per theme, because
+       near-black disappears on the dark page and pale yellow disappears on
+       the light one. --iron-other is for series whose cost is unknown, which
+       is not the same as expensive. */
+    --iron-1:         #33206b;
+    --iron-2:         #93206e;
+    --iron-3:         #cc3a17;
+    --iron-4:         #b87b00;
+    --iron-other:     #8a8880;
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
@@ -40,6 +51,11 @@
       --series-4:       #008300;
       --series-5:       #9085e9;
       --hover-wash:     rgba(255,255,255,0.06);
+      --iron-1:         #7551e0;
+      --iron-2:         #a52a86;
+      --iron-3:         #ef6a1a;
+      --iron-4:         #ffcf4d;
+      --iron-other:     #6f6d66;
     }
   }
   :root[data-theme="dark"] {
@@ -58,6 +74,11 @@
     --series-4:       #008300;
     --series-5:       #9085e9;
     --hover-wash:     rgba(255,255,255,0.06);
+    --iron-1:         #7551e0;
+    --iron-2:         #a52a86;
+    --iron-3:         #ef6a1a;
+    --iron-4:         #ffcf4d;
+    --iron-other:     #6f6d66;
   }
 
   * { box-sizing: border-box; }
@@ -126,12 +147,12 @@
   .grid-line { stroke: var(--grid); stroke-width: 1; }
   .base-line { stroke: var(--baseline); stroke-width: 1; }
   .bar { fill: var(--series-1); }
-  .fill-s1 { fill: var(--series-1); } .fill-s2 { fill: var(--series-2); }
-  .fill-s3 { fill: var(--series-3); } .fill-s4 { fill: var(--series-4); }
-  .fill-s5 { fill: var(--series-5); }
-  .sw-s1 { background: var(--series-1); } .sw-s2 { background: var(--series-2); }
-  .sw-s3 { background: var(--series-3); } .sw-s4 { background: var(--series-4); }
-  .sw-s5 { background: var(--series-5); }
+  .fill-i1 { fill: var(--iron-1); } .fill-i2 { fill: var(--iron-2); }
+  .fill-i3 { fill: var(--iron-3); } .fill-i4 { fill: var(--iron-4); }
+  .fill-io { fill: var(--iron-other); }
+  .sw-i1 { background: var(--iron-1); } .sw-i2 { background: var(--iron-2); }
+  .sw-i3 { background: var(--iron-3); } .sw-i4 { background: var(--iron-4); }
+  .sw-io { background: var(--iron-other); }
   .bar-hit { fill: transparent; cursor: pointer; }
   .bar-hit:hover + .bar, .bar.hot { opacity: 0.8; }
   #chart-legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-secondary); margin: 0 0 6px; }
@@ -567,18 +588,31 @@ const CHARTS = {
   plan7d:{ title: "Plan limit: peak 7-day usage per day (account-wide)",
            plan: 1, val: b => b.plan, fmt: fmtPct, top: 100 },
 };
-// Cost components: fixed name -> color-slot pairing, order matches row.comp
-const COMP = [["cache read", 1], ["cache write", 3], ["output", 5], ["uncached input", 2]];
-// Fixed family -> color-slot assignment (color follows the entity, never rank).
+/* Cost components. Indexed to match row.comp - do not reorder. The slot is a
+   rank on the ironbow ramp, and per-token cost is what ranks them: cache read
+   is 0.1x the input rate, uncached input 1x, cache write 1.25-2x, and output
+   about 5x. So the colour tracks the money. */
+const COMP = [["cache read", 1], ["cache write", 3], ["output", 4], ["uncached input", 2]];
+/* Bottom-to-top stacking order (indices into COMP), cheapest first, so a
+   stacked bar reads as a cost gradient rather than an arbitrary pile. */
+const COMP_STACK = [0, 3, 1, 2];
+
+/* Model families in cost order, cheapest first - which is both the ramp rank
+   and the stacking order. Output rates run roughly haiku $5, sonnet $15,
+   opus $25, fable $50 per Mtok, so haiku and fable sit at opposite ends of
+   the ramp instead of being two similar greens. "other" is a model whose cost
+   we do not know, which is not the same as an expensive one, so it gets a
+   neutral grey off the ramp. Match order matters too: "other" catches
+   everything and must stay last. */
 const FAMILIES = [
-  ["opus",   m => m.includes("opus")],
-  ["fable",  m => m.includes("fable") || m.includes("mythos")],
-  ["sonnet", m => m.includes("sonnet")],
-  ["haiku",  m => m.includes("haiku")],
-  ["other",  () => true],
+  ["haiku",  m => m.includes("haiku"),  1],
+  ["sonnet", m => m.includes("sonnet"), 2],
+  ["opus",   m => m.includes("opus"),   3],
+  ["fable",  m => m.includes("fable") || m.includes("mythos"), 4],
+  ["other",  () => true, "o"],
 ];
 const famOf = (model) => FAMILIES.find(([, test]) => test(model || ""))[0];
-const famSlot = (fam) => FAMILIES.findIndex(([n]) => n === fam) + 1;
+const famSlot = (fam) => (FAMILIES.find(([n]) => n === fam) || [])[2] || "o";
 
 function renderChart(rs) {
   const wrap = $("chart-wrap");
@@ -628,7 +662,8 @@ function renderChart(rs) {
   // stacked charts: [name, colorSlot, accessor] per series, fixed order
   const stackDefs =
     chart.stacked === "fams" ? FAMILIES.map(([n]) => [n, famSlot(n), b => b.fams[n] || 0]) :
-    chart.stacked === "comp" ? COMP.map(([n, slot], i) => [n, slot, b => (b.comp || [])[i] || 0]) :
+    chart.stacked === "comp" ? COMP_STACK.map(i =>
+        [COMP[i][0], COMP[i][1], b => (b.comp || [])[i] || 0]) :
     null;
   const present = stackDefs
     ? stackDefs.filter(([, , get]) => seq.some(k => { const b = byDay.get(k); return b && get(b) > 0; }))
@@ -653,7 +688,7 @@ function renderChart(rs) {
     legend.hidden = false;
     legend.replaceChildren(...present.map(([n, slot]) => {
       const s = el("span");
-      s.append(el("span", "sw sw-s" + slot), document.createTextNode(n));
+      s.append(el("span", "sw sw-i" + slot), document.createTextNode(n));
       return s;
     }));
   } else {
@@ -685,7 +720,11 @@ function renderChart(rs) {
     const v = dayVal(key);
     const x = padL + i * band + (band - barW) / 2;
     if (stackDefs && v != null && v > 0) {
-      // stacked segments bottom-up in fixed series order, 2px surface gaps
+      /* Stacked segments bottom-up, flush against each other. There used to
+         be a 2px gap between them, which read nicely on big segments and
+         erased small ones outright - a 1px series minus a 2px gap is not
+         visible at all. Colour now does the separating, and every segment
+         keeps a 1px floor so a small contributor still shows up. */
       let yCursor = padT + plotH;
       const segs = present.map(([, slot, get]) => [slot, get(b)]).filter(s => s[1] > 0);
       segs.forEach(([slot, val], si) => {
@@ -693,12 +732,12 @@ function renderChart(rs) {
         const yTop = yCursor - h;
         const isTop = si === segs.length - 1;
         if (isTop) {
-          svg.append(roundedBar(x, yTop, barW, yCursor, "bar fill-s" + slot, key));
+          svg.append(roundedBar(x, yTop, barW, yCursor, "bar fill-i" + slot, key));
         } else {
-          svg.append(mk("rect", { x, y: yTop, width: barW, height: Math.max(1, h - 2),
-                                  class: "bar fill-s" + slot, "data-day": key }));
+          svg.append(mk("rect", { x, y: yTop, width: barW, height: h,
+                                  class: "bar fill-i" + slot, "data-day": key }));
         }
-        yCursor = yTop - 2;                     // 2px surface gap between segments
+        yCursor = yTop;
       });
     } else if (v != null && v > 0) {
       const h = Math.max(2, plotH * v / top);
@@ -1127,7 +1166,7 @@ function donutSvg(comp, total) {
         `L${x3},${y3} A${r0},${r0} 0 ${large} 0 ${x4},${y4} Z`);
       a = a2;
     }
-    p.setAttribute("class", "fill-s" + slot);
+    p.setAttribute("class", "fill-i" + slot);
     p.style.stroke = "var(--surface-1)";      // 2px surface gap between slices
     p.style.strokeWidth = "2";
     const t = document.createElementNS(ns, "title");
@@ -1167,7 +1206,7 @@ function toggleDetail(tr, r) {
       const [name, slot] = COMP[i];
       const row = el("tr");
       const tdN = el("td");
-      tdN.append(el("span", "sw sw-s" + slot), document.createTextNode(" " + name));
+      tdN.append(el("span", "sw sw-i" + slot), document.createTextNode(" " + name));
       tdN.firstChild.style.cssText = "display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;";
       row.append(tdN,
                  el("td", "num", "$" + v.toFixed(v >= 10 ? 1 : 2)),
