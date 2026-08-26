@@ -482,6 +482,115 @@ class CoworkSupport(unittest.TestCase):
         self.assertEqual(stats["prompts"], 0)
 
 
+class DashboardPayload(unittest.TestCase):
+    """The contract between collect() and the dashboard's product selector.
+
+    The template filters on `kind` rather than on a "cowork/" name prefix, so
+    a local project that happens to be called cowork cannot be mistaken for
+    the desktop app. These pin the field down; the template wiring that
+    consumes it is checked separately.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="claude-lens-kind-")
+        self.dbpath = os.path.join(self.tmp, "metrics.db")
+        self._connect = db.connect
+        db.connect = lambda path=self.dbpath, cross_thread=False: \
+            self._connect(path, cross_thread)
+
+    def tearDown(self):
+        db.connect = self._connect
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_rows_are_tagged_with_their_product(self):
+        import build_dashboard
+        import jsonl_ingest
+        plain = os.path.join(self.tmp, "plain")
+        write_transcript(plain, "-y-work-app", "s-code", "/y/work/app",
+                         "p-code", "req-code")
+        cowork = os.path.join(self.tmp, "cw", ".claude")
+        write_transcript(cowork, "C--sandbox-outputs", "s-cw",
+                         "/sandbox/outputs", "p-cw", "req-cw")
+
+        con = db.connect()
+        jsonl_ingest.ingest_tree(con, os.path.join(plain, "projects"), "")
+        jsonl_ingest.ingest_tree(con, os.path.join(cowork, "projects"),
+                                 sources.COWORK_LABEL,
+                                 project_override="A Cowork Session")
+        con.commit()
+        rows, _ = build_dashboard.collect(con)
+        con.close()
+
+        by_kind = {r["kind"]: r for r in rows}
+        self.assertEqual(set(by_kind), {"code", "cowork"})
+        self.assertEqual(by_kind["code"]["project"], "app")
+        self.assertEqual(by_kind["cowork"]["project"],
+                         "cowork/A Cowork Session")
+
+    def test_a_local_project_named_cowork_is_still_claude_code(self):
+        """The trap that name-prefix matching would fall into."""
+        import build_dashboard
+        import jsonl_ingest
+        plain = os.path.join(self.tmp, "plain2")
+        write_transcript(plain, "-y-work-cowork", "s-trap", "/y/work/cowork",
+                         "p-trap", "req-trap")
+        con = db.connect()
+        jsonl_ingest.ingest_tree(con, os.path.join(plain, "projects"), "")
+        con.commit()
+        rows, _ = build_dashboard.collect(con)
+        con.close()
+        self.assertEqual([r["kind"] for r in rows], ["code"])
+        self.assertEqual([r["project"] for r in rows], ["cowork"])
+
+
+class TemplateWiring(unittest.TestCase):
+    """Cheap guards that the dashboard controls are still wired up.
+
+    The behaviour itself is verified by driving the real script in a DOM
+    stub during development; these keep the markup from silently losing the
+    pieces that script depends on. The project stays Python-only, so nothing
+    here needs a JS runtime.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "template.html"), encoding="utf-8") as f:
+            cls.html = f.read()
+
+    def test_range_buttons_include_month_to_date(self):
+        for token in ('data-range="1"', 'data-range="7"', 'data-range="mtd"',
+                      'data-range="30"', 'data-range="90"', 'data-range="0"'):
+            self.assertIn(token, self.html)
+
+    def test_mtd_is_not_coerced_to_a_number(self):
+        """+"mtd" is NaN; the handler and the aria state must compare strings."""
+        self.assertIn('b.dataset.range === "mtd" ? "mtd" : +b.dataset.range',
+                      self.html)
+        self.assertIn("String(x.dataset.range) === String(state.range)",
+                      self.html)
+        self.assertIn('state.range === "mtd"', self.html)
+
+    def test_product_selector_sits_before_the_project_selector(self):
+        kind = self.html.index('id="f-kind"')
+        project = self.html.index('id="f-project"')
+        seg = self.html.index('id="range-seg"')
+        self.assertLess(seg, kind, "product selector comes after the range")
+        self.assertLess(kind, project, "product selector comes before project")
+
+    def test_product_filter_and_label_stripping_are_wired(self):
+        self.assertIn("kindOf(r) === state.kind", self.html)
+        self.assertIn("function projLabel", self.html)
+        self.assertIn('{ id: "cowork", label: "Claude Cowork", prefix: "cowork/" }',
+                      self.html)
+        self.assertIn('const DEFAULT_KIND = "code"', self.html)
+        # every place a project name reaches the user goes through projLabel
+        self.assertIn("cell: r => el(\"td\", \"muted\", projLabel(r.project))",
+                      self.html)
+        self.assertIn("const g = projLabel(r.project);", self.html)
+        self.assertIn("esc(projLabel(r.project))", self.html)
+
+
 class SshConfig(unittest.TestCase):
     def test_hosts_and_includes(self):
         tmp = tempfile.mkdtemp(prefix="claude-lens-ssh-")

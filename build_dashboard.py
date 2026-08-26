@@ -14,6 +14,11 @@ from datetime import datetime, timedelta, timezone
 import db
 import pricing
 import report_index
+import sources
+
+# Product a row came from, used by the dashboard's product selector.
+CODE_KIND = "code"
+COWORK_KIND = "cowork"
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE = os.path.join(BASE, "template.html")
@@ -118,6 +123,7 @@ def collect(con):
     # seeing. Stored project slugs are already qualified by the ingester, so
     # slug_display keys stay unique per source.
     session_project = {}
+    session_kind = {}
     slug_display = {}
     for sid, proj, cwd, label in con.execute(
             "SELECT session_id, project, cwd, source_label FROM sessions"):
@@ -125,6 +131,10 @@ def collect(con):
         base = os.path.basename((cwd or "").rstrip("\\/"))
         disp = f"{label}/{base}" if (label and base) else (base or proj)
         session_project[sid] = disp
+        # Which Claude product produced this row. Recorded explicitly rather
+        # than inferred from the name prefix in the UI, so a local folder that
+        # happens to be called "cowork" can't be mistaken for the desktop app.
+        session_kind[sid] = COWORK_KIND if label == sources.COWORK_LABEL else CODE_KIND
         if proj and disp:
             slug_display[proj] = disp
     canon = resolve_map(con)
@@ -262,12 +272,19 @@ def collect(con):
         file_list = sorted(
             ([p, a, d] for p, (a, d) in r["files"].items()),
             key=lambda x: -(x[1] + x[2]))[:40]
+        project = slug_display.get(r["project"],
+                                   session_project.get(r["session"],
+                                                       r["project"] or "?"))
+        kind = session_kind.get(r["session"])
+        if kind is None:      # prompt whose session never made it into the DB
+            kind = (COWORK_KIND
+                    if project.startswith(sources.COWORK_LABEL + "/")
+                    else CODE_KIND)
         out_rows.append({
             "id": r["id"],
             "ts": r["ts"],
-            "project": slug_display.get(r["project"],
-                                        session_project.get(r["session"],
-                                                            r["project"] or "?")),
+            "project": project,
+            "kind": kind,
             "text": r["text"],
             "models": models,
             "tools": sorted(r["tools"].items(), key=lambda kv: -kv[1]),

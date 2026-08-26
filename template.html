@@ -220,10 +220,12 @@
     <span class="seg" id="range-seg" role="group" aria-label="Date range">
       <button data-range="1">Today</button>
       <button data-range="7">7d</button>
+      <button data-range="mtd" title="Month to date">MTD</button>
       <button data-range="30" aria-pressed="true">30d</button>
       <button data-range="90">90d</button>
       <button data-range="0">All</button>
     </span>
+    <select id="f-kind" aria-label="Product" hidden></select>
     <select id="f-project" aria-label="Project"></select>
     <select id="f-model" aria-label="Model"></select>
     <input id="f-search" type="search" placeholder="Search prompt text…" aria-label="Search prompts">
@@ -325,17 +327,55 @@ const dayOf = (iso) => iso ? iso.slice(0, 10) : "";
 /* ---------- state & filters ---------- */
 // Filters persist across the 5-min auto-refresh reload.
 const saved = (() => { try { return JSON.parse(localStorage.getItem("ccu-state")) || {}; } catch { return {}; } })();
+/* Claude products that can appear in one database. Rows carry `kind` from the
+   ingester; older payloads have none, so they read as Claude Code. `prefix` is
+   the source label the ingester puts on project names - redundant once the
+   view is already filtered to that product, so it is stripped for display. */
+const PRODUCTS = [
+  { id: "code",   label: "Claude Code",   prefix: "" },
+  { id: "cowork", label: "Claude Cowork", prefix: "cowork/" },
+];
+const DEFAULT_KIND = "code";
+const kindOf = r => r.kind || DEFAULT_KIND;
+const product = id => PRODUCTS.find(p => p.id === id) || PRODUCTS[0];
+
 const state = { range: saved.range ?? 30, project: saved.project || "all",
+                kind: saved.kind || DEFAULT_KIND,
                 model: saved.model || "all", q: "", sort: "ts", dir: -1,
                 chart: saved.chart || "out", group: !!saved.group,
                 cols: saved.cols };
 const persist = () => localStorage.setItem("ccu-state", JSON.stringify(
-  { range: state.range, project: state.project, model: state.model,
-    chart: state.chart, group: state.group, cols: state.cols }));
+  { range: state.range, project: state.project, kind: state.kind,
+    model: state.model, chart: state.chart, group: state.group,
+    cols: state.cols }));
 const rows = DATA.rows;
 
+/* Project name as shown: the active product's label prefix carries no
+   information once every visible row belongs to that product. */
+function projLabel(p) {
+  const pre = product(state.kind).prefix;
+  return pre && p.startsWith(pre) ? p.slice(pre.length) : p;
+}
+
+const projectsFor = kind => [...new Set(
+  rows.filter(r => kindOf(r) === kind).map(r => r.project))].sort(
+    (a, b) => projLabel(a).localeCompare(projLabel(b)));
+
+/* Repopulate the project list for the active product. A project saved from
+   the other product no longer exists here, so it falls back to "all". */
+function refreshProjects() {
+  const sel = $("f-project");
+  sel.textContent = "";
+  const opt = el("option", null, "All projects"); opt.value = "all"; sel.append(opt);
+  const projects = projectsFor(state.kind);
+  for (const p of projects) {
+    const o = el("option", null, projLabel(p)); o.value = p; sel.append(o);
+  }
+  if (!projects.includes(state.project)) state.project = "all";
+  sel.value = state.project;
+}
+
 function initFilters() {
-  const projects = [...new Set(rows.map(r => r.project))].sort();
   const models = [...new Set(rows.flatMap(r => r.models.map(m => m.model)))].sort();
   const fill = (sel, items, allLabel) => {
     sel.append(el("option", null, allLabel));
@@ -344,10 +384,28 @@ function initFilters() {
       const o = el("option", null, it); o.value = it; sel.append(o);
     }
   };
-  fill($("f-project"), projects, "All projects");
   fill($("f-model"), models, "All models");
-  if (projects.includes(state.project)) $("f-project").value = state.project; else state.project = "all";
   if (models.includes(state.model)) $("f-model").value = state.model; else state.model = "all";
+
+  // The product selector only earns its place when more than one product has
+  // data; on the overwhelmingly common Code-only install it stays hidden.
+  const present = PRODUCTS.filter(p => rows.some(r => kindOf(r) === p.id));
+  if (!present.some(p => p.id === state.kind)) state.kind = DEFAULT_KIND;
+  const kindSel = $("f-kind");
+  kindSel.hidden = present.length <= 1;   // set outright, not left to the markup
+  if (present.length > 1) {
+    for (const p of present) {
+      const o = el("option", null, p.label); o.value = p.id; kindSel.append(o);
+    }
+    kindSel.value = state.kind;
+    kindSel.hidden = false;
+    kindSel.addEventListener("change", e => {
+      state.kind = e.target.value;
+      refreshProjects();
+      persist(); render();
+    });
+  }
+  refreshProjects();
   $("f-project").addEventListener("change", e => { state.project = e.target.value; persist(); render(); });
   $("f-model").addEventListener("change", e => { state.model = e.target.value; persist(); render(); });
   let deb;
@@ -356,10 +414,11 @@ function initFilters() {
     deb = setTimeout(() => { state.q = e.target.value.toLowerCase(); render(); }, 150);
   });
   for (const x of $("range-seg").children)
-    x.setAttribute("aria-pressed", +x.dataset.range === state.range);
+    x.setAttribute("aria-pressed", String(x.dataset.range) === String(state.range));
   $("range-seg").addEventListener("click", e => {
     const b = e.target.closest("button"); if (!b) return;
-    state.range = +b.dataset.range;
+    // "mtd" is a calendar period rather than a day count, so it stays a string
+    state.range = b.dataset.range === "mtd" ? "mtd" : +b.dataset.range;
     for (const x of $("range-seg").children) x.setAttribute("aria-pressed", x === b);
     persist(); render();
   });
@@ -380,12 +439,17 @@ function initFilters() {
 
 function filtered() {
   let cutoff = "";
-  if (state.range > 0) {
+  if (state.range === "mtd") {
+    // calendar month to date, in the viewer's own timezone
+    const d = new Date(); d.setDate(1); d.setHours(0, 0, 0, 0);
+    cutoff = d.toISOString();
+  } else if (state.range > 0) {
     const d = new Date(); d.setDate(d.getDate() - (state.range - 1)); d.setHours(0, 0, 0, 0);
     cutoff = d.toISOString();
   }
   return rows.filter(r =>
     (!cutoff || r.ts >= cutoff) &&
+    kindOf(r) === state.kind &&
     (state.project === "all" || r.project === state.project) &&
     (state.model === "all" || r.models.some(m => m.model === state.model)) &&
     (!state.q || r.text.toLowerCase().includes(state.q)));
@@ -696,8 +760,8 @@ const dash = (v, f) => v == null ? "–" : f(v);
 const COLCAT = [
   { k: "ts", label: "Time", def: true, val: r => r.ts || "",
     cell: r => { const t = el("td", null, r.ts ? r.ts.slice(0, 16).replace("T", " ") : "–"); t.style.whiteSpace = "nowrap"; return t; } },
-  { k: "project", label: "Project", def: true, val: r => r.project,
-    cell: r => el("td", "muted", r.project) },
+  { k: "project", label: "Project", def: true, val: r => projLabel(r.project),
+    cell: r => el("td", "muted", projLabel(r.project)) },
   { k: "text", label: "Prompt", def: true, val: r => r.text,
     cell: r => { const td = el("td", "prompt"); td.append(el("div", "txt", r.text || "(empty)")); return td; } },
   { k: "models", label: "Models", def: true, val: r => r.models.length,
@@ -825,8 +889,9 @@ function renderTable(rs) {
   // click a header to collapse/expand its rows
   const groups = new Map();
   for (const r of sorted) {
-    if (!groups.has(r.project)) groups.set(r.project, []);
-    groups.get(r.project).push(r);
+    const g = projLabel(r.project);
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(r);
   }
   const order = [...groups.entries()].sort((a, b) =>
     b[1].reduce((s, r) => s + r.cost, 0) - a[1].reduce((s, r) => s + r.cost, 0));
@@ -963,7 +1028,7 @@ function exportCsv() {
   const lines = [head.join(",")];
   for (const r of rs) {
     lines.push([
-      r.ts, r.project, esc(r.text),
+      r.ts, esc(projLabel(r.project)), esc(r.text),
       esc(r.models.map(m => shortModel(m.model)).join("; ")),
       r.api_calls, r.inp, r.out, r.cr || 0,
       r.tools.reduce((a, t) => a + t[1], 0), r.agents.length,
