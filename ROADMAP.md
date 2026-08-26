@@ -35,6 +35,7 @@ Last updated: 2026-08-26
 | Per-session index | Complete | `idx_req_session` on `api_requests(session_id)`; per-session work is no longer a full scan. |
 
 | Gapless stacked bars | Complete | The 2px inter-segment gap is gone; segments are flush with a 1px floor each. Measured on real data: 87 sub-2px segments in the cost-composition chart and 15 in the model-mix chart now render that the gap would have erased. |
+| Gapless, cost-ordered donuts | Complete | The per-prompt cost donut lost its 2px slice stroke, gained cheapest-first slice order matching the bars, and a MIN_SWEEP floor so a small component still draws. Measured: 289 of 494 prompts had a slice below the floor, and every ring still closes to an exact turn. |
 | Ironbow cost ramp | Complete | Stacked series are coloured by cost, darkest cheapest to brightest dearest, for both model families and cache/output components; stacking order matches. Replaces the old fixed palette where haiku and fable were both greens at opposite ends of the cost spectrum (now 126-148 dE apart). Ends trimmed per theme; all stops >= 3:1 on their background, adjacent stops >= 37 dE. |
 
 ## Deferred
@@ -55,10 +56,6 @@ Last updated: 2026-08-26
   estimate is within 3% ($7.23 vs $7.47). Would be worth revisiting with a
   per-session coverage guard (audit run count == prompt count) that upgrades
   only fully covered sessions.
-- **Gapless donut slices** — the per-prompt cost donut still strokes each
-  slice with 2px of surface colour, which can swallow a very small slice the
-  same way the bar gaps did. Left alone because the request was about the
-  stacked bar chart; the same fix applies if wanted.
 - **Moving metrics.db off the network share** — the database lives on an SMB
   share here, where SQLite WAL is not reliable (a transient `disk I/O error`
   was seen once). A `--db` flag pointing at local disk, with only the reports

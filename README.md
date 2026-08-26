@@ -395,7 +395,14 @@ background, and adjacent stops are at least 37 ΔE apart.
 Segments in a stacked bar sit flush against each other. They used to be
 separated by a 2px gap, which looked tidy on large segments and erased small
 ones outright — a series one pixel tall minus a two-pixel gap is not there at
-all. Colour does the separating now, and every segment keeps a 1px floor. Cost components are derived
+all. Colour does the separating now, and every segment keeps a 1px floor.
+
+The per-prompt cost donut follows the same three rules: no separating stroke,
+slices ordered cheapest to dearest around the ring, and a minimum arc so a
+small component is still visible. The floor is paid for proportionally by the
+larger slices, so the ring closes exactly; with at most four components the
+distortion stays under about a degree per lifted slice, and the tooltip and
+the table beside the donut carry the exact figures either way. Cost components are derived
 from the pricing table and scaled to sum to the CLI-reported cost where
 available; cost views show the "without caching" counterfactual.
 

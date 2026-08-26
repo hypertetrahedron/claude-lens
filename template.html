@@ -1138,6 +1138,29 @@ function exportCsv() {
   URL.revokeObjectURL(a.href);
 }
 
+/* Smallest arc a slice may occupy: about a pixel of arc at the ring's
+   mid-radius, the donut's equivalent of the 1px floor on a stacked segment.
+   Without it a fraction-of-a-percent component draws a sub-pixel sliver and
+   is effectively absent, which is the very thing worth pointing out. */
+const MIN_SWEEP = 0.024;
+
+/* Fractions -> arc sweeps summing to exactly a full turn, with every slice at
+   least MIN_SWEEP. The floor is paid for proportionally by the slices that
+   can afford it, so the ring still closes. With at most four components the
+   distortion is under about a degree per lifted slice; the tooltip and the
+   table beside the donut carry the exact figures. */
+function fitSweeps(fracs) {
+  const FULL = 2 * Math.PI;
+  const raw = fracs.map(f => Math.max(0, Math.min(f, 1)) * FULL);
+  if (raw.length < 2 || raw.every(s => s >= MIN_SWEEP)) return raw;
+  const room = FULL - raw.length * MIN_SWEEP;
+  const pool = raw.reduce((a, s) => a + Math.max(0, s - MIN_SWEEP), 0);
+  if (room <= 0 || pool <= 0) return raw.map(() => FULL / raw.length);
+  const k = room / pool;
+  return raw.map(s => s <= MIN_SWEEP ? MIN_SWEEP
+                                     : MIN_SWEEP + (s - MIN_SWEEP) * k);
+}
+
 function donutSvg(comp, total) {
   const ns = "http://www.w3.org/2000/svg";
   const size = 116, c = size / 2, R = 52, r0 = 33;
@@ -1145,20 +1168,25 @@ function donutSvg(comp, total) {
   svg.setAttribute("viewBox", `0 0 ${size} ${size}`);
   svg.setAttribute("width", size); svg.setAttribute("height", size);
   const pt = (rad, ang) => [c + rad * Math.cos(ang), c + rad * Math.sin(ang)];
+  // cheapest first, so the ring reads as the same cost gradient the stacked
+  // bars do rather than an arbitrary order
+  const parts = COMP_STACK.map(i => ({ i, v: (comp || [])[i] || 0 }))
+                          .filter(p => p.v > 0);
+  const sum = parts.reduce((a, p) => a + p.v, 0);
+  const sweeps = sum > 0 ? fitSweeps(parts.map(p => p.v / sum)) : [];
   let a = -Math.PI / 2;
-  comp.forEach((v, i) => {
-    if (v <= 0) return;
-    const [name, slot] = COMP[i];
-    const frac = Math.min(v / total, 1);
+  parts.forEach((part, k) => {
+    const [name, slot] = COMP[part.i];
+    const sweep = sweeps[k];
     const p = document.createElementNS(ns, "path");
-    if (frac > 0.999) {                       // lone slice: full ring
+    if (parts.length === 1) {                 // lone slice: full ring
       p.setAttribute("d",
         `M${c},${c - R} A${R},${R} 0 1 1 ${c - 0.01},${c - R} Z ` +
         `M${c},${c - r0} A${r0},${r0} 0 1 0 ${c - 0.01},${c - r0} Z`);
       p.setAttribute("fill-rule", "evenodd");
     } else {
-      const a2 = a + frac * 2 * Math.PI;
-      const large = frac > 0.5 ? 1 : 0;
+      const a2 = a + sweep;
+      const large = sweep > Math.PI ? 1 : 0;
       const [x1, y1] = pt(R, a), [x2, y2] = pt(R, a2);
       const [x3, y3] = pt(r0, a2), [x4, y4] = pt(r0, a);
       p.setAttribute("d",
@@ -1166,11 +1194,12 @@ function donutSvg(comp, total) {
         `L${x3},${y3} A${r0},${r0} 0 ${large} 0 ${x4},${y4} Z`);
       a = a2;
     }
+    // No stroke: a 2px surface outline used to separate the slices, and in
+    // doing so painted over any slice thinner than the outline itself. The
+    // ironbow ramp separates them by colour instead.
     p.setAttribute("class", "fill-i" + slot);
-    p.style.stroke = "var(--surface-1)";      // 2px surface gap between slices
-    p.style.strokeWidth = "2";
     const t = document.createElementNS(ns, "title");
-    t.textContent = `${name}: $${v.toFixed(2)} (${(100 * v / total).toFixed(0)}%)`;
+    t.textContent = `${name}: $${part.v.toFixed(2)} (${(100 * part.v / total).toFixed(0)}%)`;
     p.append(t);
     svg.append(p);
   });
@@ -1201,8 +1230,9 @@ function toggleDetail(tr, r) {
     flex.style.cssText = "display:flex;gap:16px;align-items:center;";
     flex.append(donutSvg(r.comp, compTotal));
     const ct = el("table");
-    r.comp.forEach((v, i) => {
-      if (v <= 0) return;
+    COMP_STACK.forEach((i) => {
+      const v = r.comp[i];
+      if (!(v > 0)) return;
       const [name, slot] = COMP[i];
       const row = el("tr");
       const tdN = el("td");
@@ -1257,8 +1287,15 @@ function toggleDetail(tr, r) {
       row.append(tdF, el("td", "num", "+" + fmtFull(a)), el("td", "num", "−" + fmtFull(d)));
       ft.append(row);
     }
-    if (r.files > r.file_list.length)
-      ft.append(el("tr")).appendChild(el("td", "muted", "… " + (r.files - r.file_list.length) + " more"));
+    if (r.files > r.file_list.length) {
+      // append() returns undefined, so chaining appendChild onto it threw and
+      // took the whole detail panel down for any prompt touching more files
+      // than the payload carries.
+      const more = el("tr");
+      more.append(el("td", "muted",
+                     "… " + (r.files - r.file_list.length) + " more"));
+      ft.append(more);
+    }
     secF.append(ft); box.append(secF);
   }
   if (r.tools.length) {
