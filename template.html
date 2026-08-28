@@ -219,6 +219,13 @@
     overflow: hidden; color: var(--text-primary);
   }
   tr.open td.prompt .txt { -webkit-line-clamp: unset; }
+  /* First row of each project when the table is sorted by project: a rule
+     above it and its name un-muted, so runs of one project are separable at a
+     glance. No rule on the very first body row - the header already draws
+     one there. */
+  tr.proj-start > td { border-top: 2px solid var(--baseline); }
+  tbody tr.proj-start:first-child > td { border-top: 0; }
+  tr.proj-start > td.proj { color: var(--text-primary); font-weight: 600; }
   tr.group-row { cursor: pointer; background: var(--hover-wash); }
   tr.group-row td { font-weight: 600; color: var(--text-primary); border-bottom: 1px solid var(--baseline); }
   tr.group-row .cnt { color: var(--text-muted); font-weight: 400; }
@@ -861,7 +868,7 @@ const COLCAT = [
   { k: "ts", label: "Time", def: true, val: r => r.ts || "",
     cell: r => { const t = el("td", null, r.ts ? r.ts.slice(0, 16).replace("T", " ") : "–"); t.style.whiteSpace = "nowrap"; return t; } },
   { k: "project", label: "Project", def: true, val: r => projLabel(r.project),
-    cell: r => el("td", "muted", projLabel(r.project)) },
+    cell: r => el("td", "muted proj", projLabel(r.project)) },
   { k: "title", label: "Session", val: r => r.title || "",
     cell: r => el("td", "muted", r.title || "–") },
   { k: "text", label: "Prompt", def: true, val: r => r.text,
@@ -984,7 +991,21 @@ function renderTable(rs) {
     return (va < vb ? -1 : va > vb ? 1 : 0) * state.dir;
   });
   if (!state.group) {
-    for (const r of sorted.slice(0, 500)) appendRow(body, r);
+    /* Under a project sort, consecutive rows from one project look identical
+       and the eye cannot find where one ends. Mark the first row of each run.
+       Under any other sort the rows are not grouped by project at all, so a
+       boundary rule would be drawing a division that does not exist - hence
+       nothing is marked there. Grouped mode never reaches this branch; its
+       header rows already do the separating. */
+    const byProject = state.sort === "project";
+    let prev = null;
+    sorted.slice(0, 500).forEach((r, i) => {
+      const tr = appendRow(body, r);
+      if (!byProject) return;
+      const name = projLabel(r.project);
+      if (i === 0 || name !== prev) tr.classList.add("proj-start");
+      prev = name;
+    });
     return;
   }
   // group by project, groups ordered by total cost; header row = subtotals,
