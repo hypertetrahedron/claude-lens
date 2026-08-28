@@ -1014,6 +1014,19 @@ class TemplateWiring(unittest.TestCase):
                       '["output", 4], ["uncached input", 2]];', self.html)
         self.assertIn("const COMP_STACK = [0, 3, 1, 2];", self.html)
 
+    def test_project_runs_are_marked_only_under_a_project_sort(self):
+        """Consecutive rows of one project are otherwise indistinguishable."""
+        self.assertIn('const byProject = state.sort === "project";', self.html)
+        self.assertIn('tr.classList.add("proj-start")', self.html)
+        # the styling, including the no-double-rule-under-the-header case
+        self.assertIn("tr.proj-start > td { border-top: 2px solid var(--baseline); }",
+                      self.html)
+        self.assertIn("tbody tr.proj-start:first-child > td { border-top: 0; }",
+                      self.html)
+        # the project cell must be targetable to un-mute it on a boundary row
+        self.assertIn('el("td", "muted proj", projLabel(r.project))', self.html)
+        self.assertIn("tr.proj-start > td.proj", self.html)
+
     def test_hidden_attribute_is_not_defeated_by_a_display_rule(self):
         """#chart-legend { display: flex } outranked [hidden] and beat it."""
         import re
@@ -1078,7 +1091,7 @@ class TemplateWiring(unittest.TestCase):
                       self.html)
         self.assertIn('const DEFAULT_KIND = "code"', self.html)
         # every place a project name reaches the user goes through projLabel
-        self.assertIn("cell: r => el(\"td\", \"muted\", projLabel(r.project))",
+        self.assertIn("cell: r => el(\"td\", \"muted proj\", projLabel(r.project))",
                       self.html)
         self.assertIn("const g = projLabel(r.project);", self.html)
         self.assertIn("esc(projLabel(r.project))", self.html)

@@ -512,6 +512,11 @@ counterfactual.
   scoping it to a project would misrepresent it).
 - **Session names** — sessions started from Claude Desktop carry the title
   the app shows. Add the optional **Session** column to see it.
+- **Project runs when sorted by project** — sort by the Project column and
+  the first row of each project gets a rule above it and its name un-muted, so
+  a run of one project is separable from the next at a glance. Only under that
+  sort: under any other, the rows are not grouped by project and such a rule
+  would divide nothing.
 - **Group by project** — subtotal header rows, ordered by cost, click to
   collapse; subtotals follow the configured columns (rates aggregate at the
   group level).
