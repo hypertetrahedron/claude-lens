@@ -1,7 +1,7 @@
 # Roadmap
 
 Status legend: Not Started · In Progress · Complete · Deferred
-Last updated: 2026-08-26
+Last updated: 2026-09-03
 
 | Feature | Status | Notes |
 |---|---|---|
@@ -36,6 +36,15 @@ Last updated: 2026-08-26
 | Bedrock / Vertex support | Complete | Model ids from any provider are canonicalised at ingest (schema v7 stores `provider` and `model_raw`, and rewrites ids already in the DB). Rates are per provider with `pricing.local.json` overrides for region rate cards and deployment-ARN aliases; promotional pricing is first-party only. Subscription-only tiles hide when no first-party traffic exists, and unpriced models are named on the page rather than only on stderr. Verified: a Bedrock transcript that previously totalled $0.00 now costs correctly, and an opaque deployment ARN is reported as unpriced instead of silently zero. |
 | Project-run highlighting | Complete | Sorting by project marks the first row of each project's run (rule above, name un-muted), so consecutive rows from one project are separable. Applied only under a project sort - elsewhere it would draw a division that does not exist - and not in grouped mode, whose header rows already separate. |
 | Project CLAUDE.md | Complete | Records the constraints and habits that are not obvious from the code: stdlib-only, the receiver overwriting `dashboard.html`, why a re-parse cannot correct a stored row, verifying transcript facts against real data, and the DOM-stub testing pattern with its blind spot for CSS. |
+| Per-model cache-read rates | Complete | `CACHE_READ_MULT_BY_MODEL` is resolved by the same longest-prefix scan as the rate itself, so Claude Fable 5.1 and Claude Mythos 5.1 bill cache reads at 0.025x input ($0.25/MTok) instead of the 0.1x every other model uses. A cache-heavy agent on those models was being overstated fourfold. Covered by `test_pricing.py`. |
+| Fast mode pricing | Complete | `FAST_PRICES` bills Claude Opus 5 / Opus 4.8 requests recorded as `usage.speed = "fast"` at 2x list, on the Anthropic provider only - fast mode does not exist on Bedrock, Vertex or Foundry. `resolve(speed=...)` returns the fast rate; a `Rate` also carries it, so one resolve can bill a batch with both speeds through `cost_at(speed=...)`. The old comment claiming the transcript records no speed field was simply wrong. |
+| Data-residency premium | Complete | `resolve(inference_geo="us")` applies a 1.1x surcharge to input and output on the models that support pinning (4.6 and later), first-party only. One published number, stated as a constant rather than buried in a formula. |
+| Sonnet 5 rate made permanent | Complete | The 1 September 2026 rise was cancelled, so $2/$10 moved from `INTRO_PRICES` into `PRICES` and `INTRO_PRICES` is now empty. The promotion mechanism is kept (and tested with a synthetic entry) for the next one. `PARTNER_PRICES` holds Bedrock and Vertex at the $3/$15 their rate cards carry, since the cut is a first-party one. |
+| Retired-model annotation | Complete | `RETIRED` maps a model to its retirement date and `status(model)` answers active / retired / unknown, so the dashboard can explain a line that stops instead of leaving it a mystery. Rates are kept - a retired model's old transcripts still need costing. A `None` date means retired before this file started recording them (the Claude 3 generation). |
+| Tool-use overhead table | Complete | `TOOL_PROMPT_TOKENS` carries Anthropic's published per-model tool-prompt size (286 on Opus 5 through 675 on Opus 4.7, default 400) with `tool_prompt_tokens()` prefix-matching it, for the dashboard's per-turn harness-overhead estimate. Claude Code sends tool definitions on every request, so this is a floor on every turn's input. |
+| Pricing overrides for the new tables | Complete | `pricing.local.json` gained `cache_read_mult` and `fast_prices` alongside the existing per-provider `prices`, `model_aliases` and `unsplit_cache_multiplier`; `pricing.example.json` documents all five. Garbage entries are skipped rather than fatal. |
+| Wrapper flag pass-through | Complete | `generate-dashboard.sh` / `.ps1` now pass `--db`, `--max-rows`, `--no-prompt-text` and `--conversations` to `build_dashboard.py`, and `--db` to `jsonl_ingest.py` as well since the database is shared. The one-shot script no longer stops short of what the two Python steps can do; the Python 3.9 check and ASCII-only output are unchanged. |
+| Index page links live pages too | Complete | `index.html` links the conversation pages when a build wrote them and Claude Code's own `/insights` report at `~/.claude/usage-data/report.html` (honouring `CLAUDE_CONFIG_DIR`) as a `file:` URL, since it may be on another drive. Directory reads moved to `os.scandir` with mtimes taken off the same read. No `--db` flag: nothing in `report_index.py` opens the database. |
 
 ## Deferred
 
