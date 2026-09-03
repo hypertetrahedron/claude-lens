@@ -1120,7 +1120,7 @@ class TemplateWiring(unittest.TestCase):
         self.assertIn("function renderView", self.html)
         self.assertIn('const VIEWS = ["prompts", "sessions"]', self.html)
         # the view must round-trip through localStorage like the other filters
-        self.assertIn("cols: state.cols, view: state.view", self.html)
+        self.assertIn("view: state.view, session: state.session", self.html)
 
     def test_sessions_table_is_wired(self):
         self.assertIn('id="sess-tbl"', self.html)
@@ -1234,6 +1234,138 @@ class TemplateWiring(unittest.TestCase):
         self.assertIn("function renderCostBasisBadge", self.html)
         self.assertIn("DATA.insights_report", self.html)
         self.assertIn("DATA.cost_basis", self.html)
+
+    def test_range_filter_controls_are_wired(self):
+        """The "More filters" panel: toggle, every min/max pair, both
+        checkboxes, and the state/predicate functions that back them."""
+        self.assertIn('id="more-filters-btn"', self.html)
+        self.assertIn('id="more-filters"', self.html)
+        for rf_id in ("rf-cost-min", "rf-cost-max", "rf-dur-min", "rf-dur-max",
+                      "rf-out-min", "rf-out-max", "rf-calls-min", "rf-calls-max",
+                      "rf-misses", "rf-errors", "rf-clear"):
+            self.assertIn('id="%s"' % rf_id, self.html)
+        self.assertIn("function sanitizeRf(v)", self.html)
+        self.assertIn("function rfPassRow(r)", self.html)
+        self.assertIn("function rfPassSession(s)", self.html)
+        self.assertIn("function rfActiveCount()", self.html)
+        self.assertIn("function updateMoreFiltersBtn()", self.html)
+        # cost/calls/misses are the only fields real on both rows and
+        # sessions; duration/output/errors must not be asserted on a session.
+        self.assertNotIn("f.durMin != null && (s.", self.html)
+        self.assertNotIn("f.outMin != null && (s.", self.html)
+        self.assertNotIn("f.errorsOnly && !((s.", self.html)
+
+    def test_filter_key_includes_range_filters(self):
+        """dayBuckets' memo key must invalidate when a range filter changes,
+        or the chart would keep showing a stale aggregate."""
+        self.assertIn("JSON.stringify(state.rf)", self.html)
+        idx_key = self.html.index("const filterKey = ()")
+        idx_rf = self.html.index("JSON.stringify(state.rf)")
+        idx_bucket = self.html.index("function dayBuckets(rs)")
+        self.assertLess(idx_key, idx_rf)
+        self.assertLess(idx_rf, idx_bucket)
+
+    def test_aria_sort_is_wired_on_both_tables(self):
+        self.assertIn('th.setAttribute("aria-sort",', self.html)
+        self.assertEqual(self.html.count('th.setAttribute("aria-sort",'), 2,
+                         "both renderHead() and renderSessHead() must set it")
+        self.assertIn('th.setAttribute("role", "button")', self.html)
+        self.assertIn('e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar"',
+                      self.html)
+
+    def test_rows_and_group_headers_are_keyboard_reachable(self):
+        """Prompt rows, session rows and group headers all answer Enter/Space
+        like a click, and their aria-expanded reflects the actual state."""
+        self.assertIn('tr.setAttribute("role", "button")', self.html)
+        self.assertIn('gtr.setAttribute("role", "button")', self.html)
+        self.assertIn('gtr.setAttribute("aria-expanded", "true")', self.html)
+        self.assertIn('gtr.setAttribute("aria-expanded", String(!hide));', self.html)
+        # a reused cached row must not keep a stale aria-expanded="true"
+        self.assertIn('cached.setAttribute("aria-expanded", "false")', self.html)
+
+    def test_chip_remove_control_has_an_aria_label(self):
+        self.assertIn('x.setAttribute("aria-label", "Clear the session filter")',
+                      self.html)
+
+    def test_focus_visible_styles_use_theme_tokens(self):
+        css = self.html[self.html.index("<style>"):self.html.index("</style>")]
+        self.assertIn(":focus-visible", css)
+        self.assertIn("outline: 2px solid var(--series-1)", css)
+        self.assertNotIn("outline: 2px solid #", css)  # must stay a token, not a literal
+
+    def test_content_visibility_bounds_row_render_cost(self):
+        self.assertIn("content-visibility: auto;", self.html)
+        self.assertIn("contain-intrinsic-size: 0 34px;", self.html)
+
+    def test_table_layout_is_fixed_with_a_colgroup(self):
+        self.assertIn("table-layout: fixed", self.html)
+        self.assertIn('id="tbl-colgroup"', self.html)
+        self.assertIn('id="sess-colgroup"', self.html)
+        self.assertIn("function buildColgroup(node, cols, widths)", self.html)
+        # the prompt text / session name columns are the ones deliberately
+        # left out of both width maps, so they take whatever the fixed
+        # columns leave over instead of being pinned to a pixel width
+        col_width = self.html[self.html.index("const COL_WIDTH"):
+                              self.html.index("};", self.html.index("const COL_WIDTH"))]
+        self.assertNotIn("text:", col_width)
+        sess_col_width = self.html[self.html.index("const SESS_COL_WIDTH"):
+                                   self.html.index("};", self.html.index("const SESS_COL_WIDTH"))]
+        self.assertNotIn("title:", sess_col_width)
+
+    def test_row_caps_are_raised_with_a_notice_element(self):
+        self.assertIn("const ROW_CAP = 5000;", self.html)
+        self.assertIn("const GROUP_ROW_CAP = 1000;", self.html)
+        self.assertIn("const SESS_ROW_CAP = 2000;", self.html)
+        self.assertIn('id="cap-notice"', self.html)
+        self.assertIn('id="sess-cap-notice"', self.html)
+        self.assertIn("function setCapNotice(node, shown, total)", self.html)
+        self.assertIn("setCapNotice($(\"cap-notice\")", self.html)
+        self.assertIn("setCapNotice($(\"sess-cap-notice\")", self.html)
+
+    def test_persist_covers_sort_and_the_range_filters(self):
+        """persist() must survive the 5-minute meta refresh with sort, dir,
+        q, ssort, sdir, view, session and the range filters intact."""
+        start = self.html.index("const persist = ()")
+        end = self.html.index(");", start)
+        body = self.html[start:end]
+        for key in ("sort:", "dir:", "q:", "ssort:", "sdir:", "view:",
+                    "session:", "rf:"):
+            self.assertIn(key, body, "persist() missing " + key)
+
+    def test_session_filter_is_validated_after_restore(self):
+        """A session id restored from a stale payload must fall back to no
+        filter instead of hiding every row with no explanation."""
+        self.assertIn(
+            "if (state.session && !sessById.has(state.session)) state.session = null;",
+            self.html)
+
+    def test_scroll_position_survives_the_meta_refresh(self):
+        self.assertIn('sessionStorage.setItem(SCROLL_KEY,', self.html)
+        self.assertIn('addEventListener("beforeunload", saveScroll)', self.html)
+        self.assertIn("setInterval(saveScroll,", self.html)
+
+    def test_reduced_motion_guards_every_transition(self):
+        """Every `transition:` in the stylesheet must sit after the nearest
+        preceding `@media (prefers-reduced-motion: no-preference)` opener and
+        before that block's own close - not just somewhere later in the file,
+        which a naive "guard exists anywhere above" check would let through
+        for a transition added outside the block by mistake."""
+        css = self.html[self.html.index("<style>"):self.html.index("</style>")]
+        guard_start = css.index("@media (prefers-reduced-motion: no-preference)")
+        guard_open = css.index("{", guard_start)
+        depth = 1
+        i = guard_open + 1
+        while depth:
+            if css[i] == "{":
+                depth += 1
+            elif css[i] == "}":
+                depth -= 1
+            i += 1
+        guard_close = i
+        for idx in (m.start() for m in re.finditer(r"transition\s*:", css)):
+            self.assertTrue(guard_open < idx < guard_close,
+                            "a transition: outside the reduced-motion guard "
+                            "reaches a viewer who asked for less motion")
 
 
 class SshConfig(unittest.TestCase):

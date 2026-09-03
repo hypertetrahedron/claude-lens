@@ -263,9 +263,16 @@
   #tooltip .tt-row .v { font-weight: 600; font-variant-numeric: tabular-nums; }
   #tooltip .tt-row .k { color: var(--text-secondary); }
 
+  /* overflow-x is the scroll boundary a wide, fixed-layout table needs -
+     nothing above it (body, .wrap) may set a min-width, or the page itself
+     would scroll sideways instead of just the table. */
   .tbl-scroll { overflow-x: auto; }
-  table { border-collapse: collapse; width: 100%; font-size: 13px; }
-  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  /* table-layout: fixed makes column widths come from the <colgroup> that
+     renderHead()/renderSessHead() build rather than from cell content, which
+     is what makes a fixed prompt-text width possible at all - without it,
+     one long unbroken token in a cell stretches every column sideways. */
+  table { border-collapse: collapse; width: 100%; font-size: 13px; table-layout: fixed; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--grid); vertical-align: top; overflow: hidden; }
   th {
     color: var(--text-muted); font-weight: 500; font-size: 12px;
     cursor: pointer; user-select: none; white-space: nowrap;
@@ -275,7 +282,24 @@
   td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
   tr.data-row { cursor: pointer; }
   tr.data-row:hover { background: var(--hover-wash); }
-  td.prompt { max-width: 480px; }
+  /* content-visibility skips layout/paint for rows the viewport has not
+     reached yet, which is what makes a several-thousand-row table cheap to
+     render at all; contain-intrinsic-size is the placeholder height it
+     reserves for a row it has not measured, close enough to the real ~34px
+     row height that the scrollbar does not jump around as rows come into
+     view. detail-row and group-row are excluded: a detail panel's real
+     height varies far too much for a fixed placeholder, and group headers
+     are few enough that skipping them buys nothing. */
+  tr.data-row, tr.sess-row {
+    content-visibility: auto;
+    contain-intrinsic-size: 0 34px;
+  }
+  /* The column's actual width now comes from the <colgroup> table-layout:
+     fixed builds (see COL_WIDTH/SESS_COL_WIDTH) - "prompt"/"title" is the one
+     column left undeclared there so it takes whatever the fixed columns do
+     not use. A max-width here would fight that instead of matching it, so
+     the two-line clamp below is what keeps a long prompt from blowing out
+     the row's height. */
   td.prompt .txt {
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
     overflow: hidden; color: var(--text-primary);
@@ -309,9 +333,59 @@
      into a flex column. */
   .detail .wide { flex: 1 0 100%; min-width: 0; }
   .detail .scroll-y { max-height: 220px; overflow-y: auto; }
-  tr.sess-row:focus { outline: 2px solid var(--series-1); outline-offset: -2px; }
+  /* :focus-visible rather than :focus: a mouse click on a row or th must not
+     ring it, only real keyboard navigation should. Every element this page
+     makes tabbable (data rows, group headers, sortable th) shares one rule so
+     a new interactive element does not need its own outline declared. */
+  tr.data-row:focus-visible, tr.sess-row:focus-visible,
+  tr.group-row:focus-visible, th[tabindex]:focus-visible {
+    outline: 2px solid var(--series-1); outline-offset: -2px;
+  }
+  button:focus-visible, a:focus-visible, select:focus-visible,
+  input:focus-visible, [tabindex]:focus-visible {
+    outline: 2px solid var(--series-1); outline-offset: 2px;
+  }
   .empty { color: var(--text-muted); padding: 24px; text-align: center; }
+  .cap-notice { color: var(--text-muted); font-size: 12px; padding: 8px 2px 0; }
   footer { color: var(--text-muted); font-size: 11px; margin-top: 8px; }
+
+  /* ---------- more filters (range/flag filters) ---------- */
+  #more-filters-btn[aria-expanded="true"] { color: var(--text-primary); font-weight: 600; }
+  #more-filters {
+    display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center;
+    margin: -6px 0 16px; padding: 10px 12px;
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+  }
+  #more-filters .rf-group { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); }
+  #more-filters .rf-group input[type="number"] {
+    width: 84px; background: var(--surface-1); color: var(--text-primary);
+    border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; font: inherit; font-size: 12px;
+  }
+  #more-filters label.rf-flag { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-secondary); cursor: pointer; }
+
+  /* Interactive rows and buttons: a colour change on hover/press reads as
+     motion to anyone who has asked the OS for less of it, so it only exists
+     for viewers who have not. */
+  @media (prefers-reduced-motion: no-preference) {
+    tr.data-row, tr.sess-row, tr.group-row, .btn, .seg button, th {
+      transition: background-color .12s ease;
+    }
+  }
+
+  /* ---------- responsive ---------- */
+  @media (max-width: 900px) {
+    .tiles { grid-template-columns: repeat(2, 1fr); }
+    #chart-wrap svg { max-height: 260px; }
+    .filters input { min-width: 160px; }
+  }
+  @media (max-width: 600px) {
+    body { padding: 12px; }
+    header { flex-wrap: wrap; row-gap: 6px; }
+    .tiles { grid-template-columns: 1fr; }
+    .filters, #more-filters { gap: 8px; }
+    .filters select, .filters input, #chart-sel { flex: 1 1 auto; min-width: 0; }
+    #more-filters .rf-group input[type="number"] { width: 70px; }
+  }
 </style>
 </head>
 <body>
@@ -343,7 +417,38 @@
     <select id="f-project" aria-label="Project"></select>
     <select id="f-model" aria-label="Model"></select>
     <input id="f-search" type="search" placeholder="Search prompts and sessions…" aria-label="Search prompts and sessions">
+    <button class="btn" id="more-filters-btn" type="button" aria-expanded="false" aria-controls="more-filters">More filters</button>
     <span class="chip" id="session-chip" hidden></span>
+  </div>
+
+  <div id="more-filters" hidden>
+    <span class="rf-group">
+      <label for="rf-cost-min">Cost $</label>
+      <input id="rf-cost-min" type="number" min="0" step="any" inputmode="decimal" placeholder="min" aria-label="Minimum cost, dollars">
+      <span aria-hidden="true">–</span>
+      <input id="rf-cost-max" type="number" min="0" step="any" inputmode="decimal" placeholder="max" aria-label="Maximum cost, dollars">
+    </span>
+    <span class="rf-group">
+      <label for="rf-dur-min">Duration s</label>
+      <input id="rf-dur-min" type="number" min="0" step="1" inputmode="numeric" placeholder="min" aria-label="Minimum duration, seconds">
+      <span aria-hidden="true">–</span>
+      <input id="rf-dur-max" type="number" min="0" step="1" inputmode="numeric" placeholder="max" aria-label="Maximum duration, seconds">
+    </span>
+    <span class="rf-group">
+      <label for="rf-out-min">Output tokens</label>
+      <input id="rf-out-min" type="number" min="0" step="1" inputmode="numeric" placeholder="min" aria-label="Minimum output tokens">
+      <span aria-hidden="true">–</span>
+      <input id="rf-out-max" type="number" min="0" step="1" inputmode="numeric" placeholder="max" aria-label="Maximum output tokens">
+    </span>
+    <span class="rf-group">
+      <label for="rf-calls-min">Tool calls</label>
+      <input id="rf-calls-min" type="number" min="0" step="1" inputmode="numeric" placeholder="min" aria-label="Minimum tool calls">
+      <span aria-hidden="true">–</span>
+      <input id="rf-calls-max" type="number" min="0" step="1" inputmode="numeric" placeholder="max" aria-label="Maximum tool calls">
+    </span>
+    <label class="rf-flag"><input type="checkbox" id="rf-misses"> Misses &gt; 0</label>
+    <label class="rf-flag"><input type="checkbox" id="rf-errors"> Errors &gt; 0</label>
+    <button class="btn" id="rf-clear" type="button" aria-label="Clear range filters">Clear</button>
   </div>
 
   <div class="tiles">
@@ -399,21 +504,25 @@
     </div>
     <div class="tbl-scroll">
       <table id="tbl">
+        <colgroup id="tbl-colgroup"></colgroup>
         <thead><tr id="tbl-head"></tr></thead>
         <tbody id="tbl-body"></tbody>
       </table>
     </div>
     <div class="empty" id="empty" hidden>No prompts match the current filters.</div>
+    <div class="cap-notice" id="cap-notice" hidden></div>
   </div>
 
   <div class="card" id="sessions-card" hidden>
     <div class="tbl-scroll">
       <table id="sess-tbl">
+        <colgroup id="sess-colgroup"></colgroup>
         <thead><tr id="sess-head"></tr></thead>
         <tbody id="sess-body"></tbody>
       </table>
     </div>
     <div class="empty" id="sess-empty" hidden>No sessions match the current filters.</div>
+    <div class="cap-notice" id="sess-cap-notice" hidden></div>
   </div>
 
   <footer>One row per user prompt; subagent work and harness-injected turns are folded into the prompt that caused them. Costs marked ~ are estimated from the public pricing table (historical backfill); others are reported by Claude Code itself.</footer>
@@ -575,6 +684,17 @@ const fmtBytes = (n) => {
   if (n >= 1e3) return (n / 1e3).toFixed(1) + " KB";
   return n + " B";
 };
+/* Shared by both tables' row caps: silent truncation used to be the only
+   option at 500 rows. Now that the cap is thousands of rows, hitting it at
+   all is rare, but when it happens the viewer needs to know the table is not
+   the whole story - which rows are missing is exactly what the filters and
+   CSV export are for. */
+function setCapNotice(node, shown, total) {
+  if (shown >= total) { node.hidden = true; node.textContent = ""; return; }
+  node.hidden = false;
+  node.textContent = "Showing " + fmtFull(shown) + " of " + fmtFull(total) +
+    " rows; narrow the filters or export CSV.";
+}
 
 /* ---------- theme ---------- */
 (() => {
@@ -617,21 +737,61 @@ const kindPrefix = id => (PRODUCT_META[id] || {}).prefix || "";
    and one row per session. `view` chooses which card is on screen; every
    filter, the tiles and the chart are shared, so switching views is not
    switching pages. `session` is the one filter the sessions view sets on the
-   prompts view ("show me this session's prompts") - it is deliberately not
-   persisted, because a session id restored from a previous payload would
-   filter everything away with no way to see why. */
+   prompts view ("show me this session's prompts"). It used to be dropped on
+   reload outright, on the theory that a session id from a stale payload
+   would filter everything away with no visible reason - but the page now
+   reloads itself every 5 minutes (the meta refresh), and over that span the
+   session almost always still exists. It is persisted like every other
+   filter and validated against the freshly loaded session table below
+   (`sessById`) the moment that table exists, so the one case the old comment
+   worried about - a genuinely stale payload - still falls back to "no
+   filter" instead of an empty table with no explanation. */
 const VIEWS = ["prompts", "sessions"];
+/* Range/flag filters live under their own state.rf. `sanitizeRf` is what
+   both the initial restore and the persisted-corruption case go through:
+   anything that is not a finite number is null, anything that is not a
+   checkbox is false, so a hand-edited or truncated localStorage value never
+   produces NaN reaching a comparison. */
+const RF_NUM_KEYS = ["costMin", "costMax", "durMin", "durMax",
+                     "outMin", "outMax", "callsMin", "callsMax"];
+const RF_DEFAULTS = { costMin: null, costMax: null, durMin: null, durMax: null,
+                      outMin: null, outMax: null, callsMin: null, callsMax: null,
+                      missesOnly: false, errorsOnly: false };
+function sanitizeRf(v) {
+  const out = { ...RF_DEFAULTS };
+  if (v && typeof v === "object") {
+    for (const k of RF_NUM_KEYS) {
+      const n = v[k];
+      out[k] = (typeof n === "number" && isFinite(n)) ? n : null;
+    }
+    out.missesOnly = !!v.missesOnly;
+    out.errorsOnly = !!v.errorsOnly;
+  }
+  return out;
+}
 const state = { range: saved.range ?? 30, project: saved.project || "all",
                 kind: saved.kind || DEFAULT_KIND,
-                model: saved.model || "all", q: "", sort: "ts", dir: -1,
+                model: saved.model || "all",
+                q: typeof saved.q === "string" ? saved.q : "",
+                sort: typeof saved.sort === "string" ? saved.sort : "ts",
+                dir: saved.dir === 1 ? 1 : -1,
                 chart: saved.chart || "out", group: !!saved.group,
                 cols: saved.cols,
                 view: VIEWS.includes(saved.view) ? saved.view : "prompts",
-                session: null, ssort: "start", sdir: -1 };
+                session: typeof saved.session === "string" ? saved.session : null,
+                ssort: typeof saved.ssort === "string" ? saved.ssort : "start",
+                sdir: saved.sdir === 1 ? 1 : -1,
+                rf: sanitizeRf(saved.rf) };
+/* Everything a reload must not lose: filters, sort (both tables), the range
+   filters and the view. Written on every change that affects what is on
+   screen, so the 5-minute meta refresh restores exactly what the viewer had,
+   not just the coarse filters this originally covered. */
 const persist = () => localStorage.setItem("ccu-state", JSON.stringify(
   { range: state.range, project: state.project, kind: state.kind,
-    model: state.model, chart: state.chart, group: state.group,
-    cols: state.cols, view: state.view }));
+    model: state.model, q: state.q, sort: state.sort, dir: state.dir,
+    chart: state.chart, group: state.group, cols: state.cols,
+    view: state.view, session: state.session,
+    ssort: state.ssort, sdir: state.sdir, rf: state.rf }));
 const rows = DATA.rows;
 
 /* Project name as shown: the active product's label prefix carries no
@@ -707,10 +867,13 @@ function initFilters() {
   refreshProjects();
   $("f-project").addEventListener("change", e => { state.project = e.target.value; persist(); render(); });
   $("f-model").addEventListener("change", e => { state.model = e.target.value; persist(); render(); });
+  // q is restored from localStorage (persist() now carries it), so the box
+  // must show that value rather than starting blank under a live filter.
+  $("f-search").value = state.q;
   let deb;
   $("f-search").addEventListener("input", e => {
     clearTimeout(deb);
-    deb = setTimeout(() => { state.q = e.target.value.toLowerCase(); render(); }, 150);
+    deb = setTimeout(() => { state.q = e.target.value.toLowerCase(); persist(); render(); }, 150);
   });
   for (const x of $("range-seg").children)
     x.setAttribute("aria-pressed", String(x.dataset.range) === String(state.range));
@@ -742,6 +905,97 @@ function initFilters() {
   $("csv-btn").addEventListener("click", exportCsv);
   initColPanel();
   initTableEvents();
+  initMoreFilters();
+}
+
+/* ---------- range/flag filters ("More filters") ---------- */
+/* Every control this panel owns, keyed the same as state.rf so init and the
+   Clear button can loop over them instead of naming each one twice. */
+const RF_NUM_INPUTS = {
+  costMin: "rf-cost-min", costMax: "rf-cost-max",
+  durMin: "rf-dur-min", durMax: "rf-dur-max",
+  outMin: "rf-out-min", outMax: "rf-out-max",
+  callsMin: "rf-calls-min", callsMax: "rf-calls-max",
+};
+function rfActiveCount() {
+  const f = state.rf;
+  let n = 0;
+  for (const k of RF_NUM_KEYS) if (f[k] != null) n++;
+  if (f.missesOnly) n++;
+  if (f.errorsOnly) n++;
+  return n;
+}
+function updateMoreFiltersBtn() {
+  const n = rfActiveCount();
+  $("more-filters-btn").textContent = n ? `More filters (${n})` : "More filters";
+}
+function initMoreFilters() {
+  const btn = $("more-filters-btn"), panel = $("more-filters");
+  const inputs = {};
+  for (const k in RF_NUM_INPUTS) inputs[k] = $(RF_NUM_INPUTS[k]);
+  for (const k in inputs) if (state.rf[k] != null) inputs[k].value = String(state.rf[k]);
+  $("rf-misses").checked = state.rf.missesOnly;
+  $("rf-errors").checked = state.rf.errorsOnly;
+  let deb;
+  const commit = () => { updateMoreFiltersBtn(); persist(); render(); };
+  for (const k in inputs) {
+    inputs[k].addEventListener("input", () => {
+      clearTimeout(deb);
+      deb = setTimeout(() => {
+        const v = inputs[k].value.trim();
+        const n = v === "" ? null : Number(v);
+        state.rf[k] = (n == null || !isFinite(n)) ? null : n;
+        commit();
+      }, 150);
+    });
+  }
+  $("rf-misses").addEventListener("change", e => { state.rf.missesOnly = e.target.checked; commit(); });
+  $("rf-errors").addEventListener("change", e => { state.rf.errorsOnly = e.target.checked; commit(); });
+  $("rf-clear").addEventListener("click", () => {
+    state.rf = { ...RF_DEFAULTS };
+    for (const k in inputs) inputs[k].value = "";
+    $("rf-misses").checked = false;
+    $("rf-errors").checked = false;
+    commit();
+  });
+  btn.addEventListener("click", () => {
+    const opening = panel.hidden;
+    panel.hidden = !opening;
+    btn.setAttribute("aria-expanded", String(opening));
+  });
+  updateMoreFiltersBtn();
+}
+
+/* Applies to both tables where the field exists on the row/session; see
+   filtered() and filteredSessions(). A `null` bound is "not set" - 0 is a
+   real bound (e.g. "cost >= 0"), so the check is against `!= null`, not
+   truthiness. */
+function rfPassRow(r) {
+  const f = state.rf;
+  if (f.costMin != null && r.cost < f.costMin) return false;
+  if (f.costMax != null && r.cost > f.costMax) return false;
+  if (f.durMin != null && (r.wall_s ?? -1) < f.durMin) return false;
+  if (f.durMax != null && (r.wall_s ?? Infinity) > f.durMax) return false;
+  if (f.outMin != null && r.out < f.outMin) return false;
+  if (f.outMax != null && r.out > f.outMax) return false;
+  if (f.callsMin != null && toolN(r) < f.callsMin) return false;
+  if (f.callsMax != null && toolN(r) > f.callsMax) return false;
+  if (f.missesOnly && !((r.misses || 0) > 0)) return false;
+  if (f.errorsOnly && !((r.errors || 0) > 0)) return false;
+  return true;
+}
+/* The sessions table has no per-session errors or duration/output-tokens
+   field, so only the three range filters with a real session-side number
+   apply there - duration and output-tokens bounds are silently a no-op on
+   the sessions view rather than hiding every row. */
+function rfPassSession(s) {
+  const f = state.rf;
+  if (f.costMin != null && s.cost < f.costMin) return false;
+  if (f.costMax != null && s.cost > f.costMax) return false;
+  if (f.callsMin != null && (s.calls || 0) < f.callsMin) return false;
+  if (f.callsMax != null && (s.calls || 0) > f.callsMax) return false;
+  if (f.missesOnly && !((s.misses || 0) > 0)) return false;
+  return true;
 }
 
 /* Start of the selected period as an ISO instant, or "" for All. Shared so
@@ -772,7 +1026,8 @@ function filtered() {
     (state.project === "all" || r.project === state.project) &&
     (state.model === "all" || r.models.some(m => m.model === state.model)) &&
     (!state.session || r.session === state.session) &&
-    (!state.q || lcText(r).includes(state.q)));
+    (!state.q || lcText(r).includes(state.q)) &&
+    rfPassRow(r));
 }
 
 /* ---------- sessions ---------- */
@@ -798,8 +1053,14 @@ function filteredSessions() {
     (state.kind === ALL_KINDS || (s.kind || DEFAULT_KIND) === state.kind) &&
     (state.project === "all" || s.project === state.project) &&
     (state.model === "all" || (s.models || []).includes(state.model)) &&
-    (!state.q || lcSess(s).includes(state.q)));
+    (!state.q || lcSess(s).includes(state.q)) &&
+    rfPassSession(s));
 }
+
+// A session id restored from localStorage across the meta refresh only
+// stays a filter if it still names a real session in this payload; see the
+// comment above `state` for why this replaced the old "never persist it".
+if (state.session && !sessById.has(state.session)) state.session = null;
 
 /* The single entry point for "show me this session's prompts". E2/E3 can call
    it from anywhere (a chip's close button, a detail-panel link) and get the
@@ -962,7 +1223,7 @@ const famSlot = (fam) => (FAMILIES.find(([n]) => n === fam) || [])[2] || "o";
 let dayCache = null, dayCacheKey = "";
 const filterKey = () =>
   [state.range, state.kind, state.project, state.model, state.q,
-   state.session || ""].join("\u0001");
+   state.session || "", JSON.stringify(state.rf)].join("\u0001");
 
 function dayBuckets(rs) {
   const key = filterKey();
@@ -1820,21 +2081,53 @@ const SESSCOLS = [
                  td.append(p); return td; } },
 ];
 const SESSCOL_BY_KEY = Object.fromEntries(SESSCOLS.map(c => [c.k, c]));
-// Same cap the prompts table uses, for the same reason: a table nobody can
-// scroll to the end of costs the same to build as one they can.
-const SESS_ROW_CAP = 500;
+/* Per-column pixel widths for the fixed table layout below - everything
+   except "title" (the session name), which is the one column meant to take
+   whatever space the others leave it. table-layout: fixed reads these from
+   a <colgroup>, not from cell content, which is what makes a stable prompt
+   text width possible without measuring anything. */
+const SESS_COL_WIDTH = { project: 130, start: 150, dur: 90, prompts: 90,
+  calls: 90, cost: 90, hit: 100, misses: 80, miss_cost: 100, models: 170,
+  switches: 90, compactions: 110, peak_ctx: 110, subagent_ttl: 120 };
+/* content-visibility (see the CSS) is what makes a row cap mostly about
+   memory rather than render cost, so this is generous: high enough that a
+   viewer with a lot of sessions almost never meets it, with a notice below
+   the table on the rare build that still does rather than a table that
+   silently stops at 500. */
+const SESS_ROW_CAP = 2000;
+
+function buildColgroup(node, cols, widths) {
+  node.replaceChildren();
+  for (const c of cols) {
+    const col = el("col");
+    const w = widths[c.k];
+    if (w) col.style.cssText = "width:" + w + "px";
+    node.append(col);
+  }
+}
 
 function renderSessHead() {
   const tr = $("sess-head");
   tr.replaceChildren();
+  buildColgroup($("sess-colgroup"), SESSCOLS, SESS_COL_WIDTH);
+  const doSort = (c) => {
+    if (state.ssort === c.k) state.sdir *= -1;
+    else { state.ssort = c.k; state.sdir = c.num || c.k === "start" ? -1 : 1; }
+    persist();
+    renderSessions(filteredSessions());
+  };
   for (const c of SESSCOLS) {
     const th = el("th", c.num ? "num" : null, c.label + " ");
-    if (state.ssort === c.k)
-      th.append(el("span", "arrow", state.sdir < 0 ? "▼" : "▲"));
-    th.addEventListener("click", () => {
-      if (state.ssort === c.k) state.sdir *= -1;
-      else { state.ssort = c.k; state.sdir = c.num || c.k === "start" ? -1 : 1; }
-      renderSessions(filteredSessions());
+    th.setAttribute("role", "button");
+    th.tabIndex = 0;
+    const active = state.ssort === c.k;
+    th.setAttribute("aria-sort", active ? (state.sdir < 0 ? "descending" : "ascending") : "none");
+    if (active) th.append(el("span", "arrow", state.sdir < 0 ? "▼" : "▲"));
+    th.addEventListener("click", () => doSort(c));
+    th.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return;
+      e.preventDefault();
+      doSort(c);
     });
     tr.append(th);
   }
@@ -1842,14 +2135,22 @@ function renderSessHead() {
 
 /* Session rows are cached exactly like prompt rows: the cells depend on the
    product filter (which is what projLabel strips) and on nothing else, so a
-   re-sort re-orders elements instead of rebuilding them. */
+   re-sort re-orders elements instead of rebuilding them. A reused row's
+   detail is always closed (renderSessions rebuilds sess-body from scratch,
+   so any open detail-row was already dropped) - aria-expanded has to catch
+   up to that or a screen reader keeps calling a closed row "expanded". */
 let sessCache = new Map(), sessCacheKey = null;
 function sessEl(s) {
   const cached = sessCache.get(s);
-  if (cached) { cached.className = "data-row sess-row"; return cached; }
+  if (cached) {
+    cached.className = "data-row sess-row";
+    cached.setAttribute("aria-expanded", "false");
+    return cached;
+  }
   const tr = el("tr", "data-row sess-row");
   for (const c of SESSCOLS) tr.append(c.cell(s));
   tr.tabIndex = 0;
+  tr.setAttribute("role", "button");
   tr.setAttribute("aria-expanded", "false");
   tr.__sess = s;
   sessCache.set(s, tr);
@@ -1868,6 +2169,7 @@ function renderSessions(ss) {
   $("sess-empty").hidden = sorted.length > 0;
   const out = sorted.slice(0, SESS_ROW_CAP).map(sessEl);
   $("sess-body").replaceChildren(...out);
+  setCapNotice($("sess-cap-notice"), out.length, sorted.length);
   if (sessCache.size > 2000 && sessCache.size > out.length * 3) {
     const keep = new Map();
     for (const tr of out) keep.set(tr.__sess, tr);
@@ -2209,21 +2511,49 @@ if (!Array.isArray(state.cols) || !state.cols.length ||
   state.cols = state.cols && Array.isArray(state.cols)
     ? state.cols.filter(k => COL_BY_KEY[k]) : null;
 if (!state.cols || !state.cols.length) state.cols = [...DEFAULT_COLS];
+// A sort/ssort restored from localStorage names a column that may no longer
+// exist (an older payload, a renamed key) - fall back the same way an
+// unknown view or product already does, rather than sorting on undefined.
+if (!COL_BY_KEY[state.sort]) state.sort = "ts";
+if (!SESSCOL_BY_KEY[state.ssort]) state.ssort = "start";
 const visibleCols = () => state.cols.map(k => COL_BY_KEY[k]).filter(Boolean);
 const sortVal = (r, k) => {
   const c = COL_BY_KEY[k];
   return c ? c.val(r) : (r[k] ?? "");
 };
+/* Per-column pixel widths for the fixed table layout - everything except
+   "text" (the prompt itself), which is left with no declared width so it
+   absorbs whatever the fixed columns do not use. See SESS_COL_WIDTH for the
+   sessions table's version of the same idea. */
+const COL_WIDTH = { ts: 130, project: 130, title: 140, models: 130,
+  inp: 90, out: 90, tools: 70, agents: 70, errors: 70, files: 70,
+  lines: 120, cost: 90, wall_s: 100, api_calls: 90, tpm: 100, lpm: 100,
+  cache: 90, cpk: 110, ashare: 90, alt: 100, cr: 90, chars: 110,
+  effort: 90, thinking: 110, fast_calls: 90, max_tokens_stops: 120,
+  web_searches: 110, peak_ctx: 110, misses: 80, miss_cost: 100, session: 100 };
 
 function renderHead() {
   const tr = $("tbl-head"); tr.replaceChildren();
-  for (const c of visibleCols()) {
+  const cols = visibleCols();
+  buildColgroup($("tbl-colgroup"), cols, COL_WIDTH);
+  const doSort = (c) => {
+    if (state.sort === c.k) state.dir *= -1;
+    else { state.sort = c.k; state.dir = c.k === "ts" || c.num ? -1 : 1; }
+    persist();
+    render();
+  };
+  for (const c of cols) {
     const th = el("th", c.num ? "num" : null, c.label + " ");
-    if (state.sort === c.k) th.append(el("span", "arrow", state.dir < 0 ? "▼" : "▲"));
-    th.addEventListener("click", () => {
-      if (state.sort === c.k) state.dir *= -1;
-      else { state.sort = c.k; state.dir = c.k === "ts" || c.num ? -1 : 1; }
-      render();
+    th.setAttribute("role", "button");
+    th.tabIndex = 0;
+    const active = state.sort === c.k;
+    th.setAttribute("aria-sort", active ? (state.dir < 0 ? "descending" : "ascending") : "none");
+    if (active) th.append(el("span", "arrow", state.dir < 0 ? "▼" : "▲"));
+    th.addEventListener("click", () => doSort(c));
+    th.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return;
+      e.preventDefault();
+      doSort(c);
     });
     tr.append(th);
   }
@@ -2246,6 +2576,14 @@ function shortModel(m) {
    covers everything a cell reads, so a stale cell cannot be shown. */
 let rowCache = new Map(), rowCacheKey = null;
 const rowFingerprint = () => state.cols.join(",") + "|" + state.kind;
+/* Rendering thousands of <tr> nodes is cheap now that content-visibility
+   (see the CSS) skips their layout until they scroll into view, so these
+   bound memory and the initial DOM-build cost rather than layout - raised
+   well past what a real filtered slice needs, with a notice below the table
+   (setCapNotice) when one still applies instead of a table that silently
+   stops. */
+const ROW_CAP = 5000;
+const GROUP_ROW_CAP = 1000;
 function rowEl(cols, r) {
   const cached = rowCache.get(r);
   if (cached) {
@@ -2254,10 +2592,17 @@ function rowEl(cols, r) {
     // a collapsed group leaves display:none behind; a reused row must not
     // carry that into a render where its group no longer exists
     cached.style.display = "";
+    // renderTable always rebuilds tbl-body from this array, so any open
+    // detail-row from a previous render is already gone - a reused row's
+    // aria-expanded has to say so too, or it lies about what is on screen.
+    cached.setAttribute("aria-expanded", "false");
     return cached;
   }
   const tr = el("tr", "data-row");
   for (const c of cols) tr.append(c.cell(r));
+  tr.tabIndex = 0;
+  tr.setAttribute("role", "button");
+  tr.setAttribute("aria-expanded", "false");
   tr.__row = r;
   rowCache.set(r, tr);
   return tr;
@@ -2295,7 +2640,7 @@ function renderTable(rs) {
        header rows already do the separating. */
     const byProject = state.sort === "project";
     let prev = null;
-    sorted.slice(0, 500).forEach((r, i) => {
+    sorted.slice(0, ROW_CAP).forEach((r, i) => {
       const tr = appendRow(out, r, cols);
       if (!byProject) return;
       const name = projLabel(r.project);
@@ -2304,6 +2649,7 @@ function renderTable(rs) {
     });
     body.replaceChildren(...out);
     pruneRowCache(out);
+    setCapNotice($("cap-notice"), Math.min(sorted.length, ROW_CAP), sorted.length);
     return;
   }
   // group by project, groups ordered by total cost; header row = subtotals,
@@ -2316,8 +2662,12 @@ function renderTable(rs) {
   }
   const order = [...groups.entries()].sort((a, b) =>
     b[1].reduce((s, r) => s + r.cost, 0) - a[1].reduce((s, r) => s + r.cost, 0));
+  let shown = 0;
   for (const [proj, list] of order) {
     const gtr = el("tr", "group-row");
+    gtr.tabIndex = 0;
+    gtr.setAttribute("role", "button");
+    gtr.setAttribute("aria-expanded", "true");
     // label cell spans the leading columns that have no subtotal
     let firstSub = cols.findIndex(c => c.groupVal);
     if (firstSub === -1) firstSub = cols.length;
@@ -2330,9 +2680,11 @@ function renderTable(rs) {
       gtr.append(el("td", "num", c.groupVal ? c.groupVal(list) : ""));
     }
     out.push(gtr);
-    const rowEls = list.slice(0, 200).map(r => appendRow(out, r, cols));
+    const rowEls = list.slice(0, GROUP_ROW_CAP).map(r => appendRow(out, r, cols));
+    shown += rowEls.length;
     gtr.__collapse = () => {
       const hide = rowEls[0] && rowEls[0].style.display !== "none";
+      gtr.setAttribute("aria-expanded", String(!hide));
       for (const e2 of rowEls) {
         e2.style.display = hide ? "none" : "";
         const sib = e2.nextSibling;
@@ -2343,9 +2695,10 @@ function renderTable(rs) {
   }
   body.replaceChildren(...out);
   pruneRowCache(out);
+  setCapNotice($("cap-notice"), shown, sorted.length);
 }
 
-/* Different sorts bring different rows into the visible 500, so the cache
+/* Different sorts bring different rows into the visible cap, so the cache
    would otherwise grow to one <tr> per prompt in the payload. Once it is
    several times larger than what is actually on screen, drop everything that
    is not. */
@@ -2358,12 +2711,27 @@ function pruneRowCache(out) {
 
 /* One delegated listener on the body. Five hundred per-row closures were
    allocated and thrown away on every sort; a click inside an open detail
-   panel finds no data row above it, exactly as before. */
+   panel finds no data row above it, exactly as before. Enter/Space answers
+   the same way a click does - the same pattern initSessionEvents uses for
+   the sessions table - so a data row or a group header is a real keyboard
+   control, not just a mouse target with a tabindex. */
 function initTableEvents() {
   const body = $("tbl-body");
-  body.addEventListener("click", (e) => {
+  const hit = (e) => {
     const tr = e.target.closest("tr");
-    if (!tr || tr.parentNode !== body) return;
+    return (tr && tr.parentNode === body) ? tr : null;
+  };
+  body.addEventListener("click", (e) => {
+    const tr = hit(e);
+    if (!tr) return;
+    if (tr.classList.contains("data-row")) toggleDetail(tr, tr.__row);
+    else if (tr.__collapse) tr.__collapse();
+  });
+  body.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return;
+    const tr = hit(e);
+    if (!tr) return;
+    e.preventDefault();
     if (tr.classList.contains("data-row")) toggleDetail(tr, tr.__row);
     else if (tr.__collapse) tr.__collapse();
   });
@@ -2574,9 +2942,12 @@ function donutSvg(comp, total) {
 
 function toggleDetail(tr, r) {
   if (tr.nextSibling && tr.nextSibling.classList.contains("detail-row")) {
-    tr.nextSibling.remove(); tr.classList.remove("open"); return;
+    tr.nextSibling.remove(); tr.classList.remove("open");
+    tr.setAttribute("aria-expanded", "false");
+    return;
   }
   tr.classList.add("open");
+  tr.setAttribute("aria-expanded", "true");
   const dtr = el("tr", "detail-row");
   const td = el("td"); td.colSpan = visibleCols().length;
   const box = el("div", "detail");
@@ -2792,6 +3163,24 @@ renderOverheadTile();
 renderInsightsLink();
 renderCostBasisBadge();
 render();
+/* The 5-minute meta refresh reloads the whole page, which drops scroll
+   position along with everything persist() covers - restoring the filters
+   into a table the viewer is back at the top of is only half the fix. This
+   is sessionStorage, not localStorage: surviving one automatic reload is the
+   goal, not following the viewer to their next real visit, where the top of
+   a probably-different table is the right place to land. Saved on a timer
+   rather than on scroll itself, since a scroll handler firing on every pixel
+   of a fast drag is needless work for a value only ever read back once. */
+const SCROLL_KEY = "ccu-scrollY";
+function saveScroll() {
+  try { sessionStorage.setItem(SCROLL_KEY, String(scrollY || 0)); } catch {}
+}
+addEventListener("beforeunload", saveScroll);
+setInterval(saveScroll, 4000);
+try {
+  const y = +sessionStorage.getItem(SCROLL_KEY);
+  if (y > 0) scrollTo(0, y);
+} catch {}
 /* resize fires continuously while a window is dragged, and each one re-ran
    the filter, re-aggregated the days and rebuilt the SVG - after reading
    clientWidth, which forces layout of the table sitting below it. One redraw
