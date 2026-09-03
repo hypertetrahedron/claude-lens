@@ -114,48 +114,123 @@ def has_tool_result(msg):
         isinstance(b, dict) and b.get("type") == "tool_result" for b in c)
 
 
-# Parsed entries are handed back from the header scan when a transcript is
-# small enough to hold, so it is read once instead of twice. Past this many
-# bytes the entries are dropped and the caller streams the file again -
-# bounded memory matters more than one extra read of a huge transcript.
-SCAN_KEEP_BYTES = 16 * 1024 * 1024
+# A transcript line can only produce a row if it mentions one of these keys:
+# requestId (an API request), "tool_use" (a tool call block - note the closing
+# quote, so "tool_use_id" inside a tool_result does not match), filePath (an
+# edit result) or origin (a human prompt on a modern transcript). Everything
+# else - attachments, ai-title, last-prompt, queue-operation, file-history,
+# and tool_result lines carrying whole files - is decoded only to be thrown
+# away, and those lines are half of a real transcript by both count and bytes.
+# The test is deliberately over-inclusive: it may keep a line that turns out to
+# be irrelevant, but it can never drop one that mattered.
+def relevant(line):
+    return ('"requestId"' in line or '"tool_use"' in line
+            or '"filePath"' in line or '"origin"' in line)
 
 
-def scan_header(path, default_session, keep_bytes=SCAN_KEEP_BYTES):
-    """One pass for a transcript's session id, its vintage, and its entries.
+def scan_header(path, default_session):
+    """A transcript's session id, cwd and vintage, without decoding the file.
 
-    Returns (session_id, legacy, entries). `legacy` is True when no user entry
-    in the file carries an origin marker, meaning human prompts have to be
-    recognised by shape instead (see is_human_prompt). `entries` is the parsed
-    file, or None when it was too large to keep and the caller should stream
-    it instead.
+    Returns (session_id, legacy, cwd). `legacy` is True when no user entry in
+    the file carries an origin marker, meaning human prompts have to be
+    recognised by shape instead (see is_human_prompt).
+
+    Only lines that could carry one of the three answers are decoded, and the
+    scan stops as soon as all three are known - on a modern transcript that is
+    within the first handful of lines, so the header costs nothing. A legacy
+    transcript has no origin marker to find and is scanned to the end, but its
+    lines are only substring-searched, never parsed.
 
     Vintage is decided per file rather than by version number: the marker
     appeared partway through the 2.1.x series and the exact build is not worth
     guessing, whereas "does this file use it" is directly observable.
     """
-    session, legacy, entries, held = None, True, [], 0
+    session = cwd = None
+    legacy = True
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
-                e = _loads(line)
-                if e is None or not isinstance(e, dict):
+                want_s = session is None and '"sessionId"' in line
+                want_c = cwd is None and '"cwd"' in line
+                want_o = legacy and '"origin"' in line
+                if not (want_s or want_c or want_o):
                     continue
-                if entries is not None:
-                    held += len(line)
-                    if held > keep_bytes:
-                        entries = None      # too big to hold; stream it later
-                    else:
-                        entries.append(e)
-                if session is None and e.get("sessionId"):
+                e = _loads(line)
+                if not isinstance(e, dict):
+                    continue
+                if want_s and e.get("sessionId"):
                     session = e["sessionId"]
-                if (legacy and e.get("type") == "user"
+                if want_c and e.get("cwd"):
+                    cwd = e["cwd"]
+                if (want_o and e.get("type") == "user"
                         and isinstance(e.get("origin"), dict)
                         and e["origin"].get("kind") in HUMAN_ORIGINS):
                     legacy = False
+                if session is not None and cwd is not None and not legacy:
+                    break
     except OSError:
-        entries = None
-    return session or default_session, legacy, entries
+        pass
+    return session or default_session, legacy, cwd
+
+
+def first_prompt_id(path):
+    """The first promptId in a subagent transcript, without parsing the rest."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"promptId"' not in line:
+                    continue
+                e = _loads(line)
+                if isinstance(e, dict) and e.get("promptId"):
+                    return e["promptId"]
+    except OSError:
+        return None
+    return None
+
+
+# canonical_model parses and re-assembles a model id; a transcript names the
+# same half-dozen models tens of thousands of times, so the answer is cached.
+_MODEL_CACHE = {}
+
+
+def canon_model(raw):
+    hit = _MODEL_CACHE.get(raw)
+    if hit is None:
+        hit = _MODEL_CACHE[raw] = pricing.canonical_model(raw)
+    return hit
+
+
+class Rows:
+    """Rows accumulated for one transcript, written in four executemany calls.
+
+    Requests are keyed by requestId rather than appended: one API request spans
+    several JSONL lines sharing that id, so the buffer collapses them before
+    they reach SQLite - which both removes ~half the inserts and makes the
+    surviving row the *last* one seen for that id instead of the first, which
+    is what a streamed transcript means by "the state of this request".
+    """
+
+    __slots__ = ("prompts", "requests", "tool_calls", "edits")
+
+    def __init__(self):
+        self.prompts = []
+        self.requests = {}
+        self.tool_calls = []
+        self.edits = []
+
+    def flush(self, con):
+        if self.prompts:
+            db.upsert_prompts(con, self.prompts)
+            del self.prompts[:]
+        if self.requests:
+            db.insert_requests_jsonl(con, self.requests.values())
+            self.requests.clear()
+        if self.tool_calls:
+            db.insert_tool_calls(con, self.tool_calls)
+            del self.tool_calls[:]
+        if self.edits:
+            db.insert_edits(con, self.edits)
+            del self.edits[:]
 
 
 def is_human_prompt(entry, legacy=False):
@@ -207,7 +282,7 @@ def inline_agent(entry):
     return "subagent"
 
 
-def handle_assistant(con, entry, prompt_id, session_id, agent=None):
+def handle_assistant(rows, entry, prompt_id, session_id, agent=None):
     msg = entry.get("message") or {}
     ts = entry.get("timestamp")
     for blk in msg.get("content") or []:
@@ -218,8 +293,8 @@ def handle_assistant(con, entry, prompt_id, session_id, agent=None):
                 inp = blk.get("input")
                 if isinstance(inp, dict):
                     detail = inp.get("skill")
-            db.insert_tool_call(con, blk["id"], prompt_id, session_id, ts,
-                                name, agent, "jsonl", detail=detail)
+            rows.tool_calls.append((blk["id"], prompt_id, session_id, ts,
+                                    name, agent, "jsonl", detail))
     usage = msg.get("usage")
     rid = entry.get("requestId")
     if not usage or not rid:
@@ -229,29 +304,22 @@ def handle_assistant(con, entry, prompt_id, session_id, agent=None):
     # decorate the same model differently, and pricing is keyed on the plain
     # Anthropic form.
     raw_model = msg.get("model", "?")
-    canon, provider = pricing.canonical_model(raw_model)
-    db.upsert_request(con, {
-        "request_id": rid,
-        "prompt_id": prompt_id,
-        "session_id": session_id,
-        "ts": ts,
-        "model": canon or raw_model,
-        "model_raw": raw_model,
-        "provider": provider,
-        "input_tokens": usage.get("input_tokens", 0) or 0,
-        "output_tokens": usage.get("output_tokens", 0) or 0,
-        "cache_read_tokens": usage.get("cache_read_input_tokens", 0) or 0,
-        "cache_create_tokens": usage.get("cache_creation_input_tokens", 0) or 0,
-        "cache_5m_tokens": cc.get("ephemeral_5m_input_tokens", 0) or 0,
-        "cache_1h_tokens": cc.get("ephemeral_1h_input_tokens", 0) or 0,
-        "cost_usd": None,
-        "duration_ms": None,
-        "query_source": "subagent" if agent else "main",
-        "agent_name": agent,
-    }, "jsonl")
+    canon, provider = canon_model(raw_model)
+    # Tuple order is db.REQUEST_COLS.
+    rows.requests[rid] = (
+        rid, prompt_id, session_id, ts, canon or raw_model,
+        usage.get("input_tokens", 0) or 0,
+        usage.get("output_tokens", 0) or 0,
+        usage.get("cache_read_input_tokens", 0) or 0,
+        usage.get("cache_creation_input_tokens", 0) or 0,
+        cc.get("ephemeral_5m_input_tokens", 0) or 0,
+        cc.get("ephemeral_1h_input_tokens", 0) or 0,
+        None, None,
+        "subagent" if agent else "main", agent,
+        raw_model, provider)
 
 
-def handle_tool_result(con, entry, prompt_id, session_id, agent=None):
+def handle_tool_result(rows, entry, prompt_id, session_id, agent=None):
     """Record file edits from Edit/Write tool results (type create/update).
 
     The result rides a user entry whose message content holds the matching
@@ -292,15 +360,16 @@ def handle_tool_result(con, entry, prompt_id, session_id, agent=None):
         content = r.get("content") or ""
         add = content.count("\n") + (1 if content else 0)
         chars = len(content)
-    db.insert_edit(con, tuid, prompt_id, session_id, entry.get("timestamp"),
-                   r.get("filePath"), kind, add, rem, chars, agent, "jsonl")
+    rows.edits.append((tuid, prompt_id, session_id, entry.get("timestamp"),
+                       r.get("filePath"), kind, add, rem, chars, agent, "jsonl"))
 
 
-def file_changed(con, path):
-    try:
-        st = os.stat(path)
-    except OSError:
-        return False
+def file_changed(con, path, st=None):
+    if st is None:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return False
     row = con.execute("SELECT size, mtime FROM ingest_state WHERE path=?",
                       (path,)).fetchone()
     if row and row[0] == st.st_size and abs(row[1] - st.st_mtime) < 1e-6:
@@ -308,11 +377,12 @@ def file_changed(con, path):
     return True
 
 
-def mark_ingested(con, path):
-    try:
-        st = os.stat(path)
-    except OSError:
-        return
+def mark_ingested(con, path, st=None):
+    if st is None:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return
     con.execute("INSERT OR REPLACE INTO ingest_state (path, size, mtime) VALUES (?,?,?)",
                 (path, st.st_size, st.st_mtime))
 
@@ -328,45 +398,75 @@ def ingest_main_file(con, path, label="", project_override=None):
     """
     project = qualify(label, project_override or
                       os.path.basename(os.path.dirname(path)))
-    session, legacy, entries = scan_header(
+    session, legacy, cwd = scan_header(
         path, os.path.splitext(os.path.basename(path))[0])
+    rows = Rows()
     current_pid = None
-    for e in (entries if entries is not None else iter_jsonl(path)):
-        cwd = e.get("cwd")
-        if cwd and not project_override:
-            db.upsert_session(con, session, project=project, cwd=cwd,
-                              source_label=label)
-        if is_human_prompt(e, legacy):
-            # promptId is universal on the transcripts seen so far; uuid is
-            # the fallback for any older build that predates it, and is
-            # equally unique per entry.
-            current_pid = e.get("promptId") or e.get("uuid")
-            if current_pid:
-                db.upsert_prompt(con, current_pid, session_id=session,
-                                 project=project, ts=e.get("timestamp"),
-                                 text=prompt_text(e.get("message") or {}),
-                                 source="jsonl")
-        elif e.get("type") == "assistant" and current_pid:
-            handle_assistant(con, e, current_pid, session,
-                             agent=inline_agent(e))
-        elif e.get("type") == "user" and current_pid:
-            handle_tool_result(con, e, current_pid, session,
-                               agent=inline_agent(e))
-    db.upsert_session(con, session, project=project, source_label=label)
+    try:
+        f = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        db.upsert_session(con, session, project=project, source_label=label)
+        return
+    with f:
+        for line in f:
+            # Legacy transcripts recognise prompts by shape, so every line has
+            # to be looked at; modern ones carry markers and can be filtered.
+            if not legacy and not relevant(line):
+                continue
+            e = _loads(line)
+            if not isinstance(e, dict):
+                continue
+            if cwd is None:
+                cwd = e.get("cwd") or None
+            if is_human_prompt(e, legacy):
+                # promptId is universal on the transcripts seen so far; uuid is
+                # the fallback for any older build that predates it, and is
+                # equally unique per entry.
+                current_pid = e.get("promptId") or e.get("uuid")
+                if current_pid:
+                    rows.prompts.append(
+                        (current_pid, session, project, e.get("timestamp"),
+                         prompt_text(e.get("message") or {}), "jsonl", 0, None))
+            elif e.get("type") == "assistant" and current_pid:
+                handle_assistant(rows, e, current_pid, session,
+                                 agent=inline_agent(e))
+            elif e.get("type") == "user" and current_pid:
+                handle_tool_result(rows, e, current_pid, session,
+                                   agent=inline_agent(e))
+    rows.flush(con)
+    # One session row per transcript instead of one per line: the project, cwd
+    # and label are the same for every entry in the file, and upsert_session
+    # keeps the first cwd it is given anyway.
+    db.upsert_session(con, session, project=project,
+                      cwd=None if project_override else cwd,
+                      source_label=label)
 
 
 def ingest_subagent_file(con, path):
     session = os.path.basename(os.path.dirname(os.path.dirname(path)))
     agent = os.path.splitext(os.path.basename(path))[0]
-    entries = list(iter_jsonl(path))
-    pid = next((e["promptId"] for e in entries if e.get("promptId")), None)
+    pid = first_prompt_id(path)
     if not pid:
         return
-    for e in entries:
-        if e.get("type") == "assistant":
-            handle_assistant(con, e, e.get("promptId") or pid, session, agent=agent)
-        elif e.get("type") == "user":
-            handle_tool_result(con, e, e.get("promptId") or pid, session, agent=agent)
+    rows = Rows()
+    try:
+        f = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with f:
+        for line in f:
+            if not relevant(line):
+                continue
+            e = _loads(line)
+            if not isinstance(e, dict):
+                continue
+            if e.get("type") == "assistant":
+                handle_assistant(rows, e, e.get("promptId") or pid, session,
+                                 agent=agent)
+            elif e.get("type") == "user":
+                handle_tool_result(rows, e, e.get("promptId") or pid, session,
+                                   agent=agent)
+    rows.flush(con)
 
 
 def ingest_tree(con, projects_dir, label="", force=False, project_override=None):
@@ -375,13 +475,17 @@ def ingest_tree(con, projects_dir, label="", force=False, project_override=None)
     pattern = os.path.join(projects_dir, "**", "*.jsonl")
     for path in sorted(glob.glob(pattern, recursive=True)):
         scanned += 1
-        if not force and not file_changed(con, path):
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if not force and not file_changed(con, path, st):
             continue
         if os.sep + "subagents" + os.sep in path:
             ingest_subagent_file(con, path)
         else:
             ingest_main_file(con, path, label, project_override)
-        mark_ingested(con, path)
+        mark_ingested(con, path, st)
         ingested += 1
     return scanned, ingested
 

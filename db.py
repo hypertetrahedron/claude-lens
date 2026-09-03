@@ -255,10 +255,7 @@ def connect(path=DB_PATH, cross_thread=False):
     return con
 
 
-def upsert_prompt(con, prompt_id, session_id=None, project=None, ts=None,
-                  text="", source=None, injected=0, canonical_id=None):
-    con.execute(
-        """INSERT INTO prompts (prompt_id, session_id, project, ts, text, source, injected, canonical_id)
+PROMPT_SQL = """INSERT INTO prompts (prompt_id, session_id, project, ts, text, source, injected, canonical_id)
            VALUES (?,?,?,?,?,?,?,?)
            ON CONFLICT(prompt_id) DO UPDATE SET
              session_id   = COALESCE(prompts.session_id, excluded.session_id),
@@ -267,30 +264,66 @@ def upsert_prompt(con, prompt_id, session_id=None, project=None, ts=None,
              text         = CASE WHEN prompts.text = '' THEN excluded.text ELSE prompts.text END,
              injected     = MAX(prompts.injected, excluded.injected),
              canonical_id = COALESCE(prompts.canonical_id, excluded.canonical_id)
-        """,
+        """
+
+
+def upsert_prompt(con, prompt_id, session_id=None, project=None, ts=None,
+                  text="", source=None, injected=0, canonical_id=None):
+    con.execute(
+        PROMPT_SQL,
         (prompt_id, session_id, project, ts, text, source, injected, canonical_id),
     )
 
 
+def upsert_prompts(con, rows):
+    """Batch of PROMPT_SQL parameter tuples, applied in order."""
+    con.executemany(PROMPT_SQL, rows)
+
+
+# Column order used by every api_requests write. The two statements below are
+# built once at import instead of being re-assembled (four string joins) on
+# every row: the transcript ingester writes tens of thousands per run.
+REQUEST_COLS = ("request_id", "prompt_id", "session_id", "ts", "model",
+                "input_tokens", "output_tokens", "cache_read_tokens",
+                "cache_create_tokens", "cache_5m_tokens", "cache_1h_tokens",
+                "cost_usd", "duration_ms", "query_source", "agent_name",
+                "model_raw", "provider")
+_REQ_PLACEHOLDERS = ",".join("?" * len(REQUEST_COLS))
+_REQ_NAMES = ",".join(REQUEST_COLS)
+
+REQUEST_SQL_OTEL = (
+    f"INSERT INTO api_requests ({_REQ_NAMES}, source)\n"
+    f"VALUES ({_REQ_PLACEHOLDERS}, 'otel')\n"
+    "ON CONFLICT(request_id) DO UPDATE SET "
+    + ",".join(f"{c}=excluded.{c}" for c in REQUEST_COLS[1:])
+    + ", source='otel'")
+
+REQUEST_SQL_JSONL = (
+    f"INSERT OR IGNORE INTO api_requests ({_REQ_NAMES}, source)\n"
+    f"VALUES ({_REQ_PLACEHOLDERS}, 'jsonl')")
+
+
 def upsert_request(con, row, source):
     """row: dict with api_requests columns (minus source). OTel wins conflicts."""
-    cols = ("request_id", "prompt_id", "session_id", "ts", "model",
-            "input_tokens", "output_tokens", "cache_read_tokens",
-            "cache_create_tokens", "cache_5m_tokens", "cache_1h_tokens",
-            "cost_usd", "duration_ms", "query_source", "agent_name",
-            "model_raw", "provider")
-    vals = [row.get(c) for c in cols]
-    if source == "otel":
-        con.execute(
-            f"""INSERT INTO api_requests ({','.join(cols)}, source)
-                VALUES ({','.join('?' * len(cols))}, 'otel')
-                ON CONFLICT(request_id) DO UPDATE SET
-                  {','.join(f'{c}=excluded.{c}' for c in cols[1:])}, source='otel'
-            """, vals)
-    else:
-        con.execute(
-            f"""INSERT OR IGNORE INTO api_requests ({','.join(cols)}, source)
-                VALUES ({','.join('?' * len(cols))}, 'jsonl')""", vals)
+    vals = [row.get(c) for c in REQUEST_COLS]
+    con.execute(REQUEST_SQL_OTEL if source == "otel" else REQUEST_SQL_JSONL,
+                vals)
+
+
+def insert_requests_jsonl(con, rows):
+    """Batch of REQUEST_COLS-ordered tuples from transcripts (OTel rows win)."""
+    con.executemany(REQUEST_SQL_JSONL, rows)
+
+
+TOOL_CALL_SQL = """INSERT INTO tool_calls
+           (tool_use_id, prompt_id, session_id, ts, tool_name, agent_name, source, detail)
+           VALUES (?,?,?,?,?,?,?,?)
+           ON CONFLICT(tool_use_id) DO UPDATE SET
+             tool_name = CASE
+               WHEN tool_calls.tool_name = 'mcp_tool'
+                    AND excluded.tool_name LIKE 'mcp__%'
+               THEN excluded.tool_name ELSE tool_calls.tool_name END,
+             detail = COALESCE(tool_calls.detail, excluded.detail)"""
 
 
 def insert_tool_call(con, tool_use_id, prompt_id, session_id, ts, tool_name,
@@ -299,30 +332,35 @@ def insert_tool_call(con, tool_use_id, prompt_id, session_id, ts, tool_name,
     # nothing of skill names; the transcript carries the specifics. On conflict,
     # let a specific name upgrade the generic one and fill a missing detail.
     con.execute(
-        """INSERT INTO tool_calls
-           (tool_use_id, prompt_id, session_id, ts, tool_name, agent_name, source, detail)
-           VALUES (?,?,?,?,?,?,?,?)
-           ON CONFLICT(tool_use_id) DO UPDATE SET
-             tool_name = CASE
-               WHEN tool_calls.tool_name = 'mcp_tool'
-                    AND excluded.tool_name LIKE 'mcp__%'
-               THEN excluded.tool_name ELSE tool_calls.tool_name END,
-             detail = COALESCE(tool_calls.detail, excluded.detail)""",
+        TOOL_CALL_SQL,
         (tool_use_id, prompt_id, session_id, ts, tool_name, agent_name, source,
          detail),
     )
 
 
+def insert_tool_calls(con, rows):
+    """Batch of TOOL_CALL_SQL parameter tuples, applied in order."""
+    con.executemany(TOOL_CALL_SQL, rows)
+
+
+EDIT_SQL = """INSERT OR IGNORE INTO edits
+           (tool_use_id, prompt_id, session_id, ts, file_path, kind,
+            lines_added, lines_removed, chars_added, agent_name, source)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)"""
+
+
 def insert_edit(con, tool_use_id, prompt_id, session_id, ts, file_path, kind,
                 lines_added, lines_removed, chars_added, agent_name, source):
     con.execute(
-        """INSERT OR IGNORE INTO edits
-           (tool_use_id, prompt_id, session_id, ts, file_path, kind,
-            lines_added, lines_removed, chars_added, agent_name, source)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        EDIT_SQL,
         (tool_use_id, prompt_id, session_id, ts, file_path, kind,
          lines_added, lines_removed, chars_added, agent_name, source),
     )
+
+
+def insert_edits(con, rows):
+    """Batch of EDIT_SQL parameter tuples."""
+    con.executemany(EDIT_SQL, rows)
 
 
 def set_session_title(con, session_id, title):

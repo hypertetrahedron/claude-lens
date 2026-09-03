@@ -6,6 +6,7 @@ stats, and subagent attribution. All filtering/summarizing happens client-side
 in the template. `collect()` is shared with digest.py.
 """
 import argparse
+import heapq
 import json
 import os
 import sys
@@ -195,90 +196,144 @@ def collect(con):
         return rows[target]
 
     window_cutoff = datetime.now(timezone.utc) - timedelta(hours=WINDOW_LOOKBACK_H)
+    # A date one day either side of the cutoff, for a string prefilter that no
+    # UTC offset (max +/-14h) can make wrong. It keeps the 5h-window scan off
+    # every request ever recorded, and off parse_ts entirely.
+    cutoff_day = (window_cutoff - timedelta(days=1)).strftime("%Y-%m-%d")
     recent = []
 
+    resolve = pricing.resolve
+    cost_at = pricing.cost_at
+    w5m, w1h = pricing.CACHE_WRITE_5M_MULT, pricing.CACHE_WRITE_1H_MULT
+
+    # API usage is aggregated in SQLite, not in Python. Everything a prompt row
+    # needs from api_requests is a sum over (prompt, session, model, provider,
+    # agent, priced-or-not, day), and there are two orders of magnitude fewer of
+    # those than there are requests - 1.1k groups for 38k requests on the
+    # benchmark tree. The day is in the key so promotional pricing, which turns
+    # over at a date boundary, still applies exactly.
+    orphan_ts = {}
     providers = defaultdict(int)
-    for (pid, sid, ts, model, inp, out, cr, cw, c5, c1, cost, dur,
-         qsrc, agent, provider) in con.execute(
-            """SELECT prompt_id, session_id, ts, model, input_tokens,
-                      output_tokens, cache_read_tokens, cache_create_tokens,
-                      cache_5m_tokens, cache_1h_tokens, cost_usd, duration_ms,
-                      query_source, agent_name, provider
-               FROM api_requests WHERE prompt_id IS NOT NULL"""):
+    for (pid, sid, model, provider, agent, nocost, calls, inp, out, cr, cw,
+         c5, c1, unsplit, cost, ts_min, ts_max) in con.execute(
+            """SELECT prompt_id, session_id, model, provider, agent_name,
+                      cost_usd IS NULL, COUNT(*),
+                      SUM(COALESCE(input_tokens, 0)),
+                      SUM(COALESCE(output_tokens, 0)),
+                      SUM(COALESCE(cache_read_tokens, 0)),
+                      SUM(COALESCE(cache_create_tokens, 0)),
+                      SUM(COALESCE(cache_5m_tokens, 0)),
+                      SUM(COALESCE(cache_1h_tokens, 0)),
+                      SUM(MAX(COALESCE(cache_create_tokens, 0)
+                              - COALESCE(cache_5m_tokens, 0)
+                              - COALESCE(cache_1h_tokens, 0), 0)),
+                      SUM(cost_usd), MIN(ts), MAX(ts)
+               FROM api_requests WHERE prompt_id IS NOT NULL
+               GROUP BY prompt_id, session_id, model, provider, agent_name,
+                        cost_usd IS NULL, substr(ts, 1, 10)"""):
         if provider:
-            providers[provider] += 1
+            providers[provider] += calls
         r = bucket(pid)
         if r["project"] == "?" and sid in session_project:
             r["project"] = session_project[sid] or "?"
         m = r["models"][model]
-        m["in"] += inp or 0
-        m["out"] += out or 0
-        m["cr"] += cr or 0
-        m["cw"] += cw or 0
-        m["calls"] += 1
-        r["api_calls"] += 1
-        unsplit = max((cw or 0) - (c5 or 0) - (c1 or 0), 0)
-        p = pricing.lookup(model, ts, provider)
-        if p is None:
-            note_unpriced(model, (inp or 0) + (out or 0) + (cr or 0) + (cw or 0),
-                          uncosted=cost is None, provider=provider)
-        if cost is None:
-            cost = pricing.estimate_cost(model, inp or 0, out or 0, cr or 0,
-                                         c5 or 0, c1 or 0, unsplit, ts,
-                                         provider=provider)
-            if cost is None:
-                cost = 0.0
+        m["in"] += inp
+        m["out"] += out
+        m["cr"] += cr
+        m["cw"] += cw
+        m["calls"] += calls
+        r["api_calls"] += calls
+        rate = resolve(model, ts_min, provider)
+        if rate is None:
+            note_unpriced(model, inp + out + cr + cw,
+                          uncosted=bool(nocost), provider=provider)
+        if nocost:
+            cost = 0.0 if rate is None else cost_at(
+                rate, inp, out, cr, c5, c1, unsplit, provider)
             r["est"] = True
         m["cost"] += cost
         r["cost"] += cost
         # Cost components from the pricing table; when the CLI reported an
         # authoritative total, scale the split so components sum to it.
-        if p:
-            pi, po = p
-            comp = [
-                (cr or 0) * pi * pricing.CACHE_READ_MULT / 1e6,
-                ((c5 or 0) * pricing.CACHE_WRITE_5M_MULT
-                 + ((c1 or 0) + unsplit) * pricing.CACHE_WRITE_1H_MULT) * pi / 1e6,
-                (out or 0) * po / 1e6,
-                (inp or 0) * pi / 1e6,
-            ]
-            est_total = sum(comp)
+        if rate is not None:
+            pi, po = rate.inp, rate.out
+            c_read = cr * pi * rate.cache_read_mult / 1e6
+            c_write = (c5 * w5m + (c1 + unsplit) * w1h) * pi / 1e6
+            c_out = out * po / 1e6
+            c_in = inp * pi / 1e6
+            est_total = sum((c_read, c_write, c_out, c_in))
             if est_total > 0 and cost > 0:
                 f = cost / est_total
-                comp = [c * f for c in comp]
-            for i2 in range(4):
-                r["comp"][i2] += comp[i2]
-            r["alt"] += (((cr or 0) + (cw or 0) + (inp or 0)) * pi
-                         + (out or 0) * po) / 1e6
+                c_read *= f
+                c_write *= f
+                c_out *= f
+                c_in *= f
+            rc = r["comp"]
+            rc[0] += c_read
+            rc[1] += c_write
+            rc[2] += c_out
+            rc[3] += c_in
+            r["alt"] += ((cr + cw + inp) * pi + out * po) / 1e6
         if agent:
             r["agents"].add(agent)
-            r["agent_out"] += out or 0
-        if ts and ts > r["last_ts"]:
-            r["last_ts"] = ts
-        if ts and not r["ts"]:
-            r["ts"] = ts
-        dt = parse_ts(ts)
-        if dt and dt >= window_cutoff:
-            recent.append((dt, out or 0, cost))
+            r["agent_out"] += out
+        if ts_max and ts_max > r["last_ts"]:
+            r["last_ts"] = ts_max
+        if ts_min:
+            prev = orphan_ts.get(r["id"])
+            if prev is None or ts_min < prev:
+                orphan_ts[r["id"]] = ts_min
 
-    for tuid, pid, name, agent, detail in con.execute(
-            "SELECT tool_use_id, prompt_id, tool_name, agent_name, detail "
-            "FROM tool_calls WHERE prompt_id IS NOT NULL"):
+    # A prompt whose own row never reached the DB takes its start time from its
+    # earliest request.
+    for rid, t in orphan_ts.items():
+        r = rows[rid]
+        if not r["ts"]:
+            r["ts"] = t
+
+    # The 5h rate-limit block needs individual request times, but only for the
+    # last day and a half, so it is its own small query rather than a field on
+    # every row of the one above.
+    for ts, model, provider, out, cost, inp, cr, cw, c5, c1 in con.execute(
+            """SELECT ts, model, provider, COALESCE(output_tokens, 0), cost_usd,
+                      COALESCE(input_tokens, 0), COALESCE(cache_read_tokens, 0),
+                      COALESCE(cache_create_tokens, 0),
+                      COALESCE(cache_5m_tokens, 0), COALESCE(cache_1h_tokens, 0)
+               FROM api_requests
+               WHERE prompt_id IS NOT NULL AND ts >= ?""", (cutoff_day,)):
+        dt = parse_ts(ts)
+        if not dt or dt < window_cutoff:
+            continue
+        if cost is None:
+            unsplit = cw - c5 - c1
+            if unsplit < 0:
+                unsplit = 0
+            rate = resolve(model, ts, provider)
+            cost = 0.0 if rate is None else cost_at(
+                rate, inp, out, cr, c5, c1, unsplit, provider)
+        recent.append((dt, out, cost))
+
+    for pid, name, detail, agent, n in con.execute(
+            "SELECT prompt_id, tool_name, detail, agent_name, COUNT(*) "
+            "FROM tool_calls WHERE prompt_id IS NOT NULL "
+            "GROUP BY prompt_id, tool_name, detail, agent_name"):
         r = bucket(pid)
         display = f"Skill:{detail}" if (name == "Skill" and detail) else (name or "?")
-        r["tools"][display] += 1
+        r["tools"][display] += n
         if agent:
             r["agents"].add(agent)
 
     for pid, path, add, rem, chars, agent in con.execute(
-            """SELECT prompt_id, file_path, lines_added, lines_removed,
-                      chars_added, agent_name
-               FROM edits WHERE prompt_id IS NOT NULL"""):
+            """SELECT prompt_id, file_path, SUM(COALESCE(lines_added, 0)),
+                      SUM(COALESCE(lines_removed, 0)),
+                      SUM(COALESCE(chars_added, 0)), agent_name
+               FROM edits WHERE prompt_id IS NOT NULL
+               GROUP BY prompt_id, file_path, agent_name"""):
         r = bucket(pid)
         f = r["files"][path or "?"]
-        f[0] += add or 0
-        f[1] += rem or 0
-        r["chars"] += chars or 0
+        f[0] += add
+        f[1] += rem
+        r["chars"] += chars
         if agent:
             r["agents"].add(agent)
 
@@ -315,12 +370,12 @@ def collect(con):
         if t0 and t1 and t1 >= t0:
             wall = round((t1 - t0).total_seconds())
         models = [
-            {"model": k, **v} for k, v in
-            sorted(r["models"].items(), key=lambda kv: -kv[1]["out"])
+            dict(v, model=k, cost=round(v["cost"], 6)) for k, v in
+            sorted(r["models"].items(), key=lambda kv: (-kv[1]["out"], kv[0]))
         ]
-        file_list = sorted(
-            ([p, a, d] for p, (a, d) in r["files"].items()),
-            key=lambda x: -(x[1] + x[2]))[:40]
+        file_list = heapq.nlargest(
+            40, ([p, a, d] for p, (a, d) in r["files"].items()),
+            key=lambda x: (x[1] + x[2], x[0]))
         project = slug_display.get(r["project"],
                                    session_project.get(r["session"],
                                                        r["project"] or "?"))
@@ -336,7 +391,7 @@ def collect(con):
             "kind": kind,
             "text": r["text"],
             "models": models,
-            "tools": sorted(r["tools"].items(), key=lambda kv: -kv[1]),
+            "tools": sorted(r["tools"].items(), key=lambda kv: (-kv[1], kv[0])),
             "agents": sorted(r["agents"]),
             "api_calls": r["api_calls"],
             "cost": round(r["cost"], 4),
@@ -363,6 +418,64 @@ def collect(con):
     PROVIDERS.clear()
     PROVIDERS.update(providers)
     return out_rows, compute_window(recent)
+
+
+# ---------------------------------------------------------------------------
+# Payload compaction.
+#
+# The browser re-parses this payload on every load and every auto-refresh, and
+# the receiver rewrites the file about once a minute, so its size is a running
+# cost rather than a one-off. Three things dominate it and none of them carry
+# information: the key names, repeated once per row; the strings (project,
+# model id, tool, agent, file path) that repeat across thousands of rows; and
+# four fields that are exact sums of the per-model breakdown sitting next to
+# them. So rows go out column-oriented, against a shared string table, with the
+# derived fields dropped - and template.html puts the rows back together in one
+# pass before any other code sees them.
+# ---------------------------------------------------------------------------
+COLUMNS = ("ts", "project", "kind", "text", "models", "tools", "agents",
+           "cost", "est", "wall_s", "agent_out", "files", "ladd", "lrem",
+           "chars", "file_list", "comp", "alt", "title")
+
+
+def compact(out_rows):
+    """(columns, string table) for a list of collect() rows."""
+    strings = []
+    seen = {}
+
+    def sid(v):
+        i = seen.get(v)
+        if i is None:
+            i = seen[v] = len(strings)
+            strings.append(v)
+        return i
+
+    cols = {k: [] for k in COLUMNS}
+    for r in out_rows:
+        cols["ts"].append(r["ts"])
+        cols["project"].append(sid(r["project"]))
+        cols["kind"].append(sid(r["kind"]))
+        cols["text"].append(r["text"])
+        cols["models"].append([[sid(m["model"]), m["in"], m["out"], m["cr"],
+                                m["cw"], m["cost"], m["calls"]]
+                               for m in r["models"]])
+        cols["tools"].append([[sid(t), n] for t, n in r["tools"]])
+        cols["agents"].append([sid(a) for a in r["agents"]])
+        cols["cost"].append(r["cost"])
+        cols["est"].append(1 if r["est"] else 0)
+        cols["wall_s"].append(r["wall_s"])
+        cols["agent_out"].append(r["agent_out"])
+        cols["files"].append(r["files"])
+        cols["ladd"].append(r["ladd"])
+        cols["lrem"].append(r["lrem"])
+        cols["chars"].append(r["chars"])
+        cols["file_list"].append([[sid(f[0]), f[1], f[2]] for f in r["file_list"]])
+        cols["comp"].append(r["comp"])
+        cols["alt"].append(r["alt"])
+        cols["title"].append(r.get("title"))
+    if not any(cols["title"]):
+        cols["title"] = 0          # nothing to carry; the reader treats it as absent
+    return cols, strings
 
 
 RECEIVER_ADDR = ("127.0.0.1", 4318)
@@ -445,16 +558,19 @@ def build(con=None, max_rows=DEFAULT_MAX_ROWS, redact=False, cfg=None):
     # first-party, so nothing changes for an existing install.
     third_party = {p for p in PROVIDERS if p != pricing.ANTHROPIC}
     subscription = bool(PROVIDERS.get(pricing.ANTHROPIC)) or not third_party
+    cols, strings = compact(out_rows)
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "window": window,
-        "rows": out_rows,
+        "n_rows": len(out_rows),
         "total_rows": total,
         "truncated": truncated,
         "redacted": bool(redact),
         "plan": plan_usage(cfg) if subscription else None,
         "providers": dict(PROVIDERS),
         "subscription": subscription,
+        "cols": cols,
+        "strings": strings,
         "unpriced": [
             {"model": m, "rows": e["rows"], "tokens": e["tokens"],
              "provider": e.get("provider")}

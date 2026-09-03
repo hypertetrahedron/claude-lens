@@ -272,22 +272,21 @@ class LegacyTranscripts(unittest.TestCase):
             {"type": "user", "sessionId": "s-legacy", "promptId": "p1",
              "promptSource": "sdk",
              "message": {"content": [{"type": "text", "text": "hello"}]}}])
-        sid, legacy_flag, entries = self.ji.scan_header(modern, "fallback")
+        sid, legacy_flag, cwd = self.ji.scan_header(modern, "fallback")
         self.assertEqual((sid, legacy_flag), ("s-modern", False))
-        self.assertEqual(len(entries), 1, "entries come back for reuse")
-        sid, legacy_flag, entries = self.ji.scan_header(legacy, "fallback")
+        sid, legacy_flag, cwd = self.ji.scan_header(legacy, "fallback")
         self.assertEqual((sid, legacy_flag), ("s-legacy", True))
-        self.assertEqual(len(entries), 1)
 
     def test_a_huge_transcript_is_streamed_instead_of_held(self):
+        """The header scan never holds the file, whatever its size."""
         path = self._write("big.jsonl", [
-            {"type": "user", "sessionId": "s", "promptId": "p",
+            {"type": "user", "sessionId": "s", "promptId": "p", "cwd": "/w",
              "promptSource": "sdk",
              "message": {"content": [{"type": "text", "text": "x" * 200}]}}])
-        sid, legacy_flag, entries = self.ji.scan_header(path, "x", keep_bytes=10)
+        sid, legacy_flag, cwd = self.ji.scan_header(path, "x")
         self.assertEqual(sid, "s")
         self.assertTrue(legacy_flag, "vintage is still decided correctly")
-        self.assertIsNone(entries, "over budget: caller re-reads instead")
+        self.assertEqual(cwd, "/w")
 
     def test_origin_on_injected_turns_alone_does_not_mean_modern(self):
         """Older files carry origin on task-notifications but not on prompts."""
@@ -298,7 +297,7 @@ class LegacyTranscripts(unittest.TestCase):
             {"type": "user", "sessionId": "s1", "promptId": "p2",
              "promptSource": "sdk",
              "message": {"content": [{"type": "text", "text": "real prompt"}]}}])
-        _, legacy, _entries = self.ji.scan_header(path, "x")
+        _, legacy, _cwd = self.ji.scan_header(path, "x")
         self.assertTrue(legacy, "only a human origin marks a file as modern")
 
     def test_legacy_prompt_recognised_tool_result_is_not(self):
@@ -887,34 +886,50 @@ class BuildOptions(unittest.TestCase):
         raw = re.search(r"const DATA = (\{.*?\});\n", html, re.S).group(1)
         return json.loads(raw)
 
+    def _rows(self, p):
+        """Rows as the template sees them, from the column-oriented payload."""
+        s, c = p["strings"], p["cols"]
+        out = []
+        for i in range(p["n_rows"]):
+            models = [{"model": s[m[0]], "in": m[1], "out": m[2], "cr": m[3],
+                       "cw": m[4], "cost": m[5], "calls": m[6]}
+                      for m in c["models"][i]]
+            out.append({"ts": c["ts"][i], "text": c["text"][i],
+                        "project": s[c["project"][i]], "models": models,
+                        "cost": c["cost"][i],
+                        "out": sum(m["out"] for m in models)})
+        return out
+
     def test_cap_keeps_the_newest_and_reports_the_rest(self):
         self.bd.build(max_rows=2)
         p = self._payload()
-        self.assertEqual(len(p["rows"]), 2)
+        rows = self._rows(p)
+        self.assertEqual(len(rows), 2)
         self.assertEqual(p["total_rows"], 5)
         self.assertEqual(p["truncated"], 3)
-        self.assertEqual(p["rows"], sorted(p["rows"], key=lambda r: r["ts"],
-                                           reverse=True))
+        self.assertEqual(rows, sorted(rows, key=lambda r: r["ts"],
+                                      reverse=True))
 
     def test_no_cap_embeds_everything(self):
         self.bd.build(max_rows=0)
         p = self._payload()
-        self.assertEqual(len(p["rows"]), 5)
+        self.assertEqual(len(self._rows(p)), 5)
         self.assertEqual(p["truncated"], 0)
 
     def test_redaction_removes_prompt_text_only(self):
         self.bd.build(redact=True)
         p = self._payload()
         self.assertTrue(p["redacted"])
-        self.assertTrue(all(r["text"] == "" for r in p["rows"]))
-        self.assertTrue(all(r["out"] > 0 for r in p["rows"]),
+        rows = self._rows(p)
+        self.assertTrue(all(r["text"] == "" for r in rows))
+        self.assertTrue(all(r["out"] > 0 for r in rows),
                         "numbers must survive redaction")
 
     def test_text_is_present_by_default(self):
         self.bd.build()
         p = self._payload()
         self.assertFalse(p["redacted"])
-        self.assertTrue(any(r["text"] for r in p["rows"]))
+        self.assertTrue(any(r["text"] for r in self._rows(p)))
 
 
 class ReceiverStaleness(unittest.TestCase):
