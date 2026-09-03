@@ -1155,6 +1155,86 @@ class TemplateWiring(unittest.TestCase):
         self.assertIn('if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return;',
                       self.html)
 
+    def test_errors_column_is_wired(self):
+        """The errors column is the one v2 column shown by default, and its
+        cell must be reachable for the red-tint class when a row has any."""
+        self.assertIn('{ k: "errors", label: "Errors", num: true, def: true,',
+                      self.html)
+        self.assertIn('td.classList.add("err-count")', self.html)
+        self.assertIn(".err-count { color: var(--danger); font-weight: 600; }",
+                      self.html)
+        for var in ("--danger",):
+            self.assertEqual(self.html.count(var + ":"), 3, var)
+
+    def test_other_v2_columns_are_wired(self):
+        for key in ("effort", "thinking", "fast_calls", "max_tokens_stops",
+                    "web_searches", "peak_ctx", "misses", "miss_cost",
+                    "session"):
+            self.assertIn('{ k: "%s", label:' % key, self.html)
+        # the session column is the click-to-filter one; it must not be
+        # confused with the existing "title" column, which is also labelled
+        # "Session" for the human-readable name
+        self.assertIn('{ k: "session", label: "Session ID"', self.html)
+        self.assertIn("setSessionFilter(r.session)", self.html)
+
+    def test_new_columns_are_exported_to_csv(self):
+        for col in ("effort", "thinking_tokens", "fast_calls", "errors",
+                    "max_tokens_stops", "web_searches", "peak_context",
+                    "cache_misses", "miss_cost_usd", "session_id"):
+            self.assertIn('"%s"' % col, self.html)
+        self.assertIn("r.effort || \"\", r.thinking || 0, r.fast_calls || 0, r.errors || 0,",
+                      self.html)
+
+    def test_tools_chart_is_registered(self):
+        """The own-axis attributed-cost-per-tool chart, following the
+        blocks/heat draw() pattern."""
+        self.assertIn('value="tools"', self.html)
+        self.assertIn(
+            'tools: { title: "Attributed tool cost (top 12)", draw: drawTools }',
+            self.html)
+        self.assertIn("function drawTools(wrap, rs)", self.html)
+
+    def test_errors_chart_is_registered(self):
+        self.assertIn('value="errors"', self.html)
+        self.assertIn('errors:{ title: "Tool errors per day",', self.html)
+        self.assertIn("b.errors += r.errors || 0;", self.html)
+
+    def test_conversation_link_is_wired(self):
+        """A real <a target=_blank> to the per-prompt conversation page,
+        only when the row's conv field is set."""
+        self.assertIn("if (r.conv) {", self.html)
+        self.assertIn('el("a", "btn", "Open conversation")', self.html)
+        self.assertIn("a.href = r.conv;", self.html)
+        self.assertIn('a.target = "_blank";', self.html)
+
+    def test_agent_info_drives_subagent_labels(self):
+        """Subagents show name + model, not the opaque agent id."""
+        self.assertIn("if (r.agent_info && r.agent_info.length) {", self.html)
+        self.assertIn('" on " + shortModel(a.model)', self.html)
+
+    def test_tool_attrib_detail_table_is_wired(self):
+        self.assertIn("r.tool_attrib && r.tool_attrib.length", self.html)
+        self.assertIn('["Tool", "Calls", "Result size", "Cost"]', self.html)
+        self.assertIn("const fmtBytes = (n) => {", self.html)
+
+    def test_errors_baseline_overhead_tiles_are_wired(self):
+        self.assertIn('id="tile-errors"', self.html)
+        self.assertIn('id="tile-baseline"', self.html)
+        self.assertIn('id="tile-overhead" hidden', self.html)
+        self.assertIn("function renderErrorsTile", self.html)
+        self.assertIn("function renderBaselineTile", self.html)
+        self.assertIn("function renderOverheadTile", self.html)
+        self.assertIn("DATA.baseline", self.html)
+        self.assertIn("DATA.overhead", self.html)
+
+    def test_header_insights_link_and_cost_basis_badge_are_wired(self):
+        self.assertIn('id="insights-link"', self.html)
+        self.assertIn('id="cost-basis-badge"', self.html)
+        self.assertIn("function renderInsightsLink", self.html)
+        self.assertIn("function renderCostBasisBadge", self.html)
+        self.assertIn("DATA.insights_report", self.html)
+        self.assertIn("DATA.cost_basis", self.html)
+
 
 class SshConfig(unittest.TestCase):
     def test_hosts_and_includes(self):
