@@ -19,6 +19,13 @@
 #   .\generate-dashboard.ps1 -Remote box1,box2    # also collect over SSH
 #   .\generate-dashboard.ps1 -SshConfig           # ...every ~\.ssh\config host
 #   .\generate-dashboard.ps1 -NoCowork            # skip Cowork sessions
+#
+# Passed through to the build:
+#
+#   .\generate-dashboard.ps1 -Db D:\local\m.db    # use this database file
+#   .\generate-dashboard.ps1 -MaxRows 2000        # cap embedded prompt rows
+#   .\generate-dashboard.ps1 -NoPromptText        # redact prompts, for sharing
+#   .\generate-dashboard.ps1 -Conversations 50    # per-prompt conversation pages
 param(
     [switch]$NoOpen,
     [switch]$Index,
@@ -31,7 +38,11 @@ param(
     [string[]]$Remote,
     [switch]$SshConfig,
     [switch]$RemoteFull,
-    [int]$SshTimeout
+    [int]$SshTimeout,
+    [string]$Db,
+    [int]$MaxRows,
+    [switch]$NoPromptText,
+    [int]$Conversations
 )
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -60,12 +71,22 @@ foreach ($h in $Remote)   { $ingestArgs += @("--remote", $h) }
 if ($PSBoundParameters.ContainsKey("Depth"))      { $ingestArgs += @("--depth", $Depth) }
 if ($PSBoundParameters.ContainsKey("SshTimeout")) { $ingestArgs += @("--ssh-timeout", $SshTimeout) }
 
+$buildArgs = @()
+if ($NoPromptText) { $buildArgs += "--no-prompt-text" }
+if ($PSBoundParameters.ContainsKey("MaxRows"))       { $buildArgs += @("--max-rows", $MaxRows) }
+if ($PSBoundParameters.ContainsKey("Conversations")) { $buildArgs += @("--conversations", $Conversations) }
+# The database is shared, so both halves of the run need to be told.
+if ($PSBoundParameters.ContainsKey("Db")) {
+    $ingestArgs += @("--db", $Db)
+    $buildArgs  += @("--db", $Db)
+}
+
 Write-Host "Ingesting Claude Code transcripts..." -ForegroundColor Cyan
 & $py jsonl_ingest.py @ingestArgs
 if ($LASTEXITCODE -ne 0) { Write-Error "Transcript ingestion failed." }
 
 Write-Host "Building dashboard..." -ForegroundColor Cyan
-& $py build_dashboard.py
+& $py build_dashboard.py @buildArgs
 if ($LASTEXITCODE -ne 0) { Write-Error "Dashboard build failed." }
 
 $dash = Join-Path $PSScriptRoot "dashboard.html"

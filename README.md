@@ -30,8 +30,18 @@ new/changed transcripts are parsed. Flags: `-Force` / `--force` re-parses
 everything; `-NoOpen` / `--no-open` skips the browser; `-Index` / `--index`
 opens the report index instead of the dashboard.
 
-`index.html` is the one page to bookmark: it links the live dashboard and
-every archived report, newest first, and is rewritten on every build.
+The wrapper also passes the build's own options straight through, so the
+one-shot script covers the same ground as running the two Python steps by
+hand: `-Db` / `--db PATH` (use a database somewhere other than next to the
+script — both the ingest and the build are told), `-MaxRows` / `--max-rows N`,
+`-NoPromptText` / `--no-prompt-text`, and `-Conversations` / `--conversations
+N`. See [Sharing and size](#sharing-and-size).
+
+`index.html` is the one page to bookmark: it links the live dashboard, the
+per-prompt conversation pages when a build wrote them, Claude Code's own
+`/insights` report when the CLI has written one (under `~/.claude/usage-data`,
+or `$CLAUDE_CONFIG_DIR`), and every archived report, newest first. It is
+rewritten on every build and every digest run.
 
 To pull in other machines or other directories, see
 [Aggregating multiple sources](#aggregating-multiple-sources).
@@ -252,6 +262,45 @@ versions dropped. On the machine this was developed against, one older remote
 went from 209 recorded API requests to 1,201, and from 25K output tokens to
 917K.
 
+## Pricing and cost estimates
+
+Rows that came from a transcript carry no cost — Claude Code only reports one
+over OTel — so their cost is estimated from the table in `pricing.py` and
+shown with a `~` prefix. Live rows use the CLI's own figure and are never
+re-estimated. A model with no entry is **named on the page and counted as
+$0.00 deliberately**; an unknown cost is not a zero cost.
+
+Four things can move a request off the base rate, and `pricing.resolve()`
+applies them in this order:
+
+| | What it does | Applies to |
+|---|---|---|
+| Promotion (`INTRO_PRICES`) | A rate that expires on a date, applied only when the request's timestamp is before it | First-party only — a promotion on the Anthropic API says nothing about a marketplace's rate card. Empty today: Claude Sonnet 5's $2/$10 lived here until the September 2026 rise was cancelled and the rate became permanent |
+| Fast mode (`FAST_PRICES`) | 2x list for requests the transcript recorded as `usage.speed = "fast"` | Claude Opus 5 and Opus 4.8, Anthropic provider only — fast mode is not offered on Bedrock, Vertex or Foundry |
+| Data residency (`GEO_PREMIUM_MULT`) | 1.1x input and output when a request pinned inference to a geography (`usage.inference_geo = "us"`) | Models that support pinning — Opus 4.6 / Sonnet 4.6 and later, first-party only |
+| Cache read (`CACHE_READ_MULT_BY_MODEL`) | A per-model multiple of the input rate, default 0.1 | Claude Fable 5.1 and Claude Mythos 5.1 read cache at **0.025x** — $0.25/MTok against a $10 input rate. On a cache-heavy agent, using 0.1x there overstates the bill fourfold |
+
+The cache multipliers apply to whichever input rate came out of the first
+three, so a fast-mode cache read costs a tenth of the *fast* input rate, not
+of list.
+
+Retired models keep their rates — old transcripts still need costing — and
+gain a retirement date in `pricing.RETIRED`, so a model whose line simply
+stops can be annotated rather than leaving a reader to wonder.
+`pricing.status(model)` answers `"active"` / `"retired"` / `"unknown"`, where
+`"unknown"` is the same set of ids that are reported as unpriced.
+
+`pricing.tool_prompt_tokens(model)` holds Anthropic's published per-model size
+of the tool-use system prompt (286 tokens on Opus 5, 675 on Opus 4.7, 400 for
+a model with no published figure). Claude Code sends tool definitions on every
+request whether or not a tool is called, so this is a floor on every turn's
+input and the basis of the dashboard's harness-overhead estimate.
+
+Everything above is overridable in `pricing.local.json` without editing the
+table — per-provider rates, `cache_read_mult`, `fast_prices`,
+`unsplit_cache_multiplier` and deployment-ARN `model_aliases`.
+`pricing.example.json` documents the shape and is the file to copy.
+
 ## Bedrock and Vertex
 
 Claude Code can reach the same models through the Anthropic API, through
@@ -363,6 +412,10 @@ dashboard says so, so a shrinking "All" view is never a mystery.
 Prompt text is otherwise embedded verbatim (first 400 characters), which is
 worth remembering before sending `dashboard.html` to anyone.
 
+Both flags — and `--conversations N` and `--db PATH` — are accepted by
+`generate-dashboard.sh` / `.ps1` too, so a redacted build is one command:
+`./generate-dashboard.sh --no-prompt-text --no-open`.
+
 ## Keeping the receiver current
 
 The receiver owns `dashboard.html` — it rebuilds it about once a minute using
@@ -436,6 +489,7 @@ carry the CLI's authoritative `cost_usd`).
 | `pricing.example.json` | Template for `pricing.local.json` rate + alias overrides |
 | `check_live.py` | Diagnostic: dump recent live rows |
 | `test_sources.py` | Test suite (discovery, ingest, pricing, payload, template wiring) |
+| `test_pricing.py` | Test suite (rates, cache multipliers, fast mode, retirement, overrides) |
 
 ## Chart metrics
 
@@ -585,4 +639,10 @@ add a changelog line in `db.py` and below.
   is named on the page and counted as $0.00 rather than guessed at.
 - Bedrock rates here default to Anthropic list prices and are unverified
   against a live account; Provisioned Throughput and batch billing cannot be
-  estimated per token at all.
+  estimated per token at all. Claude Sonnet 5 is the one entry where the
+  partner card is stated separately (`pricing.PARTNER_PRICES`), because its
+  $2/$10 is a first-party rate.
+- The data-residency premium is a single 1.1x, applied to input and output
+  alike, for every model that supports pinning. No per-model figure is
+  published; the number is stated in `pricing.py` rather than buried in a
+  formula so it is one line to correct.

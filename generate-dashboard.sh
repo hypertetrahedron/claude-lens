@@ -19,17 +19,29 @@
 #   ./generate-dashboard.sh --remote box1      # also collect over SSH
 #   ./generate-dashboard.sh --ssh-config       # ...every ~/.ssh/config host
 #   ./generate-dashboard.sh --no-cowork        # skip Cowork sessions
+#
+# Passed through to the build:
+#
+#   ./generate-dashboard.sh --db /local/m.db   # use this database file
+#   ./generate-dashboard.sh --max-rows 2000    # cap embedded prompt rows
+#   ./generate-dashboard.sh --no-prompt-text   # redact prompts, for sharing
+#   ./generate-dashboard.sh --conversations 50 # per-prompt conversation pages
 set -euo pipefail
 cd "$(dirname "$0")"
 
 NO_OPEN=0
 OPEN_INDEX=0
 INGEST_ARGS=()
+BUILD_ARGS=()
 
 usage() {
     # the header comment block, minus the shebang, verbatim
     awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"
     exit "${1:-0}"
+}
+
+need_value() {
+    [ "$2" -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; }
 }
 
 while [ $# -gt 0 ]; do
@@ -39,8 +51,16 @@ while [ $# -gt 0 ]; do
         --force|--no-siblings|--no-cowork|--ssh-config|--remote-full)
                         INGEST_ARGS+=("$1") ;;
         --extra-dir|--cowork-dir|--remote|--depth|--ssh-timeout)
-                        [ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; }
+                        need_value "$1" $#
                         INGEST_ARGS+=("$1" "$2"); shift ;;
+        # The database is shared, so both halves of the run need to be told.
+        --db)           need_value "$1" $#
+                        INGEST_ARGS+=("$1" "$2"); BUILD_ARGS+=("$1" "$2"); shift ;;
+        --no-prompt-text)
+                        BUILD_ARGS+=("$1") ;;
+        --max-rows|--conversations)
+                        need_value "$1" $#
+                        BUILD_ARGS+=("$1" "$2"); shift ;;
         -h|--help)      usage 0 ;;
         *) echo "unknown option: $1" >&2; usage 2 ;;
     esac
@@ -61,7 +81,7 @@ echo "Ingesting Claude Code transcripts..."
 "$PY" jsonl_ingest.py ${INGEST_ARGS+"${INGEST_ARGS[@]}"}
 
 echo "Building dashboard..."
-"$PY" build_dashboard.py
+"$PY" build_dashboard.py ${BUILD_ARGS+"${BUILD_ARGS[@]}"}
 
 DASH="$(pwd)/dashboard.html"
 IDX="$(pwd)/index.html"
