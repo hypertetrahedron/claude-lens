@@ -320,7 +320,12 @@ Not every prompt was typed. `prompts.kind` says which is which:
 | `loop` | a turn dispatched by `/loop` |
 | `scheduled` | a turn dispatched by a schedule or cron routine |
 | `team` | a message from another Claude session |
+| `command` | a slash command dispatched by the harness (the receiver reads it from OTel's `command_name` / `command_source`) |
 | `other` | marked as non-human by a marker this version does not know |
+
+An origin marker this version has never seen is stored as `other` rather than
+dropped, so a kind a later CLI invents still shows up as "not typed by a
+person" instead of quietly counting as one.
 
 Everything but `human` is stored with `injected = 1` and a `canonical_id`
 pointing at the most recent human prompt at or before it, so its cost is
@@ -787,6 +792,23 @@ Recovery is best-effort by nature: only the newest version or two of a file is
 kept, so the earliest change to a file usually has no earlier version to diff
 against, and a run of edits between two checkpoints is recovered as one net
 change attributed to the prompt open at the later checkpoint. See ROADMAP.md.
+
+## How big a tool call was
+
+`tool_calls.input_bytes` is the length of the call's input serialised as
+compact JSON; `result_bytes` is the length of what came back — the characters
+in the `tool_result` block, or `toolUseResult.stdout` + `stderr` where that is
+larger, since a Bash result's visible block is only a summary of its output.
+Both are **exact, decoded sizes**, not the size of the line in the transcript:
+a transcript line carries the result twice over for Bash calls and inflates
+everything else with JSON escaping, so line length runs a median of 2.7x and a
+mean of 9.3x the real figure. Measuring the result properly costs about 0.4s
+on a 450 MB tree, which is the price of the column being usable.
+
+`is_error` is set from the `tool_result` block's own flag or from an `error` /
+`isError` on `toolUseResult`. OTel fills `duration_ms` and `error_type` for
+the same call; neither source overwrites the other, each only fills what is
+still NULL.
 
 ## Database versioning
 

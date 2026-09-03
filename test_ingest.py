@@ -308,8 +308,19 @@ class TaskNotificationFolding(TranscriptCase):
         self.assertEqual(ji.prompt_kind({"origin": {"kind": "coordinator"}}),
                          "coordinator")
         self.assertEqual(ji.prompt_kind({"origin": {"kind": "teammate"}}), "team")
+        self.assertEqual(ji.prompt_kind({"origin": {"kind": "command"}}),
+                         "command")
         self.assertEqual(ji.prompt_kind({"origin": {"kind": "wat"}}), "other")
+        self.assertEqual(ji.prompt_kind({}, "<command-name>/loop"), "command")
         self.assertIsNone(ji.prompt_kind({}, "just a sentence"))
+
+    def test_unknown_kinds_are_recorded_as_other(self):
+        """A marker a later CLI invents must not vanish from the table."""
+        for raw in ("something-new", "sdk-driver", ""):
+            kind = ji.prompt_kind({"origin": {"kind": raw}})
+            self.assertTrue(kind is None or kind in ji.KNOWN_KINDS, raw)
+        self.assertEqual(ji.prompt_kind({"origin": {"kind": "something-new"}}),
+                         "other")
 
 
 class SessionEvents(TranscriptCase):
@@ -473,7 +484,10 @@ class ToolCallSizes(TranscriptCase):
         row = self.rows("SELECT input_bytes, detail, tool_name FROM tool_calls "
                         "WHERE tool_use_id='toolu_skill'")[0]
         self.assertEqual(row[1:], ("dataviz", "Skill"))
-        self.assertEqual(row[0], len(json.dumps({"skill": "dataviz"})))
+        # Compact separators: the size is a property of the input, not of
+        # the serialiser's spacing (and one encoder is reused per run).
+        self.assertEqual(row[0], len(json.dumps({"skill": "dataviz"},
+                                                separators=(",", ":"))))
 
     def test_is_error(self):
         self.build()

@@ -400,7 +400,10 @@ def connect(path=DB_PATH, cross_thread=False):
         MIGRATIONS[version](con)
         con.execute(f"PRAGMA user_version = {version}")
         con.commit()
-        print(f"metrics.db migrated to schema v{version}")
+        # Name the file: the tests and any --db run migrate copies, and a
+        # message that always says "metrics.db" reads as if the real one had
+        # just been rewritten.
+        print(f"{os.path.basename(path)} migrated to schema v{version}")
     return con
 
 
@@ -427,6 +430,8 @@ def _pad(row, width):
     list stays valid; the receiver and any out-of-tree caller keep working
     across a schema bump instead of raising a binding error.
     """
+    if type(row) is tuple and len(row) == width:
+        return row
     row = tuple(row)
     if len(row) == width:
         return row
@@ -512,12 +517,20 @@ def upsert_request(con, row, source):
 
 
 def insert_requests_jsonl(con, rows):
-    """Batch of REQUEST_COLS-ordered tuples (or dicts) from transcripts."""
+    """Batch of REQUEST_COLS-ordered tuples (or dicts) from transcripts.
+
+    The ingester already hands over full-width tuples with context_tokens
+    filled, and it hands over tens of thousands per run, so that case passes
+    straight through; only a short tuple or a dict pays for normalisation.
+    """
     width = len(REQUEST_COLS)
 
     def prepared():
         for row in rows:
-            if isinstance(row, dict):
+            if type(row) is tuple and len(row) == width \
+                    and row[_CTX_IDX] is not None:
+                yield row
+            elif isinstance(row, dict):
                 yield _with_context([row.get(c) for c in REQUEST_COLS])
             else:
                 yield _with_context(list(_pad(row, width)))

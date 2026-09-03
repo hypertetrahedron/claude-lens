@@ -89,8 +89,11 @@ IDE_WRAPPERS = ("<ide_", "<system-reminder>")
 # prompts.kind. `origin.kind` answers it outright on modern transcripts; the
 # text openers below cover files written before the marker existed and turns
 # that arrive through a queue rather than as an origin-marked entry.
+# "command" is what receiver.py records for a slash command dispatched
+# through OTel's command_name/command_source; the ingester recognises it here
+# so both sources spell the same thing the same way.
 KNOWN_KINDS = frozenset({"human", "task-notification", "coordinator", "loop",
-                         "scheduled", "team", "other"})
+                         "scheduled", "team", "command", "other"})
 ORIGIN_KIND_ALIASES = {"teammate": "team", "teammate-message": "team",
                        "cron": "scheduled", "schedule": "scheduled"}
 KIND_PREFIXES = (
@@ -98,6 +101,8 @@ KIND_PREFIXES = (
     ("<teammate-message", "team"),
     ("Another Claude session sent a message:", "team"),
     ("<coordinator", "coordinator"),
+    ("<command-name>", "command"),
+    ("<local-command-caveat>", "command"),
     ("<loop", "loop"),
     ("<scheduled", "scheduled"),
     ("<cron", "scheduled"),
@@ -106,6 +111,7 @@ KIND_PREFIXES = (
 # Tools whose calls change a file on disk.
 EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 
+_REQ_OUT = db.REQUEST_COLS.index("output_tokens")
 _TC = {name: i for i, name in enumerate(db.TOOL_CALL_COLS)}
 _TC_RESULT_BYTES = _TC["result_bytes"]
 _TC_IS_ERROR = _TC["is_error"]
@@ -113,6 +119,13 @@ _TC_IS_ERROR = _TC["is_error"]
 # "<total_tokens>15000000 tokens left</total_tokens>", the harness's own
 # running context reading, delivered as an attachment entry.
 _TOTAL_TOKENS_RE = re.compile(r"<total_tokens>\s*([0-9][0-9_,]*)")
+
+# json.dumps() with any keyword argument builds a fresh JSONEncoder on every
+# call, and tool inputs are measured tens of thousands of times per run. One
+# encoder, built once. Compact separators make the size a property of the
+# input rather than of the serialiser's spacing.
+_encode_compact = json.JSONEncoder(separators=(",", ":"),
+                                   default=str).encode
 
 
 def _loads(line):
@@ -256,9 +269,9 @@ def content_len(content):
                 if isinstance(src, dict) and isinstance(src.get("data"), str):
                     total += len(src["data"])
                 else:
-                    total += len(json.dumps(b, default=str))
+                    total += len(_encode_compact(b))
         return total
-    return len(json.dumps(content, default=str))
+    return len(_encode_compact(content))
 
 
 def has_tool_result(msg):
@@ -288,14 +301,15 @@ _RELEVANT_KEYS = ('"tool_result"', '"requestId"', '"tool_use"', '"origin"',
 # Every marker above appears within the entry's own envelope, ahead of any
 # large payload, on every transcript seen. The head is therefore enough to
 # *accept* a line; only a line the head rejects is scanned in full, which
-# keeps the guarantee that nothing relevant is ever dropped.
+# keeps the guarantee that nothing relevant is ever dropped. find() with an
+# end offset rather than a slice: slicing copies 4 KB per line, which over a
+# large tree is hundreds of megabytes of memcpy to answer a yes/no question.
 _HEAD = 4096
 
 
 def relevant(line):
-    head = line[:_HEAD]
     for key in _RELEVANT_KEYS:
-        if key in head:
+        if line.find(key, 0, _HEAD) >= 0:
             return True
     if len(line) <= _HEAD:
         return False
@@ -494,7 +508,7 @@ def handle_assistant(rows, entry, prompt_id, session_id, agent=None,
         detail = inp.get("skill") if (name == "Skill"
                                       and isinstance(inp, dict)) else None
         try:
-            input_bytes = len(json.dumps(inp, default=str)) if inp is not None else 0
+            input_bytes = len(_encode_compact(inp)) if inp is not None else 0
         except (TypeError, ValueError):
             input_bytes = None
         # Column order is db.TOOL_CALL_COLS; kept mutable so the result's size
@@ -511,6 +525,15 @@ def handle_assistant(rows, entry, prompt_id, session_id, agent=None,
     usage = msg.get("usage")
     rid = entry.get("requestId")
     if not usage or not rid:
+        return
+    out_t = usage.get("output_tokens", 0) or 0
+    seen = rows.requests.get(rid)
+    if seen is not None and seen[_REQ_OUT] >= out_t:
+        # Another content block of this request is already buffered with at
+        # least as many output tokens, which is the same test SQLite applies
+        # on conflict - so this line cannot change the answer and the whole
+        # tuple need not be built. Half the assistant lines in a transcript
+        # are these repeats.
         return
     cc = usage.get("cache_creation") or {}
     otd = usage.get("output_tokens_details") or {}
@@ -529,13 +552,16 @@ def handle_assistant(rows, entry, prompt_id, session_id, agent=None,
     # server_tool_use is a map of counters (web_search_requests,
     # web_fetch_requests, ...); the total is what the dashboard charts, and
     # summing keeps a counter added later from being silently dropped.
-    server_calls = sum(v for v in stu.values() if isinstance(v, int)) if stu else None
+    server_calls = None
+    if stu:
+        server_calls = 0
+        for value in stu.values():
+            if type(value) is int:
+                server_calls += value
     # Tuple order is db.REQUEST_COLS.
     rows.requests[rid] = (
         rid, prompt_id, session_id, ts, model,
-        inp_t,
-        usage.get("output_tokens", 0) or 0,
-        read_t, create_t,
+        inp_t, out_t, read_t, create_t,
         cc.get("ephemeral_5m_input_tokens", 0) or 0,
         cc.get("ephemeral_1h_input_tokens", 0) or 0,
         None, None,
@@ -781,16 +807,28 @@ class SessionInfo:
             setattr(self, name, None)
 
     def note(self, entry):
-        ts = entry.get("timestamp")
+        # Called once per decoded entry, so it is written as straight-line
+        # attribute assignment rather than a loop over _FIELDS (which stays
+        # as the documentation of the mapping).
+        get = entry.get
+        ts = get("timestamp")
         if ts:
             if self.first_ts is None or ts < self.first_ts:
                 self.first_ts = ts
             if self.last_ts is None or ts > self.last_ts:
                 self.last_ts = ts
-        for attr, key in self._FIELDS:
-            value = entry.get(key)
-            if value:
-                setattr(self, attr, value)
+        value = get("gitBranch")
+        if value:
+            self.git_branch = value
+        value = get("version")
+        if value:
+            self.cli_version = value
+        value = get("entrypoint")
+        if value:
+            self.entrypoint = value
+        value = get("permissionMode")
+        if value:
+            self.permission_mode = value
 
 
 def record_injected_prompt(rows, entry, session, project, last_human):
@@ -923,10 +961,15 @@ def ingest_main_file(con, path, label="", project_override=None, fh_maps=None):
             elif etype == "user":
                 record_injected_prompt(rows, e, session, project, last_human)
                 if current_pid:
-                    agent = inline_agent(e)
-                    handle_tool_result(rows, e, current_pid, session, agent=agent)
                     handle_tool_result_blocks(rows, e)
-                    handle_agent_result(rows, e, session)
+                    # Both of the following start by demanding toolUseResult,
+                    # and most user entries are tool results that carry none;
+                    # asking once here saves two calls per entry on the
+                    # busiest line of the whole parse.
+                    if e.get("toolUseResult") is not None:
+                        handle_tool_result(rows, e, current_pid, session,
+                                           agent=inline_agent(e))
+                        handle_agent_result(rows, e, session)
                 _note_compaction(rows, e, session, current_pid)
             else:
                 _note_compaction(rows, e, session, current_pid)
@@ -987,9 +1030,10 @@ def ingest_subagent_file(con, path):
                 handle_assistant(rows, e, e.get("promptId") or pid, session,
                                  agent=agent)
             elif e.get("type") == "user":
-                handle_tool_result(rows, e, e.get("promptId") or pid, session,
-                                   agent=agent)
                 handle_tool_result_blocks(rows, e)
+                if e.get("toolUseResult") is not None:
+                    handle_tool_result(rows, e, e.get("promptId") or pid,
+                                       session, agent=agent)
     # Fills only what the launch record did not already establish.
     rows.agents[agent] = (agent, session, pid, None, subagent_type, None,
                           resolved, None, None, "subagent-file")
