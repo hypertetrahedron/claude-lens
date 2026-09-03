@@ -462,7 +462,11 @@ The **5h blocks** chart view draws one bar per ccusage-style billing block
 **Current 5h block** tile shows the open block's burn rate — tokens/min,
 $/min, projected cost at close, minutes left — from the payload's `burn`
 figure; it is hidden entirely between blocks (nothing to project) and on a
-Bedrock/Vertex install, where the 5-hour concept does not apply.
+Bedrock/Vertex install, where the 5-hour concept does not apply. The rate is
+averaged over the last 30 minutes, or however long the block has actually
+been open if that is less — a block two minutes old is not diluted by
+dividing over 30 minutes of mostly-nothing, and a request from the block
+before it is never counted into a young block's rate.
 
 ### Heatmap
 
@@ -715,10 +719,18 @@ Three things are worth knowing:
   containing `<script>` renders as those nine characters.
 - **They need the transcript.** A prompt whose JSONL has been deleted or
   compacted away is skipped, and the dashboard's notice bar says how many.
+- **The filename is never the raw prompt id.** An id matching
+  `^[A-Za-z0-9._-]{1,120}$` is used as-is; anything else — including one
+  crafted to escape the directory — is replaced by a short hash of it, so a
+  page can never be written outside `conversations/`.
 
 A page is only rewritten when its transcript has moved, so the receiver's
 once-a-minute rebuild costs one `stat()` per session rather than three hundred
-file writes.
+file writes. After writing the current window, any page that fell out of it —
+because the window slid forward, or its prompt no longer resolves — is
+deleted, so the directory tracks `--conversations N` rather than growing
+without bound; `index.html` and anything not matching the pattern above are
+never touched.
 
 ## Keeping the receiver current
 

@@ -12,6 +12,7 @@ import os
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from urllib.request import pathname2url
 
 import conversations
 import db
@@ -103,12 +104,20 @@ def parse_ts(ts):
         return None
 
 
-def note_unpriced(model, tokens, uncosted, provider=None):
+def note_unpriced(model, tokens, uncosted, provider=None, calls=1):
+    """Record `calls` unpriced requests for `model` (one GROUP BY group).
+
+    `calls` is the request count of the group being folded in, not the
+    number of times this function was called - collect() calls it once per
+    (model, provider, ...) group, so without this the stderr warning and the
+    payload's unpriced[].rows undercount every model with more than one
+    request.
+    """
     e = UNPRICED.setdefault(model or "?",
                             {"rows": 0, "uncosted_rows": 0, "tokens": 0,
                              "provider": provider})
-    e["rows"] += 1
-    e["uncosted_rows"] += int(uncosted)
+    e["rows"] += calls
+    e["uncosted_rows"] += calls if uncosted else 0
     e["tokens"] += tokens
     if provider and not e.get("provider"):
         e["provider"] = provider
@@ -189,7 +198,7 @@ def cache_write_cost(rate, c5, c1, unsplit, provider):
             + unsplit * mult) * rate.inp / 1e6
 
 
-def cache_scan(con, since=None):
+def cache_scan(con, since=None, canon=None):
     """One ordered pass over main-conversation requests.
 
     Two things come out of it that a GROUP BY cannot produce, because both
@@ -206,14 +215,17 @@ def cache_scan(con, since=None):
     between the two, or the session simply sat idle past the cache's TTL.
     "unknown" is left as itself rather than guessed at.
 
-    Returns (per_prompt, per_session, ctx) where per_prompt maps a prompt id
-    to [misses, miss_cost] and ctx maps a session id to a list of
-    [t, ctx, cr, cw, model, miss, cause, event] points.
+    Returns (per_prompt, per_session, ctx) where per_prompt maps a *canonical*
+    prompt id (per `canon`, folding injected turns onto their parent - see
+    resolve_map()) to [misses, miss_cost] and ctx maps a session id to a list
+    of [t, ctx, cr, cw, model, miss, cause, event] points. `canon` defaults to
+    resolve_map(con) when not passed by a caller that already has it.
 
     Subagent requests are excluded: they run against their own context, so
     mixing them into the session's series would draw a sawtooth that never
     happened.
     """
+    canon = resolve_map(con) if canon is None else canon
     events = defaultdict(list)
     for sid, ts, kind in con.execute(
             "SELECT session_id, ts, kind FROM session_events "
@@ -257,6 +269,10 @@ def cache_scan(con, since=None):
             seen.append(evs[ei][1])
             ei += 1
         dt = parse_ts(ts)
+        # "normal" and "standard" both mean the request was not fast mode;
+        # without this a standard->NULL pair (or vice versa) reads as a
+        # switch and pre-empts the real cause.
+        speed_n = "standard" if speed == "normal" else speed
         if ctx_tokens > stats["peak_ctx"]:
             stats["peak_ctx"] = ctx_tokens
         miss, cause = 0, None
@@ -268,9 +284,9 @@ def cache_scan(con, since=None):
                    if (dt and prev[4]) else None)
             if model != prev[1]:
                 cause = "model_switch"
-            elif effort != prev[2]:
+            elif effort is not None and prev[2] is not None and effort != prev[2]:
                 cause = "effort_switch"
-            elif speed != prev[3]:
+            elif speed_n is not None and prev[3] is not None and speed_n != prev[3]:
                 cause = "speed_switch"
             elif "compact" in seen:
                 cause = "compact"
@@ -284,13 +300,13 @@ def cache_scan(con, since=None):
                                         provider)
                 stats["miss_cost"] += cost
                 if pid:
-                    per_prompt[pid][1] += cost
+                    per_prompt[canon.get(pid, pid)][1] += cost
             stats["misses"] += 1
             if pid:
-                per_prompt[pid][0] += 1
+                per_prompt[canon.get(pid, pid)][0] += 1
         points.append([int(dt.timestamp()) if dt else None, ctx_tokens, cr, cw,
                        model, miss, cause, seen[0] if seen else None])
-        prev = (cr, model, effort, speed, dt)
+        prev = (cr, model, effort, speed_n, dt)
     return per_prompt, per_session, ctx
 
 
@@ -347,6 +363,10 @@ def compute_blocks(con, now=None, days=BLOCK_DAYS):
             blocks.append({"start": start, "end": end, "calls": 0,
                            "cost": 0.0, "out": 0, "inp": 0, "cr": 0, "cw": 0,
                            "models": set()})
+            # Burn only ever describes the block currently open, so a new
+            # block starting resets it - otherwise a block only a few
+            # minutes old would still carry requests from the one before it.
+            burn_tokens = burn_usd = 0.0
         b = blocks[-1]
         b["calls"] += 1
         b["cost"] += cost
@@ -368,13 +388,19 @@ def compute_blocks(con, now=None, days=BLOCK_DAYS):
     if blocks and blocks[-1]["active"]:
         b = blocks[-1]
         left = max((b["end"] - now).total_seconds() / 60.0, 0.0)
+        # A block only a few minutes old has not had BURN_WINDOW_MIN of
+        # history yet - dividing by the full 30 minutes would under-report
+        # its rate, so the divisor is however long the block has actually
+        # been open, capped at the window and floored at one minute.
+        since_start = (now - b["start"]).total_seconds() / 60.0
+        divisor = max(1.0, min(BURN_WINDOW_MIN, since_start))
         burn = {
             "window_min": BURN_WINDOW_MIN,
             "minutes_left": round(left, 1),
-            "tokens_per_min": round(burn_tokens / BURN_WINDOW_MIN, 1),
-            "usd_per_min": round(burn_usd / BURN_WINDOW_MIN, 6),
+            "tokens_per_min": round(burn_tokens / divisor, 1),
+            "usd_per_min": round(burn_usd / divisor, 6),
             "projected_cost": round(
-                b["cost"] + burn_usd / BURN_WINDOW_MIN * left, 4),
+                b["cost"] + burn_usd / divisor * left, 4),
         }
     return blocks, burn
 
@@ -597,7 +623,8 @@ def collect(con, since=None):
         rate = resolve(model, ts_min, provider, speed, geo)
         if rate is None:
             note_unpriced(model, inp + out + cr + cw,
-                          uncosted=bool(nocost), provider=provider)
+                          uncosted=bool(nocost), provider=provider,
+                          calls=calls)
         if nocost:
             cost = 0.0 if rate is None else cost_at(
                 rate, inp, out, cr, c5, c1, unsplit, provider)
@@ -730,7 +757,8 @@ def collect(con, since=None):
             "FROM agents"):
         agent_meta[aid] = (kind, resolved or requested)
 
-    per_prompt_cache, per_session_cache, ctx_series = cache_scan(con, since)
+    per_prompt_cache, per_session_cache, ctx_series = cache_scan(con, since,
+                                                                 canon)
 
     out_rows = []
     for r in rows.values():
@@ -1197,16 +1225,21 @@ def unpriced_models():
 
 
 def insights_report():
-    """Path to Claude Code's own /insights report, if the CLI wrote one.
+    """file: URL for Claude Code's own /insights report, if the CLI wrote one.
 
     It answers a different question than this dashboard does - the CLI's view
     of the account - and it is easy to forget it exists, so the page links it.
+    A raw filesystem path is not a usable href (and breaks outright on
+    Windows' drive-letter form), so this is encoded with pathname2url the
+    same way report_index.py's _file_url does it.
     """
     path = os.path.join(
         os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR")
                            or os.path.join("~", ".claude")),
         "usage-data", "report.html")
-    return path if os.path.exists(path) else None
+    if not os.path.exists(path):
+        return None
+    return "file:" + pathname2url(os.path.abspath(path))
 
 
 def build(con=None, max_rows=DEFAULT_MAX_ROWS, redact=False, cfg=None,

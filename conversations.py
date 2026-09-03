@@ -24,12 +24,33 @@ Design rules, all of them load-bearing:
 - **Incremental.** A page is rewritten only when its transcript moved, so a
   rebuild every minute does not rewrite three hundred files every minute.
 """
+import hashlib
 import html
 import json
 import os
+import re
 from datetime import datetime, timezone
 
 import pricing
+
+# A prompt id that is safe to use verbatim as a filename: no path separators,
+# no "..", nothing that needs escaping. Anything else (an id containing "/",
+# or "../../pwned" - both seen in real transcripts) is hashed instead, so a
+# malicious or malformed id can never be written outside `folder`. The hash
+# form is also within this character class, so one regex describes every
+# filename this module ever writes - see _prune_stale().
+SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
+SAFE_FILENAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,120}\.html$")
+
+
+def safe_filename(pid):
+    """`<id>.html` for a well-formed id, else a hash of it, always inside
+    `folder` and always the same character class either way."""
+    pid = "" if pid is None else str(pid)
+    if SAFE_ID_RE.match(pid):
+        return pid + ".html"
+    digest = hashlib.sha1(pid.encode("utf-8", "surrogateescape")).hexdigest()
+    return digest[:24] + ".html"
 
 # Per assistant text/thinking block, and per tool-call input summary.
 MAX_BLOCK = 4000
@@ -473,7 +494,7 @@ def write_pages(con, out_dir, rows, limit=300, redact=False):
         if not path or not os.path.exists(path):
             result["skipped_missing"] += 1
             continue
-        page_path = os.path.join(folder, f"{r['id']}.html")
+        page_path = os.path.join(folder, safe_filename(r["id"]))
         href = "conversations/" + os.path.basename(page_path)
         r["conv"] = href
         listed.append((r, href))
@@ -513,7 +534,32 @@ def write_pages(con, out_dir, rows, limit=300, redact=False):
                 result["written"] += 1
 
     _write_index(folder, listed)
+    _prune_stale(folder, {os.path.basename(href) for _, href in listed})
     return result
+
+
+def _prune_stale(folder, keep):
+    """Remove conversation pages that fell out of the current window.
+
+    Without this the directory only ever grows: every build's window slides
+    forward, but nothing ever took the older pages back off disk. Only files
+    matching the filename pattern this module itself writes are candidates,
+    `index.html` is never one of them, and anything in `keep` (the pages just
+    written or confirmed current) survives.
+    """
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return
+    for name in names:
+        if name == "index.html" or name in keep:
+            continue
+        if not SAFE_FILENAME_RE.match(name):
+            continue
+        try:
+            os.remove(os.path.join(folder, name))
+        except OSError:
+            pass
 
 
 def _write_one(page_path, row, entries, costs, agents, base_dir):
