@@ -428,8 +428,11 @@ open its detail panel:
   filter bar so the narrowed view is never a mystery. Clearing the chip
   clears the filter without changing the view.
 
-The session filter is deliberately not persisted across a reload — a session
-id restored from a different payload would filter every prompt away with no
+The session filter persists across the 5-minute auto-refresh like every
+other filter, and is checked against the freshly loaded session table the
+moment that table exists — a session id that no longer names anything (a
+genuinely stale payload, not the ordinary case of the same page reloading
+itself) is dropped rather than left filtering every prompt away with no
 visible reason why.
 
 ### Context-growth chart
@@ -1009,13 +1012,42 @@ counterfactual.
   transcript is gone, the page says so rather than quietly showing less.
   Anything else the build itself wants to say about the payload (via
   `DATA.notices`) is appended to the same notice bar.
-- **Auto-refresh** — the page reloads every 5 minutes; filters, chart choice,
-  grouping and the Prompts/Sessions view persist (localStorage). Light/dark
-  theme with toggle.
-- **Keyboard access** — every clickable row (prompt, session, day bar) and
-  every chart mark with its own tooltip (block bars, heatmap days, context
-  events and misses) is a focusable, tabbable element; a session row also
-  answers Enter and Space the way a click does.
+- **More filters** — a collapsible row under the filter bar with min/max
+  ranges for cost, duration, output tokens and tool calls, plus **misses >
+  0** / **errors > 0** checkboxes. The toggle button shows how many are
+  active (e.g. "More filters (2)"). They narrow the prompts table and chart;
+  on the sessions table only cost, calls and misses apply, since duration,
+  output tokens and errors have no per-session field to filter on. Persisted
+  like every other filter.
+- **Auto-refresh** — the page reloads every 5 minutes. Every filter (date
+  range, product, project, model, search text, the range filters above),
+  both tables' sort column and direction, the Prompts/Sessions view, column
+  layout, chart choice, grouping and the session filter all persist
+  (localStorage) and are restored before the first render, so the reload is
+  invisible. Scroll position survives it too (sessionStorage, saved every
+  few seconds and on unload). A session filter is validated against the
+  freshly loaded session table on restore, so a session that no longer
+  exists is dropped instead of hiding every row with no explanation. Light/
+  dark theme with toggle.
+- **Keyboard access** — every clickable row (prompt, session, group header,
+  day bar) and every chart mark with its own tooltip (block bars, heatmap
+  days, context events and misses) is a focusable, tabbable element that
+  answers Enter and Space the way a click does; a prompt or session row's
+  `aria-expanded` and a group header's follow the open/collapsed state. Both
+  tables' column headers are keyboard-sortable and carry `aria-sort`
+  (ascending/descending/none), updated on every sort. Focus is shown with a
+  visible outline (`:focus-visible`, so it does not appear on a mouse click)
+  using the same colour token as everywhere else on the page.
+- **Large tables** — both tables use a fixed column layout (a `<colgroup>`
+  gives every column but the prompt text / session name a set width, which
+  is what makes a stable layout possible without measuring content) and
+  `content-visibility` on data rows, which skips layout and paint for rows
+  the viewport has not reached — the same table with 8,000 rows costs far
+  less to render than it looks. The prompts table shows up to 5,000 rows
+  ungrouped or 1,000 per group; the sessions table up to 2,000. Past that, a
+  one-line notice under the table says how many are hidden rather than
+  truncating silently — narrow the filters or use Export CSV to get
+  everything.
 
 ## File-change tracking
 
