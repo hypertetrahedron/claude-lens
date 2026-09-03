@@ -23,6 +23,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 import build_dashboard
+import conversations
 import db
 import report_index
 
@@ -87,16 +88,20 @@ def delta(now, before):
 
 
 def conversation_href(prompt_id):
-    """`../conversations/<id>.html` when a build wrote that page, else None.
+    """`../conversations/<file>.html` when a build wrote that page, else None.
 
     The digest does not write conversation pages - a build does - so this is a
     link only where the target exists, and the digest stays readable on a
-    machine where they were never generated.
+    machine where they were never generated. The filename comes from the same
+    conversations.safe_filename() a build used to write it, so an id that
+    needed hashing (or one crafted to escape the directory) still resolves to
+    the real file instead of a path build from the raw id.
     """
     if not prompt_id:
         return None
-    path = os.path.join(BASE, "conversations", f"{prompt_id}.html")
-    return f"../conversations/{prompt_id}.html" if os.path.exists(path) else None
+    fname = conversations.safe_filename(prompt_id)
+    path = os.path.join(BASE, "conversations", fname)
+    return f"../conversations/{fname}" if os.path.exists(path) else None
 
 
 def cache_stats(rows):

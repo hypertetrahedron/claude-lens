@@ -329,6 +329,112 @@ class CacheMisses(Fixture):
         self.assertEqual(len(bd.EXTRAS["ctx"]["sess-a"]), 6)
 
 
+class CacheMissEdgeCases(unittest.TestCase):
+    """cache_scan() correctness that the Fixture scenario doesn't exercise:
+    folding a miss on an injected turn onto its canonical prompt, and not
+    mistaking a NULL effort/speed (or "normal" vs "standard") for a switch.
+    """
+
+    def setUp(self):
+        self.con = db.connect(":memory:")
+        db.upsert_session(self.con, "sess-x", project="proj", cwd="/work/proj",
+                          first_ts=ts(0), last_ts=ts(5))
+
+    def tearDown(self):
+        self.con.close()
+
+    def _requests(self, rows):
+        db.insert_requests_jsonl(self.con, rows)
+        self.con.commit()
+
+    def test_misses_on_an_injected_turn_land_on_the_canonical_row(self):
+        con = self.con
+        db.upsert_prompt(con, "human1", "sess-x", "proj", ts(0),
+                         "do the thing", "jsonl", 0, None, "human")
+        db.upsert_prompt(con, "inject1", "sess-x", "proj", ts(1),
+                         "<task-notification>done</task-notification>",
+                         "jsonl", 1, "human1", "task-notification")
+        self._requests([
+            request("w1", "human1", "sess-x", ts(0), OPUS, input_tokens=10,
+                    output_tokens=10, cache_read_tokens=5000),
+            # The miss lands on a request keyed by the *injected* prompt id.
+            request("w2", "inject1", "sess-x", ts(1), OPUS, input_tokens=10,
+                    output_tokens=10, cache_create_tokens=6000,
+                    cache_1h_tokens=6000),
+        ])
+        canon = bd.resolve_map(con)
+        per_prompt, _, _ = bd.cache_scan(con, canon=canon)
+        self.assertNotIn("inject1", per_prompt,
+                         "a miss on a folded prompt must not sit under its "
+                         "own raw id")
+        self.assertIn("human1", per_prompt)
+        self.assertEqual(per_prompt["human1"][0], 1)
+        self.assertGreater(per_prompt["human1"][1], 0)
+
+    def test_two_raw_ids_folding_to_one_canonical_accumulate(self):
+        con = self.con
+        db.upsert_prompt(con, "human2", "sess-x", "proj", ts(0),
+                         "do the thing", "jsonl", 0, None, "human")
+        db.upsert_prompt(con, "inject2a", "sess-x", "proj", ts(1),
+                         "<task-notification>a</task-notification>",
+                         "jsonl", 1, "human2", "task-notification")
+        db.upsert_prompt(con, "inject2b", "sess-x", "proj", ts(2),
+                         "<task-notification>b</task-notification>",
+                         "jsonl", 1, "human2", "task-notification")
+        self._requests([
+            request("v1", "human2", "sess-x", ts(0), OPUS, input_tokens=10,
+                    output_tokens=10, cache_read_tokens=5000),
+            request("v2", "inject2a", "sess-x", ts(1), OPUS, input_tokens=10,
+                    output_tokens=10, cache_create_tokens=6000,
+                    cache_1h_tokens=6000),
+            # A hit that re-warms the cache before the second injected miss.
+            request("v3", "inject2b", "sess-x", ts(2), OPUS,
+                    input_tokens=10, output_tokens=10,
+                    cache_read_tokens=6000),
+            request("v4", "human2", "sess-x", ts(3), OPUS, input_tokens=10,
+                    output_tokens=10, cache_create_tokens=7000,
+                    cache_1h_tokens=7000),
+        ])
+        canon = bd.resolve_map(con)
+        per_prompt, _, _ = bd.cache_scan(con, canon=canon)
+        self.assertEqual(per_prompt["human2"][0], 2,
+                         "both folded misses must accumulate, not overwrite")
+
+    def test_effort_switch_requires_both_sides_known(self):
+        con = self.con
+        db.upsert_prompt(con, "human3", "sess-x", "proj", ts(0),
+                         "p", "jsonl", 0, None, "human")
+        self._requests([
+            request("e1", "human3", "sess-x", ts(0), OPUS, input_tokens=10,
+                    output_tokens=10, cache_read_tokens=5000, effort="high"),
+            request("e2", "human3", "sess-x", ts(1), OPUS, input_tokens=10,
+                    output_tokens=10, cache_create_tokens=6000,
+                    cache_1h_tokens=6000, effort=None),
+        ])
+        _, _, ctx = bd.cache_scan(con, canon=bd.resolve_map(con))
+        points = ctx["sess-x"]
+        self.assertEqual(points[-1][5], 1, "still a genuine cache miss")
+        self.assertEqual(points[-1][6], "unknown",
+                         "a NULL effort must not be read as effort_switch")
+
+    def test_speed_normal_and_standard_compare_equal(self):
+        con = self.con
+        db.upsert_prompt(con, "human4", "sess-x", "proj", ts(0),
+                         "p", "jsonl", 0, None, "human")
+        self._requests([
+            request("s1", "human4", "sess-x", ts(0), OPUS, input_tokens=10,
+                    output_tokens=10, cache_read_tokens=5000, speed="normal"),
+            request("s2", "human4", "sess-x", ts(1), OPUS, input_tokens=10,
+                    output_tokens=10, cache_create_tokens=6000,
+                    cache_1h_tokens=6000, speed="standard"),
+        ])
+        _, _, ctx = bd.cache_scan(con, canon=bd.resolve_map(con))
+        points = ctx["sess-x"]
+        self.assertEqual(points[-1][5], 1)
+        self.assertEqual(points[-1][6], "unknown",
+                         "'normal' and 'standard' must not read as a switch")
+
+
 class Sessions(Fixture):
     def test_session_row_values(self):
         _, rows, _ = self.collect()
@@ -423,6 +529,35 @@ class Blocks(Fixture):
         _, burn = bd.compute_blocks(self.con, now=T0 + timedelta(days=2),
                                     days=365)
         self.assertIsNone(burn)
+
+    def test_burn_rate_scales_with_the_blocks_own_age_not_a_fixed_30_min(self):
+        """A block only a few minutes old must not be diluted by dividing
+        over the full 30-minute window, and must not absorb a request that
+        actually belongs to the block before it just because that request
+        falls inside the last 30 wall-clock minutes."""
+        old_block_ts = ts(295)   # still inside the block that opened at T0
+        new_block_ts = ts(302)   # T0+302min floors to a fresh block at T0+5h
+        db.insert_requests_jsonl(self.con, [
+            request("burn-old", "p1", "sess-a", old_block_ts, OPUS,
+                    output_tokens=1000),
+            request("burn-new", "p1", "sess-a", new_block_ts, OPUS,
+                    output_tokens=100),
+        ])
+        self.con.commit()
+        now = T0 + timedelta(minutes=304)
+        blocks, burn = bd.compute_blocks(self.con, now=now, days=365)
+        self.assertTrue(blocks[-1]["active"])
+        self.assertEqual(blocks[-1]["calls"], 1,
+                         "only the new block's own request belongs to it")
+        rate = pricing.resolve(OPUS)
+        expect_cost = 100 * rate.out / 1e6      # burn-new alone
+        divisor = 4.0                            # now is 4 min into this block
+        self.assertAlmostEqual(burn["usd_per_min"], expect_cost / divisor,
+                               places=6)
+        # The pre-fix behaviour divided by the fixed 30-minute window and
+        # summed both requests regardless of which block they belonged to.
+        buggy = (expect_cost + 1000 * rate.out / 1e6) / bd.BURN_WINDOW_MIN
+        self.assertNotAlmostEqual(burn["usd_per_min"], buggy, places=6)
 
 
 class Payload(Fixture):
@@ -545,6 +680,109 @@ class ConversationPages(Fixture):
         self.assertTrue(page.add("x" * 100))
         self.assertFalse(page.add("y" * 200))
         self.assertIn("longer than one page", page.html())
+
+    def test_path_traversal_id_cannot_escape_the_conversations_folder(self):
+        _, rows, _ = self.collect()
+        base = next(r for r in rows if r["id"] == "p1")
+        evil = dict(base)
+        evil["id"] = "../../evil"
+        res = conversations.write_pages(self.con, self.tmp, [evil], limit=10)
+        self.assertEqual(res["count"], 1)
+        outside = os.path.normpath(
+            os.path.join(self.tmp, os.pardir, "evil.html"))
+        self.assertFalse(
+            os.path.exists(outside),
+            "a crafted id must never write outside conversations/")
+        fname = conversations.safe_filename("../../evil")
+        self.assertTrue(fname.endswith(".html"))
+        self.assertNotIn("/", fname)
+        self.assertTrue(os.path.exists(
+            os.path.join(self.tmp, "conversations", fname)))
+        self.assertEqual(evil["conv"], f"conversations/{fname}")
+
+    def test_stale_pages_are_pruned_after_a_rebuild(self):
+        self._write(limit=10)
+        stale = os.path.join(self.tmp, "conversations", "stale-prompt.html")
+        with open(stale, "w", encoding="utf-8") as f:
+            f.write("<html>old</html>")
+        # Not a page this module would ever write - must survive pruning.
+        keep_file = os.path.join(self.tmp, "conversations", "notes.txt")
+        with open(keep_file, "w", encoding="utf-8") as f:
+            f.write("not a conversation page")
+        self._write(limit=10)
+        self.assertFalse(
+            os.path.exists(stale),
+            "a page outside the current window must be removed")
+        self.assertTrue(os.path.exists(keep_file),
+                        "only conversation-page filenames may be pruned")
+        self.assertTrue(os.path.exists(
+            os.path.join(self.tmp, "conversations", "index.html")))
+
+
+class SafeFilenames(unittest.TestCase):
+    def test_normal_id_keeps_its_own_name(self):
+        self.assertEqual(conversations.safe_filename("p1"), "p1.html")
+
+    def test_traversal_id_is_hashed_not_joined_raw(self):
+        fname = conversations.safe_filename("../../pwned")
+        self.assertNotIn("/", fname)
+        self.assertNotIn("..", fname)
+        self.assertRegex(fname, r"^[0-9a-f]{24}\.html$")
+
+    def test_hashing_is_deterministic(self):
+        self.assertEqual(conversations.safe_filename("../x"),
+                         conversations.safe_filename("../x"))
+
+
+class InsightsReportLink(unittest.TestCase):
+    def test_emits_a_file_url_not_a_raw_path(self):
+        tmp = tempfile.mkdtemp(prefix="claude-lens-insights-")
+        try:
+            udir = os.path.join(tmp, "usage-data")
+            os.makedirs(udir)
+            report = os.path.join(udir, "report.html")
+            with open(report, "w", encoding="utf-8") as f:
+                f.write("<html></html>")
+            old = os.environ.get("CLAUDE_CONFIG_DIR")
+            os.environ["CLAUDE_CONFIG_DIR"] = tmp
+            try:
+                href = bd.insights_report()
+            finally:
+                if old is None:
+                    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+                else:
+                    os.environ["CLAUDE_CONFIG_DIR"] = old
+            self.assertIsNotNone(href)
+            self.assertTrue(href.startswith("file:"))
+            # Same encoding report_index.py uses for the same purpose.
+            self.assertEqual(href, report_index._file_url(report))
+            self.assertNotEqual(href, report,
+                               "a raw filesystem path is not a usable href")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class UnpricedCounts(unittest.TestCase):
+    def setUp(self):
+        bd.UNPRICED.clear()
+
+    def tearDown(self):
+        bd.UNPRICED.clear()
+
+    def test_note_unpriced_counts_requests_not_calls_to_it(self):
+        """collect() calls note_unpriced() once per GROUP BY group, passing
+        that group's request count - a single call standing for many rows
+        must not be counted as one row."""
+        bd.note_unpriced("mystery-model", tokens=1000, uncosted=True, calls=7)
+        bd.note_unpriced("mystery-model", tokens=500, uncosted=False, calls=3)
+        e = bd.UNPRICED["mystery-model"]
+        self.assertEqual(e["rows"], 10)
+        self.assertEqual(e["uncosted_rows"], 7)
+        self.assertEqual(e["tokens"], 1500)
+
+    def test_default_calls_is_one(self):
+        bd.note_unpriced("solo-model", tokens=10, uncosted=True)
+        self.assertEqual(bd.UNPRICED["solo-model"]["rows"], 1)
 
 
 class Digest(Fixture):
