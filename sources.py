@@ -187,11 +187,19 @@ def _label_for(path, host=None):
     its parent instead - that parent is what distinguishes it (a per-machine
     backup folder, say).
     Remote: the host name, with the folder name appended when the machine has
-    more than the standard directory.
+    more than the standard directory. A Docker host-mount root
+    (`.claude-<project>/data`) is named after the `.claude-<project>` folder
+    instead of `data`, which every such mount would otherwise share.
     """
     name = os.path.basename(os.path.normpath(path))
     if host:
-        return host if name == ".claude" else f"{host}/{name}"
+        if name == ".claude":
+            return host
+        if not name.startswith(".claude"):
+            up = os.path.basename(os.path.dirname(os.path.normpath(path)))
+            if up.startswith(".claude"):
+                name = up
+        return f"{host}/{name}"
     if name == ".claude":
         parent = os.path.basename(os.path.dirname(os.path.normpath(path)))
         return parent or name
@@ -319,11 +327,13 @@ def ssh_config_hosts(path=None, _seen=None):
 
 # Runs on the remote under /bin/sh. Args: $1 = search depth, $2 = mtime cutoff
 # (epoch seconds; 0 = everything). Locates every `.claude*` directory holding a
-# projects/ subtree under $HOME and streams their transcripts out as a gzipped
-# tar on stdout, with paths relative to $HOME. Exit 3 = nothing Claude-shaped
-# on this machine, 4 = no usable home directory. Needs only sh, find and tar,
-# so it works on Linux and macOS remotes alike; -newermt support is probed at
-# run time and the incremental filter is simply skipped where it is missing.
+# projects/ subtree under $HOME - directly, or one level below (the Docker
+# host-mount layout: container ~/.claude/ -> host ~/.claude-<project>/data/)
+# - and streams their transcripts out as a gzipped tar on stdout, with paths
+# relative to $HOME. Exit 3 = nothing Claude-shaped on this machine, 4 = no
+# usable home directory. Needs only sh, find and tar, so it works on Linux and
+# macOS remotes alike; -newermt support is probed at run time and the
+# incremental filter is simply skipped where it is missing.
 REMOTE_SH = r"""
 set -u
 DEPTH="${1:-3}"
@@ -337,13 +347,23 @@ NEWER=""
 if [ "$SINCE" -gt 0 ] 2>/dev/null; then
   if find . -maxdepth 0 -newermt "@$SINCE" >/dev/null 2>&1; then NEWER=1; fi
 fi
+emit() {
+  if [ -n "$NEWER" ]; then
+    find "$1/projects" -type f -name '*.jsonl' -newermt "@$SINCE" -print0 2>/dev/null
+  else
+    find "$1/projects" -type f -name '*.jsonl' -print0 2>/dev/null
+  fi
+}
 list() {
   roots | while IFS= read -r r; do
-    [ -d "$r/projects" ] || continue
-    if [ -n "$NEWER" ]; then
-      find "$r/projects" -type f -name '*.jsonl' -newermt "@$SINCE" -print0 2>/dev/null
+    if [ -d "$r/projects" ]; then
+      emit "$r"
     else
-      find "$r/projects" -type f -name '*.jsonl' -print0 2>/dev/null
+      # Docker host-mount layout: ~/.claude-<project>/data/projects/*.jsonl.
+      # One glob level only - never a recursive descent.
+      for c in "$r"/*; do
+        [ -d "$c/projects" ] && emit "$c"
+      done
     fi
   done
 }
