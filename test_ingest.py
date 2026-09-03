@@ -877,5 +877,68 @@ class ResolvePath(unittest.TestCase):
         self.assertIsNone(ji.parse_args([]).db)
 
 
+class OtelUpsertFillsOnly(unittest.TestCase):
+    """A live row landing on a transcript row must not erase what only the
+    transcript knows: the cache TTL split, thinking tokens, stop reason."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.con = db.connect(os.path.join(self.dir, "t.db"))
+        self.addCleanup(self.con.close)
+
+    def row(self, **over):
+        base = {"request_id": "req_1", "prompt_id": "p1", "session_id": "s1",
+                "ts": "2026-09-01T10:00:00Z", "model": "claude-opus-5",
+                "input_tokens": 10, "output_tokens": 100,
+                "cache_read_tokens": 1000, "cache_create_tokens": 300,
+                "cache_5m_tokens": 200, "cache_1h_tokens": 100,
+                "cost_usd": None, "duration_ms": None,
+                "query_source": "main", "agent_name": None,
+                "thinking_tokens": 40, "stop_reason": "end_turn"}
+        base.update(over)
+        return base
+
+    def test_split_and_transcript_only_fields_survive_an_otel_row(self):
+        db.upsert_request(self.con, self.row(), "jsonl")
+        db.upsert_request(self.con, self.row(
+            cache_5m_tokens=None, cache_1h_tokens=None, thinking_tokens=None,
+            stop_reason=None, cost_usd=0.5, duration_ms=1234,
+            effort="high", speed="standard"), "otel")
+        got = self.con.execute(
+            "SELECT source, cost_usd, duration_ms, cache_5m_tokens, "
+            "cache_1h_tokens, thinking_tokens, stop_reason, effort "
+            "FROM api_requests WHERE request_id='req_1'").fetchone()
+        self.assertEqual(tuple(got),
+                         ("otel", 0.5, 1234, 200, 100, 40, "end_turn", "high"))
+
+    def test_transcript_row_never_overwrites_an_otel_row(self):
+        db.upsert_request(self.con, self.row(cost_usd=0.5), "otel")
+        db.upsert_request(self.con, self.row(output_tokens=999), "jsonl")
+        got = self.con.execute(
+            "SELECT source, output_tokens FROM api_requests").fetchone()
+        self.assertEqual(tuple(got), ("otel", 100))
+
+    def test_transcript_reparse_corrects_a_partial_first_chunk(self):
+        db.upsert_request(self.con, self.row(output_tokens=1), "jsonl")
+        db.upsert_request(self.con, self.row(output_tokens=787), "jsonl")
+        db.upsert_request(self.con, self.row(output_tokens=5), "jsonl")
+        self.assertEqual(self.con.execute(
+            "SELECT output_tokens FROM api_requests").fetchone()[0], 787)
+
+
+class EventsWithoutTimestampsDedupe(unittest.TestCase):
+    def test_null_ts_event_is_inserted_once(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        con = db.connect(os.path.join(d, "t.db"))
+        self.addCleanup(con.close)
+        for _ in range(3):
+            db.insert_event(con, "s1", None, "compact", detail=None, value=None)
+        con.commit()
+        self.assertEqual(con.execute(
+            "SELECT COUNT(*) FROM session_events").fetchone()[0], 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -215,9 +215,15 @@ CREATE TABLE IF NOT EXISTS session_events (
     value      INTEGER
 );
 -- Re-ingesting a transcript must not multiply its events, and the table has
--- no natural key, so identity is the whole tuple.
+-- no natural key, so identity is the whole tuple. Every column is COALESCEd:
+-- SQLite treats NULLs as distinct in a UNIQUE index, so a bare column here
+-- would let an event with no timestamp - a compaction summary entry carries
+-- none - be re-inserted on every re-parse until the session claimed hundreds
+-- of compactions.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_uniq
-    ON session_events(session_id, ts, kind, COALESCE(detail,''), COALESCE(value,-1));
+    ON session_events(COALESCE(session_id,''), COALESCE(ts,''),
+                      COALESCE(kind,''), COALESCE(detail,''),
+                      COALESCE(value,-1));
 CREATE INDEX IF NOT EXISTS idx_events_session ON session_events(session_id, ts);
 -- Cost a CLI reported for a whole session, with the number of runs it covers.
 -- Only trusted when `runs` matches the prompts actually seen for that session;
@@ -392,6 +398,7 @@ def connect(path=DB_PATH, cross_thread=False):
     if version == 0:
         version = 1  # databases from before version tracking
     if version > SCHEMA_VERSION:
+        con.close()  # a connection left open here blocks rmtree on Windows
         raise RuntimeError(
             f"metrics.db is schema v{version} but this code only knows "
             f"v{SCHEMA_VERSION} — update the project before running.")
@@ -477,11 +484,29 @@ _TOKEN_IDX = (REQUEST_COLS.index("input_tokens"),
               REQUEST_COLS.index("cache_read_tokens"),
               REQUEST_COLS.index("cache_create_tokens"))
 
+# Columns an OTel event does not carry. It has one cache-write total and no
+# TTL split, and it knows nothing of thinking tokens, stop reasons, server
+# tool use, service tier or inference geo - all of which only the transcript
+# records. Overwriting them with NULL when a live row lands on top of a
+# transcript row would, for the cache split, silently bill the whole write at
+# the 1h rate; so these fill rather than replace, and everything else still
+# takes the OTel value (it carries the CLI's own cost).
+OTEL_FILLS_ONLY = frozenset({
+    "cache_5m_tokens", "cache_1h_tokens", "thinking_tokens", "stop_reason",
+    "server_tool_requests", "service_tier", "inference_geo"})
+
+
+def _otel_assignment(col):
+    if col in OTEL_FILLS_ONLY:
+        return f"{col}=COALESCE(excluded.{col},api_requests.{col})"
+    return f"{col}=excluded.{col}"
+
+
 REQUEST_SQL_OTEL = (
     f"INSERT INTO api_requests ({_REQ_NAMES}, source)\n"
     f"VALUES ({_REQ_PLACEHOLDERS}, 'otel')\n"
     "ON CONFLICT(request_id) DO UPDATE SET "
-    + ",".join(f"{c}=excluded.{c}" for c in REQUEST_COLS[1:])
+    + ",".join(_otel_assignment(c) for c in REQUEST_COLS[1:])
     + ", source='otel'")
 
 # Transcript rows may correct each other but never an OTel row, and only

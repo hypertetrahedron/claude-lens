@@ -105,17 +105,24 @@ def ingest(con, path):
     return "run"
 
 
-def rebuild():
-    """Rebuild dashboard.html unless a receiver owns it. Returns what it did."""
+def rebuild(db_path=None):
+    """Rebuild dashboard.html unless a receiver owns it. Returns what it did.
+
+    db_path is passed through when the builder accepts it: with --db the
+    transcript went into that database, so the page must be rendered from
+    the same one rather than from the default metrics.db.
+    """
     import build_dashboard
     if build_dashboard.receiver_running():
         return "skipped (receiver listening on 127.0.0.1:4318)"
     kwargs = {}
     try:
         import inspect
-        if "check_receiver" in inspect.signature(
-                build_dashboard.build).parameters:
+        params = inspect.signature(build_dashboard.build).parameters
+        if "check_receiver" in params:
             kwargs["check_receiver"] = False
+        if db_path and "db_path" in params:
+            kwargs["db_path"] = db_path
     except (TypeError, ValueError):
         pass
     build_dashboard.build(**kwargs)
@@ -163,7 +170,8 @@ def main(argv=None, stream=None):
                 con.commit()
             finally:
                 con.close()
-            built = "not requested" if args.no_build else rebuild()
+            built = ("not requested" if args.no_build
+                     else rebuild(resolve_db(args.db)))
         text = noise.getvalue().strip()
         log.info("session=%s ingested %s via %s; dashboard %s; %.2fs%s",
                  session, os.path.basename(path), used, built,

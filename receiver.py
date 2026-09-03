@@ -123,12 +123,20 @@ def resolve_db(explicit=None):
 # below are filtered to the columns that actually exist, so a receiver never
 # fails on an out-of-date file - it simply stores less.
 # ---------------------------------------------------------------------------
+# Keyed on the connection object, not id(con): a closed connection's id is
+# reused by the next one, and a cache hit on a stale id would report another
+# database's columns. sqlite3.Connection cannot be weak-referenced and carries
+# no attribute dict, so the key holds a strong reference - which is also what
+# stops the id from being recycled. The receiver holds two connections for its
+# lifetime, so there is nothing to reclaim; reset_column_cache() is there for
+# the tests and for after a migration.
 _col_cache = {}
+_table_cache = {}
 
 
 def columns(con, table):
     """Column names of `table`, cached per connection."""
-    key = (id(con), table)
+    key = (con, table)
     cols = _col_cache.get(key)
     if cols is None:
         cols = {r[1] for r in con.execute("PRAGMA table_info(%s)" % table)}
@@ -136,9 +144,20 @@ def columns(con, table):
     return cols
 
 
+def tables(con):
+    """Table names in this database, cached per connection."""
+    names = _table_cache.get(con)
+    if names is None:
+        names = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        _table_cache[con] = names
+    return names
+
+
 def reset_column_cache():
     """Forget cached PRAGMA results (after a migration, or between tests)."""
     _col_cache.clear()
+    _table_cache.clear()
 
 
 def fill_nulls(con, table, key_col, key, values):
@@ -263,6 +282,17 @@ def request_key(attrs):
     return attrs.get("request_id") or attrs.get("client_request_id")
 
 
+# OTel says "normal", transcripts say "standard", and both mean "not fast".
+# Stored in the transcript's vocabulary so a filter or a GROUP BY sees one
+# value rather than two names for the same thing.
+SPEED_ALIASES = {"normal": "standard"}
+
+
+def request_speed(attrs):
+    speed = attrs.get("speed")
+    return SPEED_ALIASES.get(speed, speed)
+
+
 def request_cost(attrs):
     """cost_usd, falling back to the integer micros field."""
     cost = attrs.get("cost_usd")
@@ -296,14 +326,18 @@ def request_row(attrs, rid, prompt_id, session_id, ts):
         "cache_read_tokens": cread,
         "cache_create_tokens": ccreate,
         # OTel does not break cache writes down by TTL; the transcript does.
-        "cache_5m_tokens": 0,
-        "cache_1h_tokens": 0,
+        # Left NULL rather than zeroed: the OTel upsert replaces every column,
+        # so writing 0 here erased a transcript's real 5m/1h split and billed
+        # the whole cache write at the 1h multiplier. db.REQUEST_SQL_OTEL
+        # COALESCEs these two, so NULL means "keep whatever is known".
+        "cache_5m_tokens": None,
+        "cache_1h_tokens": None,
         "cost_usd": request_cost(attrs),
         "duration_ms": attrs.get("duration_ms"),
         "query_source": attrs.get("query_source"),
         "agent_name": attrs.get("agent.name"),
         "effort": attrs.get("effort"),
-        "speed": attrs.get("speed"),
+        "speed": request_speed(attrs),
         "context_tokens": inp + cread + ccreate,
         "cost_basis": cost_basis(),
         "error": None,
@@ -335,7 +369,7 @@ def error_row(attrs, rid, prompt_id, session_id, ts):
         "query_source": attrs.get("query_source"),
         "agent_name": attrs.get("agent.name"),
         "effort": attrs.get("effort"),
-        "speed": attrs.get("speed"),
+        "speed": request_speed(attrs),
         "context_tokens": 0,
         "cost_basis": None,
         "error": text or "error",
@@ -462,8 +496,13 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-# Tables whose growth means the dashboard has something new to say.
-FINGERPRINT_TABLES = ("api_requests", "prompts", "tool_calls", "edits")
+# Tables whose growth means the dashboard has something new to say. agents and
+# session_events are here because a reconcile can add nothing but those - a
+# session that compacted, switched model or ran a subagent - and the page has
+# something to show for each. A table the schema does not have yet contributes
+# nothing instead of raising.
+FINGERPRINT_TABLES = ("api_requests", "prompts", "tool_calls", "edits",
+                      "agents", "session_events")
 
 
 def data_fingerprint(con):
@@ -474,27 +513,44 @@ def data_fingerprint(con):
     OTel cost correcting an estimate) moves neither number and waits for the
     next insert to be published, which on a live machine is seconds away.
     """
+    present = tables(con)
     return tuple(
         tuple(con.execute(
             "SELECT COUNT(*), COALESCE(MAX(rowid),0) FROM %s" % t).fetchone())
+        if t in present else None
         for t in FINGERPRINT_TABLES)
 
 
-def reconcile():
+def ingest_kwargs(db_path):
+    """`db_path=` for jsonl_ingest.run() if it takes one."""
+    try:
+        params = inspect.signature(jsonl_ingest.run).parameters
+    except (TypeError, ValueError):
+        return {}
+    return {"db_path": db_path} if "db_path" in params else {}
+
+
+def reconcile(db_path=None):
     """One reconciliation pass over every configured source.
+
+    db_path is threaded all the way through. Resolving it once in main() and
+    then letting the reconciler fall back to its own default would put live
+    rows in one database and transcript rows in another, and silently create
+    and migrate the default file as a side effect of --db.
 
     Remote machines (sources.json) are fetched *before* the DB lock is taken:
     an SSH transfer can run for minutes, and holding the lock that long would
     stall the live telemetry the receiver exists to accept. The fetch touches
     only the remote_state bookkeeping, on its own short-lived connection.
     """
+    db_path = db_path or resolve_db()
     cfg = sources.SourceConfig.load()
     if cfg.hosts():
         # Wrapped on its own: a remote that misbehaves, or a hiccup writing
         # its bookkeeping, must never cost us the local reconcile below -
         # that is the part that matters on this machine.
         try:
-            con = db.connect()
+            con = db.connect(db_path)
             try:
                 log.info("remote fetch: %s", jsonl_ingest.fetch_remotes(
                     con, cfg, respect_backoff=True))
@@ -510,16 +566,24 @@ def reconcile():
     # transcript, the lock can go entirely: run() writes on its own connection,
     # so SQLite's own writer serialisation is enough.
     with _db_lock:
-        return jsonl_ingest.run(config=cfg, skip_remote_fetch=True)
+        return jsonl_ingest.run(config=cfg, skip_remote_fetch=True,
+                                **ingest_kwargs(db_path))
 
 
-def build_kwargs():
-    """`check_receiver=False` if the builder takes it - we are the receiver."""
+def build_kwargs(db_path=None):
+    """What build() will accept: no self-probe (we are the receiver), our db."""
     try:
         params = inspect.signature(build_dashboard.build).parameters
     except (TypeError, ValueError):
         return {}
-    return {"check_receiver": False} if "check_receiver" in params else {}
+    out = {}
+    if "check_receiver" in params:
+        out["check_receiver"] = False
+    if db_path and "db_path" in params:
+        # build() gets our connection, but conversation pages and index.html
+        # open their own; without this they would use the default database.
+        out["db_path"] = db_path
+    return out
 
 
 def maintenance_loop(db_path=None):
@@ -531,7 +595,7 @@ def maintenance_loop(db_path=None):
     beside the writer, and the read is of committed rows either way.
     """
     db_path = db_path or resolve_db()
-    kwargs = build_kwargs()
+    kwargs = build_kwargs(db_path)
     last_reconcile = 0.0
     last_fingerprint = None
     build_con = None
@@ -540,7 +604,7 @@ def maintenance_loop(db_path=None):
             stale = code_is_stale()
             now = time.time()
             if now - last_reconcile >= RECONCILE_EVERY:
-                stats = reconcile()
+                stats = reconcile(db_path)
                 last_reconcile = now
                 log.info("reconcile: %s", stats)
             if not stale:
