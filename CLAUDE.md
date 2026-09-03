@@ -21,9 +21,11 @@ python test_sources.py          # the whole suite
 python test_pricing.py          # rates, cache multipliers, fast mode, retirement
 python test_receiver.py         # OTel attributes, dirty fingerprint, SessionEnd hook
 python test_ingest.py           # transcript parsing, schema v8, --db
+python test_build.py            # payload contract, cache misses, blocks, pages
 python jsonl_ingest.py          # ingest every configured source
 python jsonl_ingest.py --db PATH          # ... into a database elsewhere
 python build_dashboard.py       # rebuild dashboard.html + index.html
+python build_dashboard.py --conversations 0   # ... without the per-prompt pages
 python digest.py                # weekly report into reports/
 python jsonl_ingest.py --remote-status    # why a remote host is quiet
 ```
@@ -79,6 +81,25 @@ Neither is a substitute for restarting it. On this machine that is the
   unpriced models all surface in the dashboard's notice bar rather than
   silently changing the numbers.
 
+## The payload is a contract
+
+`build_dashboard.collect()` produces rows; `compact()` and its siblings encode
+them; `rehydrate()` in `template.html` decodes them. **The encoding is private
+between those two and the rest of the script must never see it.** The context
+series is delta-encoded, run-length encoded and sparse all at once because it
+is one point per API request and was two thirds of the payload; none of that
+is visible past `rehydrateCtx()`, which is what makes it changeable.
+
+Adding a field means: a key on the row in `collect()`, a name in `COLUMNS`, a
+line in `compact()`, a line in `rehydrate()`. Removing one means checking
+`template.html` first -- `collect()` also feeds `digest.py`, so a field is
+never only the dashboard's.
+
+`EXTRAS` holds everything `collect()` works out that is not a per-prompt row
+(the context series, cache-miss figures, blocks, error rates, overhead). It is
+a module global rather than a return value so that `collect()`'s two-value
+signature, which `digest.py` and the tests depend on, did not have to change.
+
 ## Testing the browser code
 
 The repo is Python-only, so `template.html` has no JS test runner. The pattern
@@ -107,7 +128,12 @@ gets built, delete the entry rather than leaving it contradicting the table.
 
 ## Privacy
 
-Prompt text is embedded verbatim in `dashboard.html` (first 400 chars);
+Prompt text is embedded verbatim in `dashboard.html` (first 400 chars) and
+`conversations/*.html` holds whole exchanges, so **`--no-prompt-text` writes
+no conversation pages at all** -- withholding the rows' 400 characters while
+leaving the full transcript next to them would be worse than useless.
+Everything those pages render is `html.escape`d and they carry no JavaScript,
+so a prompt containing `<script>` is nine characters of text.
 `--no-prompt-text` blanks it for sharing. `metrics.db`, the generated HTML,
 `remote-cache/`, `sources.json` and `pricing.local.json` are all gitignored —
 the last two hold machine names and account-specific rates. This is a public

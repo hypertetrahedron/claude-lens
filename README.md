@@ -334,6 +334,78 @@ their transcripts are attributed to the `<task-notification>` prompt, not to
 the prompt you typed, and without the fold their spend appears as rows nobody
 recognises.
 
+### What else a row carries
+
+Beyond tokens, cost and file changes, each prompt row records what the turn
+actually did:
+
+| Field | What it means |
+|---|---|
+| `effort` | The reasoning effort most of the turn's requests ran at. |
+| `thinking` | Thinking tokens, which are output tokens and are billed as such. |
+| `fast_calls` | Requests served in fast mode, billed at twice the list rate. |
+| `errors` | Tool calls that came back as errors. |
+| `max_tokens_stops` | Responses that hit the output ceiling and had to be continued -- each one is a request paid for twice. |
+| `web_searches` | Server-side tool requests (web search, web fetch). |
+| `peak_ctx` | The largest context any one request of the turn carried. |
+| `misses` / `cache_miss_cost` | Cache misses and what re-writing the cache cost. See below. |
+| `tool_attrib` | The turn's input-side cost shared out across its tools. |
+| `session` / `conv` | The session it belongs to, and its conversation page. |
+
+`tool_attrib` is **an attribution, not a measurement**. A tool result enters
+the context once and is then re-read on every later request of the turn, so
+the turn's whole input-side bill (cache read + cache write + uncached input)
+is divided among its tools in proportion to result bytes. The totals are
+exact; the split is a model of where they came from. A tool whose result size
+was never recorded falls back to its share of the call count.
+
+### Cache misses, and what they cost
+
+Claude Code caches the conversation so far and re-reads it at a tenth of the
+input rate. When that cache is cold the whole context is *written* again, at
+1.25x or 2x the input rate -- the single most expensive thing that can happen
+to a long session, and until now it happened invisibly.
+
+A request is counted as a miss when more than half its input was cache writes
+*and* the request before it was reading from a cache -- there was a warm cache
+and this request did not use it. The cause is the first that fits:
+
+| Cause | What happened |
+|---|---|
+| `model_switch` | The model changed under the session. Each model caches separately. |
+| `effort_switch` / `speed_switch` | Reasoning effort or fast mode changed. |
+| `compact` | The conversation was compacted between the two requests. |
+| `idle_gap` | The session sat idle past the cache's TTL -- 60 minutes for the main conversation on the Anthropic API, 5 minutes elsewhere. |
+| `unknown` | None of the above fits. Left as itself rather than guessed at. |
+
+`miss_cost` is that request's cache-write tokens at its own rate, so "an hour
+away from the keyboard cost $0.57" is a sentence the data can now support.
+
+### Sessions, context and billing blocks
+
+Three more tables ride along with the rows:
+
+- **`sessions`** -- one row per session: span, prompts, calls, cost, tokens,
+  cache hit fraction, models used, model switches, dominant effort,
+  compactions, peak context, misses and their cost, the cache TTL its
+  subagents ran at, and the first prompt's text.
+- **`ctx`** -- the context series: one point per main-conversation request
+  carrying the measured `context_tokens`, cache reads and writes, the model,
+  whether it missed the cache and why, and any compaction or switch that
+  landed since the previous request. Subagent requests are left out; they run
+  against their own context, so mixing them in would draw a sawtooth that
+  never happened. Capped at 200,000 points -- past that, whole sessions are
+  dropped oldest-first and the notice bar says how many.
+- **`blocks`** -- ccusage-style 5-hour billing blocks over the last 30 days,
+  and for the open one a burn rate (tokens and dollars per minute over the
+  last half hour) with a projected cost at the block's end.
+
+Alongside them the payload carries the tool-use system prompt `overhead`
+(re-sent on every request; an upper bound, since it is usually cached),
+per-tool error rates, whether costs are `list` or `contracted`, and
+Anthropic's published `baseline` of about $13 per active developer per day
+(p90 $30), so "expensive" can be told from "ordinary" without guessing.
+
 ## Pricing and cost estimates
 
 Rows that came from a transcript carry no cost — Claude Code only reports one
@@ -525,8 +597,10 @@ your machine or your history gets long:
 
 | Flag | Effect |
 |---|---|
-| `--no-prompt-text` | Blanks prompt text. Every number survives; nothing you typed is embedded. The page says it was redacted. |
+| `--no-prompt-text` | Blanks prompt text. Every number survives; nothing you typed is embedded. The page says it was redacted, and no conversation pages are written. |
 | `--max-rows N` | Embeds only the newest N prompts (default 8000; `0` for no limit). |
+| `--conversations N` | Writes a conversation page for the newest N prompts (default 300; `0` for none). |
+| `--db PATH` | Reads a database somewhere other than beside the script. |
 
 The payload is re-parsed by the browser on every load and every 5-minute
 auto-refresh, and each prompt costs roughly a kilobyte — so an unbounded
@@ -539,6 +613,42 @@ worth remembering before sending `dashboard.html` to anyone.
 Both flags — and `--conversations N` and `--db PATH` — are accepted by
 `generate-dashboard.sh` / `.ps1` too, so a redacted build is one command:
 `./generate-dashboard.sh --no-prompt-text --no-open`.
+
+## Conversation pages
+
+The dashboard says a prompt cost $4.80 and made 61 API calls. The obvious next
+question -- *what did it actually do* -- used to mean opening a 40 MB JSONL
+file and reading it with your eyes.
+
+Every build writes `conversations/<prompt id>.html` for the newest 300 prompts
+(`--conversations N`, `0` to turn it off). Each is a self-contained page in the
+dashboard's own theme, rendering that turn as it happened:
+
+- what you typed, and what came back (assistant text and thinking, cut at 4000
+  characters per block);
+- every tool call, with its name, a 200-character summary of its input, the
+  size of its result, and whether it failed;
+- each subagent's own transcript, inlined under a boundary naming the
+  subagent type and the model it actually ran on;
+- the cost of each API request, from `metrics.db` rather than recomputed, and
+  the turn's total in the header.
+
+Clicking a row in the dashboard opens its page; `conversations/index.html`
+lists them all and is linked from the landing page.
+
+Three things are worth knowing:
+
+- **They are prompt text.** `--no-prompt-text` writes none, for the same
+  reason it blanks the rows.
+- **They are escaped, not sanitised.** Everything from a transcript goes
+  through `html.escape`, and the pages carry no JavaScript at all -- a prompt
+  containing `<script>` renders as those nine characters.
+- **They need the transcript.** A prompt whose JSONL has been deleted or
+  compacted away is skipped, and the dashboard's notice bar says how many.
+
+A page is only rewritten when its transcript has moved, so the receiver's
+once-a-minute rebuild costs one `stat()` per session rather than three hundred
+file writes.
 
 ## Keeping the receiver current
 
@@ -625,13 +735,28 @@ it to be noisy.
 ## Optional: weekly digest
 
 `python digest.py` writes a self-contained report for the last 7 full days
-(UTC) to `reports/digest-<YYYY>-W<week>.html` — totals, per-project,
-per-product (when more than one is present), per-model-family, top-10 most
-expensive prompts, daily breakdown. Existing
-digests are **never overwritten** (same-week re-runs get a `-HHMMSS` suffix);
-`reports/index.html` links them all, and the top-level `index.html` is
-refreshed too so a new digest appears next to the live dashboard. Schedule it
-weekly (Task Scheduler / cron) if wanted.
+(UTC) to `reports/digest-<YYYY>-W<week>.html`. `--db PATH` reads a database
+elsewhere.
+
+Every headline figure carries **the week before it** — cost, prompts, output
+tokens and cache hit rate — because a number on its own ("$91") says nothing
+a person can act on and the same number with "+38% on last week" says
+everything. A week with no predecessor says "new" rather than inventing a
+percentage.
+
+The report has: totals with those deltas, per-project, per-product (when more
+than one is present), **per-session** (top 10, with each session's cache hit
+rate), per-model-family, a **caching** section giving reads, writes, uncached
+input and what the week's cache misses cost, the 10 most expensive prompts —
+each linked to its conversation page where a build wrote one — and a daily
+breakdown. A line under the tiles says whether the costs are list-price
+estimates or the CLI's own contracted figures, and counts the week's failed
+tool calls, API errors, and responses that hit the output ceiling.
+
+Existing digests are **never overwritten** (same-week re-runs get a `-HHMMSS`
+suffix); `reports/index.html` links them all, and the top-level `index.html`
+is refreshed too so a new digest appears next to the live dashboard. Schedule
+it weekly (Task Scheduler / cron) if wanted.
 
 ## Architecture
 
@@ -666,7 +791,8 @@ carry the CLI's authoritative `cost_usd`).
 | `report_index.py` | Writes index.html linking every report |
 | `receiver.py` | Optional live OTLP listener + scheduler (`--db`, `--port`) |
 | `hooks/session_end_hook.py` | Optional SessionEnd hook: ingest one transcript, refresh the page (`.sh` / `.ps1` wrappers alongside) |
-| `digest.py` | Weekly digest with collision-proof filenames |
+| `conversations.py` | Per-prompt conversation pages rendered from the transcripts |
+| `digest.py` | Weekly digest with collision-proof filenames (`--db`) |
 | `template.html` | Dashboard UI (no external deps) |
 | `db.py` / `pricing.py` | Storage / pricing, model-id canonicalisation |
 | `pricing.example.json` | Template for `pricing.local.json` rate + alias overrides |
@@ -674,6 +800,7 @@ carry the CLI's authoritative `cost_usd`).
 | `test_sources.py` | Test suite (discovery, ingest, pricing, payload, template wiring) |
 | `test_pricing.py` | Test suite (rates, cache multipliers, fast mode, retirement, overrides) |
 | `test_receiver.py` | Test suite (OTel attribute mapping, dirty fingerprint, SessionEnd hook) |
+| `test_build.py` | Test suite (payload contract, cache misses, blocks, conversation pages, digest) |
 
 ## Chart metrics
 
@@ -759,8 +886,10 @@ counterfactual.
   collapse; subtotals follow the configured columns (rates aggregate at the
   group level).
 - **Export CSV** — the current filtered/sorted view, incl. cost components.
-- **Notices** — if a build embedded only the newest N prompts, or withheld
-  prompt text, the page says so rather than quietly showing less.
+- **Notices** — if a build embedded only the newest N prompts, withheld
+  prompt text, dropped old sessions from the context series to stay under its
+  200,000-point cap, or could not write a conversation page because the
+  transcript is gone, the page says so rather than quietly showing less.
 - **Auto-refresh** — the page reloads every 5 minutes; filters, chart choice,
   and grouping persist (localStorage). Light/dark theme with toggle.
 

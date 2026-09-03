@@ -4,6 +4,7 @@ metrics.db-shm
 metrics.db-wal
 dashboard.html
 index.html
+conversations/
 receiver.log*
 hooks/hook.log*
 reports/

@@ -340,7 +340,8 @@ const DATA = /*__DATA__*/null;
 function rehydrate(d) {
   if (!d.cols) return d.rows || [];
   const S = d.strings, C = d.cols, n = d.n_rows, out = new Array(n);
-  const T = C.title || 0;
+  const T = C.title || 0, CV = C.conv || 0;
+  const str = (i) => (i == null ? null : S[i]);
   for (let i = 0; i < n; i++) {
     const models = C.models[i].map(m => ({
       model: S[m[0]], in: m[1], out: m[2], cr: m[3], cw: m[4],
@@ -350,24 +351,103 @@ function rehydrate(d) {
       tOut += m.out; tCr += m.cr; calls += m.calls;
       tIn += m.in + m.cr + m.cw;
     }
+    /* Each agent goes out as [id, subagent_type, resolved model]. `agents`
+       stays an array of strings, as it always was, but the string is now the
+       type that was launched rather than the opaque id - `agent_info` carries
+       all three for anything that wants to say more. */
+    const ag = C.agents[i];
     const r = {
       ts: C.ts[i], project: S[C.project[i]], kind: S[C.kind[i]],
       text: C.text[i], models: models,
       tools: C.tools[i].map(t => [S[t[0]], t[1]]),
-      agents: C.agents[i].map(a => S[a]),
+      agents: ag.map(a => (a[1] == null ? S[a[0]] : S[a[1]])),
+      agent_info: ag.map(a => ({ id: S[a[0]], name: str(a[1]),
+                                 model: str(a[2]) })),
       api_calls: calls, cost: C.cost[i], est: !!C.est[i],
       wall_s: C.wall_s[i], out: tOut, inp: tIn, cr: tCr,
       agent_out: C.agent_out[i], files: C.files[i],
       ladd: C.ladd[i], lrem: C.lrem[i], chars: C.chars[i],
       file_list: C.file_list[i].map(f => [S[f[0]], f[1], f[2]]),
       comp: C.comp[i], alt: C.alt[i],
+      session: str(C.session[i]), conv: CV ? CV[i] : null,
+      effort: str(C.effort[i]), thinking: C.thinking[i],
+      fast_calls: C.fast_calls[i], errors: C.errors[i],
+      max_tokens_stops: C.max_tokens_stops[i],
+      web_searches: C.web_searches[i], peak_ctx: C.peak_ctx[i],
+      misses: C.misses[i], cache_miss_cost: C.cache_miss_cost[i],
+      tool_attrib: C.tool_attrib[i].map(t => [S[t[0]], t[1], t[2], t[3]]),
     };
     if (T && T[i]) r.title = T[i];
     out[i] = r;
   }
   return out;
 }
+
+/* The payload's other tables - sessions, the per-request context series, the
+   5h billing blocks - are column-oriented in exactly the same way, as
+   {n, cols} against the same string table. The columns that hold a string
+   index are named here rather than guessed at, because an id that happens to
+   be a number would otherwise be indexed into the string table by accident. */
+const TABLE_STRINGS = {
+  sessions: ["id", "title", "project", "kind", "effort", "subagent_ttl"],
+  blocks: [],
+};
+const TABLE_STRING_LISTS = { sessions: ["models"], blocks: ["models"] };
+
+function rehydrateTable(d, key) {
+  const t = d[key];
+  if (!t || !t.cols) return Array.isArray(t) ? t : [];
+  const S = d.strings, C = t.cols, names = Object.keys(C);
+  const isStr = new Set(TABLE_STRINGS[key] || []);
+  const isList = new Set(TABLE_STRING_LISTS[key] || []);
+  const out = new Array(t.n);
+  for (let i = 0; i < t.n; i++) {
+    const o = {};
+    for (const k of names) {
+      const v = C[k][i];
+      o[k] = isStr.has(k) ? (v == null ? null : S[v])
+           : isList.has(k) ? (v || []).map(x => S[x])
+           : v;
+    }
+    out[i] = o;
+  }
+  return out;
+}
+/* The context series carries one point per API request, which makes it the
+   largest thing in the payload by a wide margin, so it is encoded harder than
+   the rest: times are deltas from `t0`, session and model are run-length
+   pairs [first index, string], and miss/cause/event are sparse because they
+   are empty on almost every point. This undoes all three, and everything
+   downstream sees a plain array of {session, t, ctx, cr, cw, model, miss,
+   cause, event} objects. */
+function rehydrateCtx(d) {
+  const t = d.ctx;
+  if (!t || !t.cols) return Array.isArray(t) ? t : [];
+  const S = d.strings, C = t.cols, n = t.n, out = new Array(n);
+  let acc = t.t0 || 0;
+  for (let i = 0; i < n; i++) {
+    acc += C.t[i];
+    out[i] = { session: null, t: acc, ctx: C.ctx[i], cr: C.cr[i], cw: C.cw[i],
+               model: null, miss: 0, cause: null, event: null };
+  }
+  for (const key of ["session", "model"]) {
+    const runs = (t.runs && t.runs[key]) || [];
+    for (let k = 0; k < runs.length; k++) {
+      const to = k + 1 < runs.length ? runs[k + 1][0] : n;
+      const v = runs[k][1] == null ? null : S[runs[k][1]];
+      for (let i = runs[k][0]; i < to; i++) out[i][key] = v;
+    }
+  }
+  const sp = t.sparse || {};
+  for (const i of sp.miss || []) out[i].miss = 1;
+  for (const p of sp.cause || []) out[p[0]].cause = S[p[1]];
+  for (const p of sp.event || []) out[p[0]].event = S[p[1]];
+  return out;
+}
 DATA.rows = rehydrate(DATA);
+DATA.sessions = rehydrateTable(DATA, "sessions");
+DATA.ctx = rehydrateCtx(DATA);
+DATA.blocks = rehydrateTable(DATA, "blocks");
 
 /* ---------- utilities ---------- */
 const $ = (id) => document.getElementById(id);
