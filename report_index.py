@@ -1,9 +1,16 @@
 """index.html: one landing page linking every report this project produces.
 
 Written next to dashboard.html on every dashboard build and every digest run,
-so whichever ran last, the index is current. It lists the live dashboard plus
-each archived report under reports/, newest first, with the time it was
-generated - a single bookmark that never goes stale as digests accumulate.
+so whichever ran last, the index is current. It lists the live dashboard, the
+conversation pages when a build wrote them, Claude Code's own /insights report
+when that exists, and each archived report under reports/, newest first, with
+the time it was generated - a single bookmark that never goes stale as digests
+accumulate.
+
+Nothing here opens metrics.db, so there is no --db flag: the index is built
+from what is on disk next to it. Directories are read with os.scandir and the
+mtimes come off that same read, so listing a hundred archived digests costs
+one directory walk rather than one stat() per file.
 
 Also owns the shared stylesheet for the static reports (digest.py imports it).
 """
@@ -11,6 +18,7 @@ import html
 import os
 import re
 from datetime import datetime
+from urllib.request import pathname2url
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 REPORTS = os.path.join(BASE, "reports")
@@ -52,6 +60,65 @@ def _mtime(path):
         return 0.0
 
 
+def _file_url(path):
+    """A file: URL for a target outside this directory.
+
+    The /insights report lives under the Claude config directory, which may be
+    on another drive; a relative href would be wrong there and unreadable
+    everywhere. pathname2url handles the Windows drive-letter form.
+    """
+    return "file:" + pathname2url(os.path.abspath(path))
+
+
+def _config_dir():
+    """Claude Code's own config directory: $CLAUDE_CONFIG_DIR or ~/.claude.
+
+    Deliberately a copy of the two lines in sources.py rather than an import -
+    this module is pulled in by digest.py and build_dashboard.py, and it has no
+    other reason to load the discovery machinery.
+    """
+    return os.path.expanduser(
+        os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join("~", ".claude"))
+
+
+def _insights_report():
+    """Claude Code's built-in /insights report, if the CLI has written one.
+
+    It answers a different question than this dashboard does - the CLI's own
+    view of the account - and it is easy to forget it exists, so link it rather
+    than reproduce it.
+    """
+    path = os.path.join(_config_dir(), "usage-data", "report.html")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return {"href": _file_url(path), "title": "Claude Code insights",
+            "kind": "CLI /insights report", "mtime": st.st_mtime,
+            "primary": False}
+
+
+def _conversations(base):
+    """The per-prompt conversation pages a build may have written.
+
+    (mtime, href) or None. A directory listing renders fine over file://, but
+    an index page is linked in preference to one when the build wrote it.
+    """
+    folder = os.path.join(base, "conversations")
+    try:
+        st = os.stat(folder)
+        if not os.path.isdir(folder):
+            return None
+    except OSError:
+        return None
+    href = ("conversations/index.html"
+            if os.path.exists(os.path.join(folder, "index.html"))
+            else "conversations/")
+    return {"href": href, "title": "Conversations",
+            "kind": "Per-prompt transcripts", "mtime": st.st_mtime,
+            "primary": False}
+
+
 def _stamp(mtime):
     if not mtime:
         return "-"
@@ -69,25 +136,37 @@ def _describe(name):
 
 
 def entries():
-    """Every report to link, dashboard first then reports/ newest-first."""
+    """Every report to link: the live pages first, then reports/ newest-first."""
     out = []
     dash = os.path.join(BASE, "dashboard.html")
     if os.path.exists(dash):
         out.append({"href": "dashboard.html", "title": "Usage dashboard",
                     "kind": "Live dashboard", "mtime": _mtime(dash),
                     "primary": True})
-    try:
-        names = os.listdir(REPORTS)
-    except OSError:
-        names = []
+    for extra in (_conversations(BASE), _insights_report()):
+        if extra:
+            out.append(extra)
+
     archived = []
-    for name in names:
-        if not name.endswith(".html") or name == "index.html":
-            continue
-        title, kind = _describe(name)
-        archived.append({"href": f"reports/{name}", "title": title,
-                         "kind": kind, "mtime": _mtime(os.path.join(REPORTS, name)),
-                         "primary": False})
+    try:
+        with os.scandir(REPORTS) as it:
+            for entry in it:
+                name = entry.name
+                if not name.endswith(".html") or name == "index.html":
+                    continue
+                # st_mtime comes off the directory read; on Windows and on
+                # Linux since 3.x scandir already carries it, so a folder of
+                # archived digests costs one walk and no per-file stat().
+                try:
+                    mtime = entry.stat().st_mtime
+                except OSError:
+                    mtime = 0.0
+                title, kind = _describe(name)
+                archived.append({"href": f"reports/{name}", "title": title,
+                                 "kind": kind, "mtime": mtime,
+                                 "primary": False})
+    except OSError:
+        pass
     archived.sort(key=lambda e: (-e["mtime"], e["title"]))
     return out + archived
 

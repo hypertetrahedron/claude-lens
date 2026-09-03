@@ -18,8 +18,14 @@ A local usage dashboard for Claude Code: transcripts and OTel telemetry in,
 
 ```
 python test_sources.py          # the whole suite
+python test_pricing.py          # rates, cache multipliers, fast mode, retirement
+python test_receiver.py         # OTel attributes, dirty fingerprint, SessionEnd hook
+python test_ingest.py           # transcript parsing, schema v8, --db
+python test_build.py            # payload contract, cache misses, blocks, pages
 python jsonl_ingest.py          # ingest every configured source
+python jsonl_ingest.py --db PATH          # ... into a database elsewhere
 python build_dashboard.py       # rebuild dashboard.html + index.html
+python build_dashboard.py --conversations 0   # ... without the per-prompt pages
 python digest.py                # weekly report into reports/
 python jsonl_ingest.py --remote-status    # why a remote host is quiet
 ```
@@ -39,11 +45,20 @@ Neither is a substitute for restarting it. On this machine that is the
 ## Storage rules
 
 - `api_requests` is keyed by Anthropic `request_id`, `tool_calls`/`edits` by
-  `tool_use_id`. OTel rows win on conflict (they carry the CLI's own cost);
-  transcript rows are `INSERT OR IGNORE`.
-- **A re-parse cannot change an existing row.** Because transcript inserts are
-  ignore-on-conflict, correcting stored values means an in-place `UPDATE` in a
-  migration. Clearing `ingest_state` only helps for rows that do not exist yet.
+  `tool_use_id`. OTel rows win on conflict (they carry the CLI's own cost).
+- **A re-parse can raise a transcript row, never lower it** (schema v8). One
+  API request is written to the transcript once per content block and the last
+  one carries the complete usage, so `REQUEST_SQL_JSONL` updates on conflict
+  only when `api_requests.source='jsonl'` and `excluded.output_tokens >=
+  api_requests.output_tokens`. That is what makes clearing `ingest_state` a
+  real repair: a row captured mid-stream is corrected by re-reading the file.
+  A transcript still never touches an OTel row, and a row whose transcript has
+  been deleted can only be corrected by an in-place `UPDATE` in a migration.
+- `tool_calls`, `agents` and `sessions` merge rather than replace: each write
+  fills what is NULL and leaves what is known alone, because the transcript
+  and OTel each know a different half (sizes vs durations, requested vs
+  resolved model). `session_events` has no natural key, so a unique index over
+  the whole tuple is what keeps a re-ingest from multiplying it.
 - Schema changes are a ritual: add `_migrate_to_N()`, register it in
   `MIGRATIONS`, bump `SCHEMA_VERSION`, update the `CREATE TABLE` text so fresh
   databases are born current, and add a changelog line **both** in `db.py` and
@@ -65,6 +80,25 @@ Neither is a substitute for restarting it. On this machine that is the
 - **Say when data is partial.** Truncated row sets, redacted prompt text and
   unpriced models all surface in the dashboard's notice bar rather than
   silently changing the numbers.
+
+## The payload is a contract
+
+`build_dashboard.collect()` produces rows; `compact()` and its siblings encode
+them; `rehydrate()` in `template.html` decodes them. **The encoding is private
+between those two and the rest of the script must never see it.** The context
+series is delta-encoded, run-length encoded and sparse all at once because it
+is one point per API request and was two thirds of the payload; none of that
+is visible past `rehydrateCtx()`, which is what makes it changeable.
+
+Adding a field means: a key on the row in `collect()`, a name in `COLUMNS`, a
+line in `compact()`, a line in `rehydrate()`. Removing one means checking
+`template.html` first -- `collect()` also feeds `digest.py`, so a field is
+never only the dashboard's.
+
+`EXTRAS` holds everything `collect()` works out that is not a per-prompt row
+(the context series, cache-miss figures, blocks, error rates, overhead). It is
+a module global rather than a return value so that `collect()`'s two-value
+signature, which `digest.py` and the tests depend on, did not have to change.
 
 ## Testing the browser code
 
@@ -94,7 +128,12 @@ gets built, delete the entry rather than leaving it contradicting the table.
 
 ## Privacy
 
-Prompt text is embedded verbatim in `dashboard.html` (first 400 chars);
+Prompt text is embedded verbatim in `dashboard.html` (first 400 chars) and
+`conversations/*.html` holds whole exchanges, so **`--no-prompt-text` writes
+no conversation pages at all** -- withholding the rows' 400 characters while
+leaving the full transcript next to them would be worse than useless.
+Everything those pages render is `html.escape`d and they carry no JavaScript,
+so a prompt containing `<script>` is nine characters of text.
 `--no-prompt-text` blanks it for sharing. `metrics.db`, the generated HTML,
 `remote-cache/`, `sources.json` and `pricing.local.json` are all gitignored —
 the last two hold machine names and account-specific rates. This is a public

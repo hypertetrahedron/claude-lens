@@ -30,8 +30,18 @@ new/changed transcripts are parsed. Flags: `-Force` / `--force` re-parses
 everything; `-NoOpen` / `--no-open` skips the browser; `-Index` / `--index`
 opens the report index instead of the dashboard.
 
-`index.html` is the one page to bookmark: it links the live dashboard and
-every archived report, newest first, and is rewritten on every build.
+The wrapper also passes the build's own options straight through, so the
+one-shot script covers the same ground as running the two Python steps by
+hand: `-Db` / `--db PATH` (use a database somewhere other than next to the
+script — both the ingest and the build are told), `-MaxRows` / `--max-rows N`,
+`-NoPromptText` / `--no-prompt-text`, and `-Conversations` / `--conversations
+N`. See [Sharing and size](#sharing-and-size).
+
+`index.html` is the one page to bookmark: it links the live dashboard, the
+per-prompt conversation pages when a build wrote them, Claude Code's own
+`/insights` report when the CLI has written one (under `~/.claude/usage-data`,
+or `$CLAUDE_CONFIG_DIR`), and every archived report, newest first. It is
+rewritten on every build and every digest run.
 
 To pull in other machines or other directories, see
 [Aggregating multiple sources](#aggregating-multiple-sources).
@@ -144,13 +154,34 @@ sources, since it reconciles on its own schedule:
   "ssh_timeout": 300,
   "remote_budget": 600,
   "cowork": true,
-  "cowork_paths": []
+  "cowork_paths": [],
+  "db": "C:/claude-lens/metrics.db"
 }
 ```
 
 CLI flags add to this file rather than replacing it. The three timing keys
 bound how long a bad host may make anything wait — see
 [A broken remote must never cost you anything](#a-broken-remote-must-never-cost-you-anything).
+
+### Where the database lives
+
+`metrics.db` sits next to the scripts by default. Every entry point
+(`jsonl_ingest.py`, `build_dashboard.py`, `digest.py`, `receiver.py`,
+`check_live.py`, `report_index.py`) takes `--db PATH` to put it somewhere
+else, and resolves the location the same way:
+
+| Order | Source |
+|---|---|
+| 1 | `--db PATH` on the command line |
+| 2 | the `CLAUDE_LENS_DB` environment variable |
+| 3 | the `"db"` key in `sources.json` |
+| 4 | `metrics.db` beside the scripts |
+
+The reason to move it: SQLite's write-ahead log is not reliable on a network
+share, and a checkout that lives on one will eventually meet a transient
+`disk I/O error`. Point `"db"` at local disk and leave the reports on the
+share. The setting is read by every entry point, so setting it once in
+`sources.json` moves the database for the background receiver too.
 
 ### How remote collection works
 
@@ -252,6 +283,245 @@ versions dropped. On the machine this was developed against, one older remote
 went from 209 recorded API requests to 1,201, and from 25K output tokens to
 917K.
 
+## What a prompt row actually says
+
+### The text
+
+A prompt is not always one block of text. Working through the IDE extension,
+what reaches the transcript is *several* text blocks: one or more envelopes
+describing the editor's state, then the sentence the person typed.
+
+```
+<ide_opened_file>The user opened the file /very/long/path/to/module.py in
+the IDE. This may or may not be related to the current task.</ide_opened_file>
+rename the widget factory
+```
+
+Claude Lens drops the envelopes -- `<ide_opened_file>`, `<ide_selection>`,
+`<ide_diagnostics>`, any other `<ide_...>` wrapper, and `<system-reminder>` --
+and stores what is left. Before it did, every IDE-driven prompt was stored
+envelope-first, so the dashboard showed rows of identical "The user opened the
+file..." text and searching for a phrase someone had typed found nothing.
+
+If a turn is *nothing but* an envelope, the envelope's contents are stored
+rather than an empty string: a row that says something is more use than a
+blank one. A turn is treated as harness-injected only when every one of its
+text blocks is an envelope or a known harness opener.
+
+### The kind
+
+Not every prompt was typed. `prompts.kind` says which is which:
+
+| kind | What it is |
+|---|---|
+| `human` | someone typed it (`origin.kind == "human"`); `injected = 0` |
+| `task-notification` | a background agent reporting back |
+| `coordinator` | a coordinating agent driving the session |
+| `loop` | a turn dispatched by `/loop` |
+| `scheduled` | a turn dispatched by a schedule or cron routine |
+| `team` | a message from another Claude session |
+| `command` | a slash command dispatched by the harness (the receiver reads it from OTel's `command_name` / `command_source`) |
+| `other` | marked as non-human by a marker this version does not know |
+
+An origin marker this version has never seen is stored as `other` rather than
+dropped, so a kind a later CLI invents still shows up as "not typed by a
+person" instead of quietly counting as one.
+
+Everything but `human` is stored with `injected = 1` and a `canonical_id`
+pointing at the most recent human prompt at or before it, so its cost is
+folded into the turn that caused it. This matters most for background agents:
+their transcripts are attributed to the `<task-notification>` prompt, not to
+the prompt you typed, and without the fold their spend appears as rows nobody
+recognises.
+
+### What else a row carries
+
+Beyond tokens, cost and file changes, each prompt row records what the turn
+actually did:
+
+| Field | What it means |
+|---|---|
+| `effort` | The reasoning effort most of the turn's requests ran at. |
+| `thinking` | Thinking tokens, which are output tokens and are billed as such. |
+| `fast_calls` | Requests served in fast mode, billed at twice the list rate. |
+| `errors` | Tool calls that came back as errors. |
+| `max_tokens_stops` | Responses that hit the output ceiling and had to be continued -- each one is a request paid for twice. |
+| `web_searches` | Server-side tool requests (web search, web fetch). |
+| `peak_ctx` | The largest context any one request of the turn carried. |
+| `misses` / `cache_miss_cost` | Cache misses and what re-writing the cache cost. See below. |
+| `tool_attrib` | The turn's input-side cost shared out across its tools. |
+| `session` / `conv` | The session it belongs to, and its conversation page. |
+
+`tool_attrib` is **an attribution, not a measurement**. A tool result enters
+the context once and is then re-read on every later request of the turn, so
+the turn's whole input-side bill (cache read + cache write + uncached input)
+is divided among its tools in proportion to result bytes. The totals are
+exact; the split is a model of where they came from. A tool whose result size
+was never recorded falls back to its share of the call count.
+
+### Cache misses, and what they cost
+
+Claude Code caches the conversation so far and re-reads it at a tenth of the
+input rate. When that cache is cold the whole context is *written* again, at
+1.25x or 2x the input rate -- the single most expensive thing that can happen
+to a long session, and until now it happened invisibly.
+
+A request is counted as a miss when more than half its input was cache writes
+*and* the request before it was reading from a cache -- there was a warm cache
+and this request did not use it. The cause is the first that fits:
+
+| Cause | What happened |
+|---|---|
+| `model_switch` | The model changed under the session. Each model caches separately. |
+| `effort_switch` / `speed_switch` | Reasoning effort or fast mode changed. |
+| `compact` | The conversation was compacted between the two requests. |
+| `idle_gap` | The session sat idle past the cache's TTL -- 60 minutes for the main conversation on the Anthropic API, 5 minutes elsewhere. |
+| `unknown` | None of the above fits. Left as itself rather than guessed at. |
+
+`miss_cost` is that request's cache-write tokens at its own rate, so "an hour
+away from the keyboard cost $0.57" is a sentence the data can now support.
+
+### Sessions, context and billing blocks
+
+Three more tables ride along with the rows:
+
+- **`sessions`** -- one row per session: span, prompts, calls, cost, tokens,
+  cache hit fraction, models used, model switches, dominant effort,
+  compactions, peak context, misses and their cost, the cache TTL its
+  subagents ran at, and the first prompt's text.
+- **`ctx`** -- the context series: one point per main-conversation request
+  carrying the measured `context_tokens`, cache reads and writes, the model,
+  whether it missed the cache and why, and any compaction or switch that
+  landed since the previous request. Subagent requests are left out; they run
+  against their own context, so mixing them in would draw a sawtooth that
+  never happened. Capped at 200,000 points -- past that, whole sessions are
+  dropped oldest-first and the notice bar says how many.
+- **`blocks`** -- ccusage-style 5-hour billing blocks over the last 30 days,
+  and for the open one a burn rate (tokens and dollars per minute over the
+  last half hour) with a projected cost at the block's end.
+
+Alongside them the payload carries the tool-use system prompt `overhead`
+(re-sent on every request; an upper bound, since it is usually cached),
+per-tool error rates, whether costs are `list` or `contracted`, and
+Anthropic's published `baseline` of about $13 per active developer per day
+(p90 $30), so "expensive" can be told from "ordinary" without guessing.
+
+## Sessions view
+
+A **Prompts / Sessions** switch sits at the left of the filter bar
+(persisted, like the chart choice) and swaps the table below the chart for
+one row per session, sharing every filter the prompts table uses: date
+range, product, project, model and search. Columns: session (title, or the
+first prompt's text, or the id), project, start, duration, prompts, API
+calls, cost (`~` when estimated), cache hit %, misses, miss cost, one pill
+per model used, model switches, compactions, peak context, and a
+subagent-cache-TTL badge. Click a row (or focus it and press Enter/Space) to
+open its detail panel:
+
+- the **context-growth chart** for that session (see below);
+- its cache misses, each with the time, cause, context size, tokens
+  re-written and a cost (the session's exact `miss_cost` shared out across
+  its misses in proportion to what each one re-wrote);
+- its model-switch / effort-switch / speed-switch / compaction events;
+- a **Show prompts** button that sets the session as a filter, switches back
+  to the Prompts view and shows a removable chip ("Session: ...") in the
+  filter bar so the narrowed view is never a mystery. Clearing the chip
+  clears the filter without changing the view.
+
+The session filter persists across the 5-minute auto-refresh like every
+other filter, and is checked against the freshly loaded session table the
+moment that table exists — a session id that no longer names anything (a
+genuinely stale payload, not the ordinary case of the same page reloading
+itself) is dropped rather than left filtering every prompt away with no
+visible reason why.
+
+### Context-growth chart
+
+Per session, an SVG area chart of measured context over time: cache-read,
+uncached-input and cache-write stacked bottom-up so their sum traces the
+context curve itself (no separate line needed beyond the stack's own
+outline). Cache misses are marked as dots coloured by cause, from the same
+categorical palette and cause table as the backend classification above; a
+legend is built from whatever actually appears in that session, so it never
+names a colour that is not on screen. Compaction and model/effort/speed
+switches are dashed vertical marks with a tooltip. A session with no context
+series (dropped by the payload's 200,000-point cap) says so instead of
+drawing an empty chart. Two matching day charts live in the chart selector:
+**"Context: peak / day"** (the largest single request's context per day) and
+**"Cache misses: cost / day"** (the day's total miss cost).
+
+### Cache-health tile
+
+A **Cache health** tile beside the cost tile shows the cache hit rate for
+the current filter, and, once there is at least one miss, the miss count,
+total miss cost and the most common cause — "no cached input in this slice"
+or "no cache misses" when there is nothing to report, rather than a blank
+tile.
+
+### 5-hour blocks and the burn-rate tile
+
+The **5h blocks** chart view draws one bar per ccusage-style billing block
+(cost on the y axis, the open block outlined), honouring the date range. A
+**Current 5h block** tile shows the open block's burn rate — tokens/min,
+$/min, projected cost at close, minutes left — from the payload's `burn`
+figure; it is hidden entirely between blocks (nothing to project) and on a
+Bedrock/Vertex install, where the 5-hour concept does not apply. The rate is
+averaged over the last 30 minutes, or however long the block has actually
+been open if that is less — a block two minutes old is not diluted by
+dividing over 30 minutes of mostly-nothing, and a request from the block
+before it is never counted into a young block's rate.
+
+### Heatmap
+
+The **Heatmap** chart view is a GitHub-style calendar of daily cost, weeks
+as columns and weekdays as rows, coloured on the same ironbow ramp as the
+stacked charts — but scaled by quartile of the days that had any spend, not
+by a fraction of the maximum, so one unusually expensive day cannot flatten
+every ordinary day onto the same rung. A day with no activity is the grid
+colour, not the bottom of the ramp: quiet is not the same as cheap. Hovering
+or focusing a day shows its cost, prompt count and output tokens; below the
+calendar, a current-streak / longest-streak readout. Under a date range the
+calendar covers exactly that range; under "All" it covers the last 26 weeks.
+
+## Pricing and cost estimates
+
+Rows that came from a transcript carry no cost — Claude Code only reports one
+over OTel — so their cost is estimated from the table in `pricing.py` and
+shown with a `~` prefix. Live rows use the CLI's own figure and are never
+re-estimated. A model with no entry is **named on the page and counted as
+$0.00 deliberately**; an unknown cost is not a zero cost.
+
+Four things can move a request off the base rate, and `pricing.resolve()`
+applies them in this order:
+
+| | What it does | Applies to |
+|---|---|---|
+| Promotion (`INTRO_PRICES`) | A rate that expires on a date, applied only when the request's timestamp is before it | First-party only — a promotion on the Anthropic API says nothing about a marketplace's rate card. Empty today: Claude Sonnet 5's $2/$10 lived here until the September 2026 rise was cancelled and the rate became permanent |
+| Fast mode (`FAST_PRICES`) | 2x list for requests the transcript recorded as `usage.speed = "fast"` | Claude Opus 5 and Opus 4.8, Anthropic provider only — fast mode is not offered on Bedrock, Vertex or Foundry |
+| Data residency (`GEO_PREMIUM_MULT`) | 1.1x input and output when a request pinned inference to a geography (`usage.inference_geo = "us"`) | Models that support pinning — Opus 4.6 / Sonnet 4.6 and later, first-party only |
+| Cache read (`CACHE_READ_MULT_BY_MODEL`) | A per-model multiple of the input rate, default 0.1 | Claude Fable 5.1 and Claude Mythos 5.1 read cache at **0.025x** — $0.25/MTok against a $10 input rate. On a cache-heavy agent, using 0.1x there overstates the bill fourfold |
+
+The cache multipliers apply to whichever input rate came out of the first
+three, so a fast-mode cache read costs a tenth of the *fast* input rate, not
+of list.
+
+Retired models keep their rates — old transcripts still need costing — and
+gain a retirement date in `pricing.RETIRED`, so a model whose line simply
+stops can be annotated rather than leaving a reader to wonder.
+`pricing.status(model)` answers `"active"` / `"retired"` / `"unknown"`, where
+`"unknown"` is the same set of ids that are reported as unpriced.
+
+`pricing.tool_prompt_tokens(model)` holds Anthropic's published per-model size
+of the tool-use system prompt (286 tokens on Opus 5, 675 on Opus 4.7, 400 for
+a model with no published figure). Claude Code sends tool definitions on every
+request whether or not a tool is called, so this is a floor on every turn's
+input and the basis of the dashboard's harness-overhead estimate.
+
+Everything above is overridable in `pricing.local.json` without editing the
+table — per-provider rates, `cache_read_mult`, `fast_prices`,
+`unsplit_cache_multiplier` and deployment-ARN `model_aliases`.
+`pricing.example.json` documents the shape and is the file to copy.
+
 ## Bedrock and Vertex
 
 Claude Code can reach the same models through the Anthropic API, through
@@ -343,7 +613,59 @@ within a minute of new data.
      ```
      then `systemctl --user enable --now claude-metrics`.
 
-   Only one receiver can run (port 4318 is the lock).
+   Only one receiver can run (port 4318 is the lock). `--port N` moves it and
+   `--db PATH` chooses the database; `python receiver.py --help` lists both.
+
+### What live rows carry that transcripts do not
+
+Every attribute below is read straight from Claude Code's documented
+[OpenTelemetry events](https://code.claude.com/docs/en/monitoring-usage):
+
+| Event | Stored as |
+|---|---|
+| `claude_code.api_request` | `effort`, `speed` (`fast`/`normal`), `cost_usd` (or `cost_usd_micros`), `duration_ms`, and `context_tokens` = `input_tokens` + `cache_read_tokens` + `cache_creation_tokens` |
+| `claude_code.api_error` | an `api_requests` row with `error` set (`"<status_code>: <error>"`) and every token count zero, so failures are visible without inflating usage |
+| `claude_code.tool_result` | `input_bytes` (`tool_input_size_bytes`), `result_bytes` (`tool_result_size_bytes`), `duration_ms`, `is_error` (from `success`) and `error_type` |
+| `claude_code.user_prompt` | `prompts.kind` from `command_name` / `command_source`, so `/loop`, `/schedule` and other command dispatches are separable from typed prompts |
+
+Two details worth knowing:
+
+- **Rows are keyed on `request_id`, falling back to `client_request_id`.** The
+  Anthropic request id exists only when the API answered; a timeout or a
+  connection failure has none. Without the client-side id those rows would all
+  be written with a NULL primary key — which SQLite accepts as often as it is
+  asked — and a flaky network would fill the table with rows nothing can join
+  or deduplicate.
+- **An error never overwrites a success.** A retried attempt can carry the id
+  of an attempt that later succeeded, so an existing row only gains the error
+  text; its token counts are left alone.
+
+### List price or your price
+
+If your organization has contracted rates, an administrator sets
+[`modelPricing`](https://code.claude.com/docs/en/settings-reference#modelpricing)
+in managed settings and Claude Code reports *those* rates in `cost_usd`. Since
+the numbers on the page then mean something different, every live row is
+stamped with the basis in force when it arrived — `cost_basis` is `contracted`
+when `modelPricing` is found, `list` otherwise. The files checked, in order:
+
+```
+$CLAUDE_CONFIG_DIR/settings.json  (or ~/.claude/settings.json)
+/Library/Application Support/ClaudeCode/managed-settings.json   macOS
+/etc/claude-code/managed-settings.json                          Linux and WSL
+C:\Program Files\ClaudeCode\managed-settings.json               Windows
+   ...plus managed-settings.d/*.json next to each
+```
+
+`modelPricing` is a managed-scope key — Claude Code ignores it in user,
+project and local settings. The user file is read anyway so that someone
+trying the setting locally sees why the label did not change, but only a
+managed source actually alters the costs Claude Code reports. The result is
+cached for five minutes.
+
+`python check_live.py` reports the fill rate of each of these columns over the
+newest rows, which is the quick way to confirm live capture is working (and to
+tell "my CLI is too old for this attribute" from "the receiver is not running").
 
 ## Sharing and size
 
@@ -352,8 +674,10 @@ your machine or your history gets long:
 
 | Flag | Effect |
 |---|---|
-| `--no-prompt-text` | Blanks prompt text. Every number survives; nothing you typed is embedded. The page says it was redacted. |
+| `--no-prompt-text` | Blanks prompt text. Every number survives; nothing you typed is embedded. The page says it was redacted, and no conversation pages are written. |
 | `--max-rows N` | Embeds only the newest N prompts (default 8000; `0` for no limit). |
+| `--conversations N` | Writes a conversation page for the newest N prompts (default 300; `0` for none). |
+| `--db PATH` | Reads a database somewhere other than beside the script. |
 
 The payload is re-parsed by the browser on every load and every 5-minute
 auto-refresh, and each prompt costs roughly a kilobyte — so an unbounded
@@ -362,6 +686,54 @@ dashboard says so, so a shrinking "All" view is never a mystery.
 
 Prompt text is otherwise embedded verbatim (first 400 characters), which is
 worth remembering before sending `dashboard.html` to anyone.
+
+Both flags — and `--conversations N` and `--db PATH` — are accepted by
+`generate-dashboard.sh` / `.ps1` too, so a redacted build is one command:
+`./generate-dashboard.sh --no-prompt-text --no-open`.
+
+## Conversation pages
+
+The dashboard says a prompt cost $4.80 and made 61 API calls. The obvious next
+question -- *what did it actually do* -- used to mean opening a 40 MB JSONL
+file and reading it with your eyes.
+
+Every build writes `conversations/<prompt id>.html` for the newest 300 prompts
+(`--conversations N`, `0` to turn it off). Each is a self-contained page in the
+dashboard's own theme, rendering that turn as it happened:
+
+- what you typed, and what came back (assistant text and thinking, cut at 4000
+  characters per block);
+- every tool call, with its name, a 200-character summary of its input, the
+  size of its result, and whether it failed;
+- each subagent's own transcript, inlined under a boundary naming the
+  subagent type and the model it actually ran on;
+- the cost of each API request, from `metrics.db` rather than recomputed, and
+  the turn's total in the header.
+
+Clicking a row in the dashboard opens its page; `conversations/index.html`
+lists them all and is linked from the landing page.
+
+Three things are worth knowing:
+
+- **They are prompt text.** `--no-prompt-text` writes none, for the same
+  reason it blanks the rows.
+- **They are escaped, not sanitised.** Everything from a transcript goes
+  through `html.escape`, and the pages carry no JavaScript at all -- a prompt
+  containing `<script>` renders as those nine characters.
+- **They need the transcript.** A prompt whose JSONL has been deleted or
+  compacted away is skipped, and the dashboard's notice bar says how many.
+- **The filename is never the raw prompt id.** An id matching
+  `^[A-Za-z0-9._-]{1,120}$` is used as-is; anything else — including one
+  crafted to escape the directory — is replaced by a short hash of it, so a
+  page can never be written outside `conversations/`.
+
+A page is only rewritten when its transcript has moved, so the receiver's
+once-a-minute rebuild costs one `stat()` per session rather than three hundred
+file writes. After writing the current window, any page that fell out of it —
+because the window slid forward, or its prompt no longer resolves — is
+deleted, so the directory tracks `--conversations N` rather than growing
+without bound; `index.html` and anything not matching the pattern above are
+never touched.
 
 ## Keeping the receiver current
 
@@ -387,16 +759,89 @@ you are standing.
 Task Scheduler did not restart on a non-zero exit, and a re-exec left nothing
 running at all — worse than a stale page.)
 
+## Optional: SessionEnd hook (fresh data without a daemon)
+
+A background receiver is the most complete option, but it is a service to
+install and keep alive. If you would rather have nothing running, let Claude
+Code tell this project when a session finishes: `hooks/session_end_hook.py`
+reads the [hook payload](https://code.claude.com/docs/en/hooks) from stdin,
+ingests the one transcript it names, and rebuilds `dashboard.html`.
+
+Add to `~/.claude/settings.json`:
+
+```json
+"hooks": {
+  "SessionEnd": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 /path/to/claude-lens/hooks/session_end_hook.py",
+          "timeout": 60
+        }
+      ]
+    }
+  ]
+}
+```
+
+On Windows use `hooks\session_end_hook.ps1`; on Linux/macOS
+`hooks/session_end_hook.sh` is there if you would rather not name an
+interpreter. Both wrappers find a Python and the script relative to
+themselves, so the repository can live anywhere.
+
+**Set the `timeout`.** SessionEnd hooks share a 1.5-second budget unless a
+per-hook `timeout` raises it (up to 60 seconds), and a dashboard rebuild does
+not fit in 1.5 seconds. If you would rather keep the hook instant, add
+`--no-build` to the command and let the next `generate-dashboard` run render
+the page; the ingest alone is milliseconds.
+
+What the hook guarantees:
+
+| Guarantee | Why |
+|---|---|
+| Always exits 0 | A usage dashboard is never worth failing the end of someone's work. Anything that goes wrong is logged and swallowed. |
+| Writes nothing to stdout | Claude Code interprets hook stdout, so everything the ingester or builder prints is captured into the log instead. |
+| Skips the rebuild when a receiver is listening | The receiver owns `dashboard.html`; two writers would fight. |
+| Logs to `hooks/hook.log` | Rotated at 1 MB, one backup kept. One line per session: what was ingested, whether the page was rebuilt, and how long it took. |
+
+`--db PATH` picks a database, and `--transcript PATH` ingests a named file
+instead of the one on stdin (useful when testing the hook by hand).
+
+Why a hook rather than watching the files: Anthropic documents the transcript
+JSONL layout as internal and subject to change, and points at hooks as the
+supported way to react to a session's lifecycle. Parsing the transcripts is
+still this project's own business — but the *timing* no longer depends on
+polling something undocumented. `PreCompact` and `Stop` receive the same
+`transcript_path` and would work with the identical script if you want the
+page refreshed mid-session; `Stop` fires after every assistant turn, so expect
+it to be noisy.
+
 ## Optional: weekly digest
 
 `python digest.py` writes a self-contained report for the last 7 full days
-(UTC) to `reports/digest-<YYYY>-W<week>.html` — totals, per-project,
-per-product (when more than one is present), per-model-family, top-10 most
-expensive prompts, daily breakdown. Existing
-digests are **never overwritten** (same-week re-runs get a `-HHMMSS` suffix);
-`reports/index.html` links them all, and the top-level `index.html` is
-refreshed too so a new digest appears next to the live dashboard. Schedule it
-weekly (Task Scheduler / cron) if wanted.
+(UTC) to `reports/digest-<YYYY>-W<week>.html`. `--db PATH` reads a database
+elsewhere.
+
+Every headline figure carries **the week before it** — cost, prompts, output
+tokens and cache hit rate — because a number on its own ("$91") says nothing
+a person can act on and the same number with "+38% on last week" says
+everything. A week with no predecessor says "new" rather than inventing a
+percentage.
+
+The report has: totals with those deltas, per-project, per-product (when more
+than one is present), **per-session** (top 10, with each session's cache hit
+rate), per-model-family, a **caching** section giving reads, writes, uncached
+input and what the week's cache misses cost, the 10 most expensive prompts —
+each linked to its conversation page where a build wrote one — and a daily
+breakdown. A line under the tiles says whether the costs are list-price
+estimates or the CLI's own contracted figures, and counts the week's failed
+tool calls, API errors, and responses that hit the output ceiling.
+
+Existing digests are **never overwritten** (same-week re-runs get a `-HHMMSS`
+suffix); `reports/index.html` links them all, and the top-level `index.html`
+is refreshed too so a new digest appears next to the live dashboard. Schedule
+it weekly (Task Scheduler / cron) if wanted.
 
 ## Architecture
 
@@ -429,25 +874,39 @@ carry the CLI's authoritative `cost_usd`).
 | `jsonl_ingest.py` | Transcript ingest/reconcile (`--force` = full re-parse) |
 | `build_dashboard.py` | Aggregates metrics.db → dashboard.html |
 | `report_index.py` | Writes index.html linking every report |
-| `receiver.py` | Optional live OTLP listener + scheduler |
-| `digest.py` | Weekly digest with collision-proof filenames |
+| `receiver.py` | Optional live OTLP listener + scheduler (`--db`, `--port`) |
+| `hooks/session_end_hook.py` | Optional SessionEnd hook: ingest one transcript, refresh the page (`.sh` / `.ps1` wrappers alongside) |
+| `conversations.py` | Per-prompt conversation pages rendered from the transcripts |
+| `digest.py` | Weekly digest with collision-proof filenames (`--db`) |
 | `template.html` | Dashboard UI (no external deps) |
 | `db.py` / `pricing.py` | Storage / pricing, model-id canonicalisation |
 | `pricing.example.json` | Template for `pricing.local.json` rate + alias overrides |
-| `check_live.py` | Diagnostic: dump recent live rows |
+| `check_live.py` | Diagnostic: recent live rows + fill rates for the live-only columns (`--db`) |
 | `test_sources.py` | Test suite (discovery, ingest, pricing, payload, template wiring) |
+| `test_pricing.py` | Test suite (rates, cache multipliers, fast mode, retirement, overrides) |
+| `test_receiver.py` | Test suite (OTel attribute mapping, dirty fingerprint, SessionEnd hook) |
+| `test_build.py` | Test suite (payload contract, cache misses, blocks, conversation pages, digest) |
 
 ## Chart metrics
 
-The chart card offers eleven views (dropdown, persisted): output tokens/day,
+The chart card offers seventeen views (dropdown, persisted): output tokens/day,
 tokens & lines per **active minute** (day total ÷ summed wall-clock span of
 each prompt; days under a minute of activity are skipped), cost/day, **cost
 composition** (stacked $: cache read / cache write / output / uncached input —
 cache reads typically dominate despite the 0.1x discount because input volume
-dwarfs output), cache hit rate, cost per 1K lines written (≥50 lines/day),
-model mix (stacked by family), subagent share, and — when Claude Desktop is
-installed — the daily peak of the account's 5-hour and 7-day **plan limits**.
-The plan views are account-wide, so only the date range applies to them.
+dwarfs output), cache hit rate, **context: peak/day** (the largest single
+request's measured context per day), **cache misses: cost/day** (what the
+day's cold-cache re-writes cost), **tool errors/day**, **5h blocks** (bar per
+billing block, the open one outlined), **heatmap** (a daily-cost calendar),
+**tool cost (top 12)** (attributed cost per tool name, dearest first), cost
+per 1K lines written (≥50 lines/day), model mix (stacked by family), subagent
+share, and — when Claude Desktop is installed — the daily peak of the
+account's 5-hour and 7-day **plan limits**. The plan views are account-wide,
+so only the date range applies to them; the 5h-blocks, heatmap and tool-cost
+views draw their own x axis (a block index, a calendar, a tool name) instead
+of the shared day-bucket bar chart the others share, so they own their own
+scale and legend. Tool cost comes from the same `tool_attrib` attribution the
+per-prompt detail panel's Tools table shows, summed across the filtered rows.
 
 **Stacked charts are coloured by cost, on an ironbow ramp** — darkest is
 cheapest, brightest is dearest. Model families run haiku → sonnet → opus →
@@ -481,14 +940,40 @@ counterfactual.
 - **Current 5h window tile** — ccusage-style rate-limit block (starts at the
   floored hour of the first request after the previous block ends): output
   tokens, cost, reset time. Global, not filter-scoped.
+- **Errors tile** — tool-call errors and their share of tool calls, for the
+  filtered rows; the hint adds the account-wide count of API-level errors
+  (OTel `claude_code.api_error`), which has no per-prompt home so it rides
+  along rather than pretending to be scoped to the filters.
+- **Per-day vs baseline tile** — cost per day the filtered range was actually
+  touched (a day with no activity does not count against it), next to
+  Anthropic's published "typical" and "p90" per-active-day figures.
+- **Fixed overhead tile** — the tool-use system prompt Claude Code re-sends on
+  every request, estimated per model and summed to tokens and cost. Global,
+  not filter-scoped, and hidden outright when there is nothing to show.
+- **Cost-basis badge** — next to the Cost tile, "list prices" / "contracted
+  rates" / "mixed" when the OTel rows say which (see
+  [List price or your price](#list-price-or-your-price)).
+- **Claude Code's own insights link** — a small link in the header to
+  `~/.claude/usage-data/report.html`, the CLI's own account-wide report, when
+  it exists on this machine. It answers a different question than this
+  dashboard does and is easy to forget exists.
 - **Per-prompt detail** (click a row) — cost-composition donut + table,
-  per-model breakdown, files changed with lines +/−, tool-call histogram,
-  subagents.
+  per-model breakdown, files changed with lines +/−, a **Tools** table
+  (`tool_attrib`: calls, result size, attributed cost, dearest first),
+  **Subagents** by name and model ("Explore on claude-sonnet-5" rather than
+  the opaque agent id), an **Effort & signals** line (effort, thinking share
+  of output, fast calls, errors, max-token stops, web searches, peak
+  context), and an **Open conversation** link to the prompt's page when one
+  was written.
 - **Configurable columns** — the ⚙ button opens a panel to add, remove, and
   reorder table columns (persisted). Beyond the defaults, opt-in columns
   include per-prompt derived metrics: tokens/min and lines/min (over the
   prompt's own duration), cache hit %, cost per 1K lines, subagent share,
-  cost without caching, API calls, cache-read tokens, chars written.
+  cost without caching, API calls, cache-read tokens, chars written, effort,
+  thinking tokens, fast calls, max-token stops, web searches, peak context,
+  cache misses and their cost, and the session id (click it to filter the
+  table to that session). Errors is the one opt-in column shown by default;
+  a row with any errors gets a red-tinted count. All of these export to CSV.
 - **Date range** — Today, 7d, **MTD** (calendar month to date, in your own
   timezone), 30d, 90d, All. MTD is a calendar period rather than a rolling
   window, so early in the month it covers less than 7d.
@@ -521,18 +1006,94 @@ counterfactual.
   collapse; subtotals follow the configured columns (rates aggregate at the
   group level).
 - **Export CSV** — the current filtered/sorted view, incl. cost components.
-- **Notices** — if a build embedded only the newest N prompts, or withheld
-  prompt text, the page says so rather than quietly showing less.
-- **Auto-refresh** — the page reloads every 5 minutes; filters, chart choice,
-  and grouping persist (localStorage). Light/dark theme with toggle.
+- **Notices** — if a build embedded only the newest N prompts, withheld
+  prompt text, dropped old sessions from the context series to stay under its
+  200,000-point cap, or could not write a conversation page because the
+  transcript is gone, the page says so rather than quietly showing less.
+  Anything else the build itself wants to say about the payload (via
+  `DATA.notices`) is appended to the same notice bar.
+- **More filters** — a collapsible row under the filter bar with min/max
+  ranges for cost, duration, output tokens and tool calls, plus **misses >
+  0** / **errors > 0** checkboxes. The toggle button shows how many are
+  active (e.g. "More filters (2)"). They narrow the prompts table and chart;
+  on the sessions table only cost, calls and misses apply, since duration,
+  output tokens and errors have no per-session field to filter on. Persisted
+  like every other filter.
+- **Auto-refresh** — the page reloads every 5 minutes. Every filter (date
+  range, product, project, model, search text, the range filters above),
+  both tables' sort column and direction, the Prompts/Sessions view, column
+  layout, chart choice, grouping and the session filter all persist
+  (localStorage) and are restored before the first render, so the reload is
+  invisible. Scroll position survives it too (sessionStorage, saved every
+  few seconds and on unload). A session filter is validated against the
+  freshly loaded session table on restore, so a session that no longer
+  exists is dropped instead of hiding every row with no explanation. Light/
+  dark theme with toggle.
+- **Keyboard access** — every clickable row (prompt, session, group header,
+  day bar) and every chart mark with its own tooltip (block bars, heatmap
+  days, context events and misses) is a focusable, tabbable element that
+  answers Enter and Space the way a click does; a prompt or session row's
+  `aria-expanded` and a group header's follow the open/collapsed state. Both
+  tables' column headers are keyboard-sortable and carry `aria-sort`
+  (ascending/descending/none), updated on every sort. Focus is shown with a
+  visible outline (`:focus-visible`, so it does not appear on a mouse click)
+  using the same colour token as everywhere else on the page.
+- **Large tables** — both tables use a fixed column layout (a `<colgroup>`
+  gives every column but the prompt text / session name a set width, which
+  is what makes a stable layout possible without measuring content) and
+  `content-visibility` on data rows, which skips layout and paint for rows
+  the viewport has not reached — the same table with 8,000 rows costs far
+  less to render than it looks. The prompts table shows up to 5,000 rows
+  ungrouped or 1,000 per group; the sessions table up to 2,000. Past that, a
+  one-line notice under the table says how many are hidden rather than
+  truncating silently — narrow the filters or use Export CSV to get
+  everything.
 
 ## File-change tracking
 
 Files / Lines ± / chars per prompt come from the `structuredPatch` diffs that
-Edit/Write tool results leave in transcripts (subagent edits included).
-Changes made via Bash (git operations, scripts, generators) leave no diff in
-transcripts and aren't counted. These columns update on ingest/reconcile, not
-via OTel (its tool events carry no diffs).
+Edit/Write tool results leave in transcripts. Changes made via Bash (git
+operations, scripts, generators) leave no diff in transcripts and aren't
+counted. These columns update on ingest/reconcile, not via OTel (its tool
+events carry no diffs).
+
+**Subagent edits and the undo history.** A subagent's transcript records its
+Edit and Write *calls* but not their results — there is no `toolUseResult` on
+those turns, so there is no `structuredPatch` to measure. What Claude Code
+does keep is its own undo history:
+
+```
+~/.claude/file-history/<session-id>/<hash>@v<N>
+```
+
+a complete copy of a file at each checkpoint, where `<hash>` is the first 16
+hex digits of the SHA-256 of the file's absolute path. Where two consecutive
+versions of a file survive, Claude Lens diffs them and records the change with
+`edits.source = 'file-history'`. It only does so for sessions that actually
+have unmeasured subagent edits, and only for files that session has no `edits`
+row for at all, so nothing is counted twice.
+
+Recovery is best-effort by nature: only the newest version or two of a file is
+kept, so the earliest change to a file usually has no earlier version to diff
+against, and a run of edits between two checkpoints is recovered as one net
+change attributed to the prompt open at the later checkpoint. See ROADMAP.md.
+
+## How big a tool call was
+
+`tool_calls.input_bytes` is the length of the call's input serialised as
+compact JSON; `result_bytes` is the length of what came back — the characters
+in the `tool_result` block, or `toolUseResult.stdout` + `stderr` where that is
+larger, since a Bash result's visible block is only a summary of its output.
+Both are **exact, decoded sizes**, not the size of the line in the transcript:
+a transcript line carries the result twice over for Bash calls and inflates
+everything else with JSON escaping, so line length runs a median of 2.7x and a
+mean of 9.3x the real figure. Measuring the result properly costs about 0.4s
+on a 450 MB tree, which is the price of the column being usable.
+
+`is_error` is set from the `tool_result` block's own flag or from an `error` /
+`isError` on `toolUseResult`. OTel fills `duration_ms` and `error_type` for
+the same call; neither source overwrites the other, each only fills what is
+still NULL.
 
 ## Database versioning
 
@@ -556,6 +1117,7 @@ add a changelog line in `db.py` and below.
 | 5 | No column change — clears `ingest_state` to force one re-parse of every transcript, backfilling usage that older formats had dropped (see [Older transcript formats](#older-transcript-formats)) |
 | 6 | `sessions.title` (the name Claude Desktop gives a session), `run_cost` (a CLI-reported cost per session, spent only where it provably covers every run), and an index on `api_requests.session_id` |
 | 7 | `api_requests.provider` and `.model_raw` — model ids are stored canonically with the original kept alongside, so Bedrock and Vertex ids resolve against the pricing table. Existing rows are normalised in place |
+| 8 | Per-request detail: `api_requests` gains `effort`, `speed`, `thinking_tokens`, `stop_reason`, `server_tool_requests`, `service_tier`, `inference_geo`, `context_tokens`, `cost_basis` and `error`; `tool_calls` gains `input_bytes`, `result_bytes`, `is_error`, `duration_ms` and `error_type`; `sessions` gains `git_branch`, `cli_version`, `entrypoint`, `permission_mode`, `transcript_path`, `first_ts` and `last_ts`; `prompts` gains `kind`. New tables `agents` (one row per subagent launch, with the requested and resolved model) and `session_events` (context readings, compactions, model/effort/speed switches). Transcript rows stop being insert-or-ignore: a re-parse may raise an existing transcript row but never lower it, and never touches an OTel row. Clears `ingest_state` to force that re-parse, and strips the `agent-` filename prefix from `agent_name` so subagent rows join `agents` |
 
 ## Known limitations
 
@@ -585,4 +1147,10 @@ add a changelog line in `db.py` and below.
   is named on the page and counted as $0.00 rather than guessed at.
 - Bedrock rates here default to Anthropic list prices and are unverified
   against a live account; Provisioned Throughput and batch billing cannot be
-  estimated per token at all.
+  estimated per token at all. Claude Sonnet 5 is the one entry where the
+  partner card is stated separately (`pricing.PARTNER_PRICES`), because its
+  $2/$10 is a first-party rate.
+- The data-residency premium is a single 1.1x, applied to input and output
+  alike, for every model that supports pinning. No per-model figure is
+  published; the number is stated in `pricing.py` rather than buried in a
+  formula so it is one line to correct.

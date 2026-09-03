@@ -10,6 +10,18 @@
     }
   },
 
+  "_cache_read_mult": "Multiple of the input rate charged for a cache read, per model - not per provider, since it is a property of the model's rate card. The default is 0.1 for every model; pricing.py already carries the exceptions it knows about (Claude Fable 5.1 and Claude Mythos 5.1 read cache at 0.025x, i.e. $0.25 against a $10/MTok input rate). Set an entry here when a model prices reads differently or your contract does.",
+  "cache_read_mult": {
+    "claude-fable-5-1": 0.025,
+    "claude-mythos-5-1": 0.025
+  },
+
+  "_fast_prices": "Fast-mode rates in USD per million tokens, [input, output], for requests whose transcript recorded usage.speed = 'fast'. Anthropic-provider only - fast mode is not offered on Bedrock, Vertex or Foundry, so an entry here never applies to those routes. Built in for Claude Opus 5 and Opus 4.8 at 2x list; add a model here if one gains a fast tier before pricing.py does. Cache multipliers apply on top of these, so a fast-mode cache read is 0.1x the fast input rate.",
+  "fast_prices": {
+    "claude-opus-5": [10.0, 50.0],
+    "claude-opus-4-8": [10.0, 50.0]
+  },
+
   "_model_aliases": "Raw model id -> canonical id. A Bedrock application inference profile or provisioned-model ARN names a deployment, not a model, so nothing in the id says which model it serves. Those are reported as unpriced until mapped here.",
   "model_aliases": {
     "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3d4e5f6": "claude-opus-4-5",
