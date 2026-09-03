@@ -406,6 +406,76 @@ per-tool error rates, whether costs are `list` or `contracted`, and
 Anthropic's published `baseline` of about $13 per active developer per day
 (p90 $30), so "expensive" can be told from "ordinary" without guessing.
 
+## Sessions view
+
+A **Prompts / Sessions** switch sits at the left of the filter bar
+(persisted, like the chart choice) and swaps the table below the chart for
+one row per session, sharing every filter the prompts table uses: date
+range, product, project, model and search. Columns: session (title, or the
+first prompt's text, or the id), project, start, duration, prompts, API
+calls, cost (`~` when estimated), cache hit %, misses, miss cost, one pill
+per model used, model switches, compactions, peak context, and a
+subagent-cache-TTL badge. Click a row (or focus it and press Enter/Space) to
+open its detail panel:
+
+- the **context-growth chart** for that session (see below);
+- its cache misses, each with the time, cause, context size, tokens
+  re-written and a cost (the session's exact `miss_cost` shared out across
+  its misses in proportion to what each one re-wrote);
+- its model-switch / effort-switch / speed-switch / compaction events;
+- a **Show prompts** button that sets the session as a filter, switches back
+  to the Prompts view and shows a removable chip ("Session: ...") in the
+  filter bar so the narrowed view is never a mystery. Clearing the chip
+  clears the filter without changing the view.
+
+The session filter is deliberately not persisted across a reload — a session
+id restored from a different payload would filter every prompt away with no
+visible reason why.
+
+### Context-growth chart
+
+Per session, an SVG area chart of measured context over time: cache-read,
+uncached-input and cache-write stacked bottom-up so their sum traces the
+context curve itself (no separate line needed beyond the stack's own
+outline). Cache misses are marked as dots coloured by cause, from the same
+categorical palette and cause table as the backend classification above; a
+legend is built from whatever actually appears in that session, so it never
+names a colour that is not on screen. Compaction and model/effort/speed
+switches are dashed vertical marks with a tooltip. A session with no context
+series (dropped by the payload's 200,000-point cap) says so instead of
+drawing an empty chart. Two matching day charts live in the chart selector:
+**"Context: peak / day"** (the largest single request's context per day) and
+**"Cache misses: cost / day"** (the day's total miss cost).
+
+### Cache-health tile
+
+A **Cache health** tile beside the cost tile shows the cache hit rate for
+the current filter, and, once there is at least one miss, the miss count,
+total miss cost and the most common cause — "no cached input in this slice"
+or "no cache misses" when there is nothing to report, rather than a blank
+tile.
+
+### 5-hour blocks and the burn-rate tile
+
+The **5h blocks** chart view draws one bar per ccusage-style billing block
+(cost on the y axis, the open block outlined), honouring the date range. A
+**Current 5h block** tile shows the open block's burn rate — tokens/min,
+$/min, projected cost at close, minutes left — from the payload's `burn`
+figure; it is hidden entirely between blocks (nothing to project) and on a
+Bedrock/Vertex install, where the 5-hour concept does not apply.
+
+### Heatmap
+
+The **Heatmap** chart view is a GitHub-style calendar of daily cost, weeks
+as columns and weekdays as rows, coloured on the same ironbow ramp as the
+stacked charts — but scaled by quartile of the days that had any spend, not
+by a fraction of the maximum, so one unusually expensive day cannot flatten
+every ordinary day onto the same rung. A day with no activity is the grid
+colour, not the bottom of the ramp: quiet is not the same as cheap. Hovering
+or focusing a day shows its cost, prompt count and output tokens; below the
+calendar, a current-streak / longest-streak readout. Under a date range the
+calendar covers exactly that range; under "All" it covers the last 26 weeks.
+
 ## Pricing and cost estimates
 
 Rows that came from a transcript carry no cost — Claude Code only reports one
@@ -804,15 +874,21 @@ carry the CLI's authoritative `cost_usd`).
 
 ## Chart metrics
 
-The chart card offers eleven views (dropdown, persisted): output tokens/day,
+The chart card offers fifteen views (dropdown, persisted): output tokens/day,
 tokens & lines per **active minute** (day total ÷ summed wall-clock span of
 each prompt; days under a minute of activity are skipped), cost/day, **cost
 composition** (stacked $: cache read / cache write / output / uncached input —
 cache reads typically dominate despite the 0.1x discount because input volume
-dwarfs output), cache hit rate, cost per 1K lines written (≥50 lines/day),
-model mix (stacked by family), subagent share, and — when Claude Desktop is
-installed — the daily peak of the account's 5-hour and 7-day **plan limits**.
-The plan views are account-wide, so only the date range applies to them.
+dwarfs output), cache hit rate, **context: peak/day** (the largest single
+request's measured context per day), **cache misses: cost/day** (what the
+day's cold-cache re-writes cost), **5h blocks** (bar per billing block, the
+open one outlined), **heatmap** (a daily-cost calendar), cost per 1K lines
+written (≥50 lines/day), model mix (stacked by family), subagent share, and —
+when Claude Desktop is installed — the daily peak of the account's 5-hour and
+7-day **plan limits**. The plan views are account-wide, so only the date
+range applies to them; the 5h-blocks and heatmap views draw their own x axis
+(a block index, a calendar) instead of the shared day-bucket bar chart the
+others share, so they own their own scale and legend.
 
 **Stacked charts are coloured by cost, on an ironbow ramp** — darkest is
 cheapest, brightest is dearest. Model families run haiku → sonnet → opus →
@@ -890,8 +966,15 @@ counterfactual.
   prompt text, dropped old sessions from the context series to stay under its
   200,000-point cap, or could not write a conversation page because the
   transcript is gone, the page says so rather than quietly showing less.
+  Anything else the build itself wants to say about the payload (via
+  `DATA.notices`) is appended to the same notice bar.
 - **Auto-refresh** — the page reloads every 5 minutes; filters, chart choice,
-  and grouping persist (localStorage). Light/dark theme with toggle.
+  grouping and the Prompts/Sessions view persist (localStorage). Light/dark
+  theme with toggle.
+- **Keyboard access** — every clickable row (prompt, session, day bar) and
+  every chart mark with its own tooltip (block bars, heatmap days, context
+  events and misses) is a focusable, tabbable element; a session row also
+  answers Enter and Space the way a click does.
 
 ## File-change tracking
 
