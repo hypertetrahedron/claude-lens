@@ -19,6 +19,7 @@ A local usage dashboard for Claude Code: transcripts and OTel telemetry in,
 ```
 python test_sources.py          # the whole suite
 python test_pricing.py          # rates, cache multipliers, fast mode, retirement
+python test_receiver.py         # OTel attributes, dirty fingerprint, SessionEnd hook
 python jsonl_ingest.py          # ingest every configured source
 python build_dashboard.py       # rebuild dashboard.html + index.html
 python digest.py                # weekly report into reports/

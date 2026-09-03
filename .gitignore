@@ -5,6 +5,7 @@ metrics.db-wal
 dashboard.html
 index.html
 receiver.log*
+hooks/hook.log*
 reports/
 remote-cache/
 __pycache__/
