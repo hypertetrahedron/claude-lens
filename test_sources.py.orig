@@ -886,50 +886,34 @@ class BuildOptions(unittest.TestCase):
         raw = re.search(r"const DATA = (\{.*?\});\n", html, re.S).group(1)
         return json.loads(raw)
 
-    def _rows(self, p):
-        """Rows as the template sees them, from the column-oriented payload."""
-        s, c = p["strings"], p["cols"]
-        out = []
-        for i in range(p["n_rows"]):
-            models = [{"model": s[m[0]], "in": m[1], "out": m[2], "cr": m[3],
-                       "cw": m[4], "cost": m[5], "calls": m[6]}
-                      for m in c["models"][i]]
-            out.append({"ts": c["ts"][i], "text": c["text"][i],
-                        "project": s[c["project"][i]], "models": models,
-                        "cost": c["cost"][i],
-                        "out": sum(m["out"] for m in models)})
-        return out
-
     def test_cap_keeps_the_newest_and_reports_the_rest(self):
         self.bd.build(max_rows=2)
         p = self._payload()
-        rows = self._rows(p)
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(p["rows"]), 2)
         self.assertEqual(p["total_rows"], 5)
         self.assertEqual(p["truncated"], 3)
-        self.assertEqual(rows, sorted(rows, key=lambda r: r["ts"],
-                                      reverse=True))
+        self.assertEqual(p["rows"], sorted(p["rows"], key=lambda r: r["ts"],
+                                           reverse=True))
 
     def test_no_cap_embeds_everything(self):
         self.bd.build(max_rows=0)
         p = self._payload()
-        self.assertEqual(len(self._rows(p)), 5)
+        self.assertEqual(len(p["rows"]), 5)
         self.assertEqual(p["truncated"], 0)
 
     def test_redaction_removes_prompt_text_only(self):
         self.bd.build(redact=True)
         p = self._payload()
         self.assertTrue(p["redacted"])
-        rows = self._rows(p)
-        self.assertTrue(all(r["text"] == "" for r in rows))
-        self.assertTrue(all(r["out"] > 0 for r in rows),
+        self.assertTrue(all(r["text"] == "" for r in p["rows"]))
+        self.assertTrue(all(r["out"] > 0 for r in p["rows"]),
                         "numbers must survive redaction")
 
     def test_text_is_present_by_default(self):
         self.bd.build()
         p = self._payload()
         self.assertFalse(p["redacted"])
-        self.assertTrue(any(r["text"] for r in self._rows(p)))
+        self.assertTrue(any(r["text"] for r in p["rows"]))
 
 
 class ReceiverStaleness(unittest.TestCase):

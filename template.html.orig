@@ -445,20 +445,9 @@ const rows = DATA.rows;
 
 /* Project name as shown: the active product's label prefix carries no
    information once every visible row belongs to that product. */
-/* Called once per row for the cell, again per comparison under a project
-   sort, again for the group key and again for CSV - so it is memoised. The
-   answer only depends on the active product's prefix, so the cache is thrown
-   away exactly when that changes. */
-let projCache = new Map(), projCachePre = null;
 function projLabel(p) {
   const pre = kindPrefix(state.kind);
-  if (pre !== projCachePre) { projCache = new Map(); projCachePre = pre; }
-  let v = projCache.get(p);
-  if (v === undefined) {
-    v = pre && p.startsWith(pre) ? p.slice(pre.length) : p;
-    projCache.set(p, v);
-  }
-  return v;
+  return pre && p.startsWith(pre) ? p.slice(pre.length) : p;
 }
 
 const projectsFor = kind => [...new Set(
@@ -550,7 +539,6 @@ function initFilters() {
   });
   $("csv-btn").addEventListener("click", exportCsv);
   initColPanel();
-  initTableEvents();
 }
 
 /* Start of the selected period as an ISO instant, or "" for All. Shared so
@@ -568,11 +556,6 @@ function rangeCutoff() {
   return "";
 }
 
-/* The search compares against lower-cased prompt text. Lower-casing it per
-   row per keystroke allocated a fresh string for every row in the payload;
-   the text never changes, so it is folded once, lazily. */
-const lcText = (r) => r._lc !== undefined ? r._lc : (r._lc = (r.text || "").toLowerCase());
-
 function filtered() {
   const cutoff = rangeCutoff();
   return rows.filter(r =>
@@ -580,7 +563,7 @@ function filtered() {
     (state.kind === ALL_KINDS || kindOf(r) === state.kind) &&
     (state.project === "all" || r.project === state.project) &&
     (state.model === "all" || r.models.some(m => m.model === state.model)) &&
-    (!state.q || lcText(r).includes(state.q)));
+    (!state.q || r.text.toLowerCase().includes(state.q)));
 }
 
 /* ---------- tiles ---------- */
@@ -681,31 +664,22 @@ const FAMILIES = [
   ["fable",  m => m.includes("fable") || m.includes("mythos"), 4],
   ["other",  () => true, "o"],
 ];
-/* Five substring tests per model per row per chart render; a payload holds
-   only a handful of distinct model ids, so the answer is cached by name. */
-const FAM_CACHE = new Map();
-const famOf = (model) => {
-  let f = FAM_CACHE.get(model);
-  if (f === undefined) {
-    f = FAMILIES.find(([, test]) => test(model || ""))[0];
-    FAM_CACHE.set(model, f);
-  }
-  return f;
-};
+const famOf = (model) => FAMILIES.find(([, test]) => test(model || ""))[0];
 const famSlot = (fam) => (FAMILIES.find(([n]) => n === fam) || [])[2] || "o";
 
-/* Every non-plan chart reads the same per-day buckets and differs only in
-   which field it plots, so switching charts - and every resize event - used to
-   re-aggregate the whole filtered set for nothing. The buckets are keyed on
-   the filter state that produced them; the chart choice is deliberately not
-   part of the key. */
-let dayCache = null, dayCacheKey = "";
-const filterKey = () =>
-  [state.range, state.kind, state.project, state.model, state.q].join("\u0001");
+function renderChart(rs) {
+  const wrap = $("chart-wrap");
+  for (const n of [...wrap.children]) if (n.id !== "tooltip") n.remove();
+  const chart = CHARTS[state.chart] || CHARTS.out;
+  $("chart-title").textContent = chart.title;
+  /* Clear the legend up front. Only stacked charts refill it, and the
+     no-data path below returns early - without this, switching to a chart
+     that has no legend (or no data) left the previous chart's series
+     labelled underneath it. */
+  const legend = $("chart-legend");
+  legend.hidden = true;
+  legend.replaceChildren();
 
-function dayBuckets(rs) {
-  const key = filterKey();
-  if (key === dayCacheKey && dayCache) return dayCache;
   const byDay = new Map();
   for (const r of rs) {
     const d = dayOf(r.ts); if (!d) continue;
@@ -723,26 +697,8 @@ function dayBuckets(rs) {
     }
     byDay.set(d, b);
   }
-  dayCache = byDay; dayCacheKey = key;
-  return byDay;
-}
-
-function renderChart(rs) {
-  const wrap = $("chart-wrap");
-  for (const n of [...wrap.children]) if (n.id !== "tooltip") n.remove();
-  const chart = CHARTS[state.chart] || CHARTS.out;
-  $("chart-title").textContent = chart.title;
-  /* Clear the legend up front. Only stacked charts refill it, and the
-     no-data path below returns early - without this, switching to a chart
-     that has no legend (or no data) left the previous chart's series
-     labelled underneath it. */
-  const legend = $("chart-legend");
-  legend.hidden = true;
-  legend.replaceChildren();
-
-  let byDay = dayBuckets(rs);
   if (chart.plan != null) {
-    byDay = new Map();
+    byDay.clear();
     const from = (rangeCutoff() || "").slice(0, 10);
     const src = (DATA.plan && DATA.plan.days) || {};
     for (const day of Object.keys(src)) {
@@ -964,8 +920,7 @@ const COLCAT = [
       for (const m of r.models) {
         const pill = el("span", "pill");
         pill.append(el("span", "dot"), document.createTextNode(shortModel(m.model)));
-        // toLocaleString is not cheap and the counts never change
-        pill.title = m._t || (m._t = `${m.calls} calls · ${fmtFull(m.out)} out`);
+        pill.title = `${m.calls} calls · ${fmtFull(m.out)} out`;
         td.append(pill);
       }
       return td;
@@ -1056,62 +1011,25 @@ function renderHead() {
   }
 }
 
-const SHORT_MODEL = new Map();
 function shortModel(m) {
-  let s = SHORT_MODEL.get(m);
-  if (s === undefined) {
-    s = m.replace(/^claude-/, "").replace(/-\d{8}$/, "");
-    SHORT_MODEL.set(m, s);
-  }
-  return s;
+  return m.replace(/^claude-/, "").replace(/-\d{8}$/, "");
 }
 
-/* A prompt's cells depend on the column list and on the product filter (which
-   is what projLabel strips) and on nothing else, so the built <tr> is cached
-   and reused. A sort, a filter change or a re-render then re-orders the same
-   elements instead of building six thousand cells again. The fingerprint
-   covers everything a cell reads, so a stale cell cannot be shown. */
-let rowCache = new Map(), rowCacheKey = null;
-const rowFingerprint = () => state.cols.join(",") + "|" + state.kind;
-function rowEl(cols, r) {
-  const cached = rowCache.get(r);
-  if (cached) {
-    // className, not classList.remove: clears proj-start and a stale open mark
-    cached.className = "data-row";
-    // a collapsed group leaves display:none behind; a reused row must not
-    // carry that into a render where its group no longer exists
-    cached.style.display = "";
-    return cached;
-  }
-  const tr = el("tr", "data-row");
-  for (const c of cols) tr.append(c.cell(r));
-  tr.__row = r;
-  rowCache.set(r, tr);
-  return tr;
-}
-/* Collects into an array rather than appending to the live table: 500 separate
-   insertions became one. */
-function appendRow(out, r, cols) {
-    const tr = rowEl(cols, r);
-    out.push(tr);
+function appendRow(body, r) {
+    const tr = el("tr", "data-row");
+    for (const c of visibleCols()) tr.append(c.cell(r));
+    tr.addEventListener("click", () => toggleDetail(tr, r));
+    body.append(tr);
     return tr;
 }
 
 function renderTable(rs) {
   renderHead();
-  const body = $("tbl-body");
-  const cols = visibleCols();
-  const fp = rowFingerprint();
-  if (fp !== rowCacheKey) { rowCache = new Map(); rowCacheKey = fp; }
-  const out = [];
+  const body = $("tbl-body"); body.replaceChildren();
   $("empty").hidden = rs.length > 0;
-  // the sort column is resolved once, not twice for every comparison
-  const scol = COL_BY_KEY[state.sort];
-  const sval = scol ? scol.val : (r => r[state.sort] ?? "");
-  const dir = state.dir;
   const sorted = [...rs].sort((a, b) => {
-    const va = sval(a), vb = sval(b);
-    return (va < vb ? -1 : va > vb ? 1 : 0) * dir;
+    const va = sortVal(a, state.sort), vb = sortVal(b, state.sort);
+    return (va < vb ? -1 : va > vb ? 1 : 0) * state.dir;
   });
   if (!state.group) {
     /* Under a project sort, consecutive rows from one project look identical
@@ -1123,14 +1041,12 @@ function renderTable(rs) {
     const byProject = state.sort === "project";
     let prev = null;
     sorted.slice(0, 500).forEach((r, i) => {
-      const tr = appendRow(out, r, cols);
+      const tr = appendRow(body, r);
       if (!byProject) return;
       const name = projLabel(r.project);
       if (i === 0 || name !== prev) tr.classList.add("proj-start");
       prev = name;
     });
-    body.replaceChildren(...out);
-    pruneRowCache(out);
     return;
   }
   // group by project, groups ordered by total cost; header row = subtotals,
@@ -1145,6 +1061,7 @@ function renderTable(rs) {
     b[1].reduce((s, r) => s + r.cost, 0) - a[1].reduce((s, r) => s + r.cost, 0));
   for (const [proj, list] of order) {
     const gtr = el("tr", "group-row");
+    const cols = visibleCols();
     // label cell spans the leading columns that have no subtotal
     let firstSub = cols.findIndex(c => c.groupVal);
     if (firstSub === -1) firstSub = cols.length;
@@ -1156,9 +1073,9 @@ function renderTable(rs) {
     for (const c of cols.slice(span)) {
       gtr.append(el("td", "num", c.groupVal ? c.groupVal(list) : ""));
     }
-    out.push(gtr);
-    const rowEls = list.slice(0, 200).map(r => appendRow(out, r, cols));
-    gtr.__collapse = () => {
+    body.append(gtr);
+    const rowEls = list.slice(0, 200).map(r => appendRow(body, r));
+    gtr.addEventListener("click", () => {
       const hide = rowEls[0] && rowEls[0].style.display !== "none";
       for (const e2 of rowEls) {
         e2.style.display = hide ? "none" : "";
@@ -1166,34 +1083,8 @@ function renderTable(rs) {
         if (sib && sib.classList && sib.classList.contains("detail-row"))
           sib.style.display = hide ? "none" : "";
       }
-    };
+    });
   }
-  body.replaceChildren(...out);
-  pruneRowCache(out);
-}
-
-/* Different sorts bring different rows into the visible 500, so the cache
-   would otherwise grow to one <tr> per prompt in the payload. Once it is
-   several times larger than what is actually on screen, drop everything that
-   is not. */
-function pruneRowCache(out) {
-  if (rowCache.size <= 2000 || rowCache.size <= out.length * 3) return;
-  const keep = new Map();
-  for (const tr of out) if (tr.__row) keep.set(tr.__row, tr);
-  rowCache = keep;
-}
-
-/* One delegated listener on the body. Five hundred per-row closures were
-   allocated and thrown away on every sort; a click inside an open detail
-   panel finds no data row above it, exactly as before. */
-function initTableEvents() {
-  const body = $("tbl-body");
-  body.addEventListener("click", (e) => {
-    const tr = e.target.closest("tr");
-    if (!tr || tr.parentNode !== body) return;
-    if (tr.classList.contains("data-row")) toggleDetail(tr, tr.__row);
-    else if (tr.__collapse) tr.__collapse();
-  });
 }
 
 /* ---------- column configuration panel ---------- */
@@ -1562,22 +1453,7 @@ renderNotice();
 initFilters();
 if (!hideSubscriptionTiles()) { renderWindow(); renderPlanTile(); }
 render();
-/* resize fires continuously while a window is dragged, and each one re-ran
-   the filter, re-aggregated the days and rebuilt the SVG - after reading
-   clientWidth, which forces layout of the table sitting below it. One redraw
-   per frame, and none at all if the width did not actually change. */
-let resizeQueued = false, lastChartW = 0;
-addEventListener("resize", () => {
-  if (resizeQueued) return;
-  resizeQueued = true;
-  requestAnimationFrame(() => {
-    resizeQueued = false;
-    const w = $("chart-wrap").clientWidth || 0;
-    if (w === lastChartW) return;
-    lastChartW = w;
-    renderChart(filtered());
-  });
-});
+addEventListener("resize", () => renderChart(filtered()));
 </script>
 </body>
 </html>

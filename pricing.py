@@ -38,10 +38,13 @@ pricing.local.json; pricing.example.json documents the shape.
 import json as _json
 import os as _os
 import re as _re
+from collections import namedtuple as _namedtuple
+from functools import lru_cache as _lru_cache
 
 PRICES = {
     # Current models
     "claude-fable-5": (10.0, 50.0),
+    "claude-fable-5-1": (10.0, 50.0),
     "claude-mythos-5": (10.0, 50.0),
     "claude-opus-5": (5.0, 25.0),
     "claude-opus-4-8": (5.0, 25.0),
@@ -84,6 +87,18 @@ CACHE_READ_MULT = 0.1
 CACHE_WRITE_5M_MULT = 1.25
 CACHE_WRITE_1H_MULT = 2.0
 
+# Cache reads bill at CACHE_READ_MULT x input for every model except the few
+# that price them differently. Keyed on the *base* table key, so it is resolved
+# by the same longest-prefix scan as the rate itself and costs one dict lookup
+# once per (model, provider) - not once per request.
+CACHE_READ_MULT_BY_MODEL = {
+    "claude-fable-5-1": 0.025,
+}
+
+# A resolved rate: what one request costs per token, everything a caller needs
+# in a single tuple so the table is consulted once per distinct model.
+Rate = _namedtuple("Rate", "inp out cache_read_mult")
+
 ANTHROPIC, BEDROCK, VERTEX = "anthropic", "bedrock", "vertex"
 
 # Per-provider rate tables. Bedrock and Vertex begin as copies of the
@@ -122,6 +137,11 @@ def _rebuild_indexes():
     for provider, table in PROVIDER_PRICES.items():
         _BY_PREFIX_BY_PROVIDER[provider] = sorted(
             table.items(), key=lambda kv: -len(kv[0]))
+    # The memo below answers from these indexes and from MODEL_ALIASES, both
+    # of which just moved. (Not yet defined during module import.)
+    memo = globals().get("_resolve_base")
+    if memo is not None:
+        memo.cache_clear()
 
 
 def load_overrides(path=OVERRIDE_PATH):
@@ -214,36 +234,56 @@ def canonical_model(raw):
     return body, provider
 
 
-def lookup(model, ts=None, provider=None):
-    """Resolve a model id to (input, output) prices per million tokens.
+@_lru_cache(maxsize=1024)
+def _resolve_base(model, provider):
+    """(table key, provider) for a raw model id, or None if unknown.
 
-    ts is an optional ISO-8601 request timestamp; when given, promotional
-    pricing in effect at that time is applied. provider selects the rate
-    table, defaulting to whatever the id itself implies. Ids still carrying
-    provider decoration are canonicalised here, so a caller that never stored
-    a provider still resolves correctly. Returns None if unknown.
+    This is the expensive half of a price lookup - canonicalisation plus a
+    linear scan of the prefix table - and it does not depend on the request
+    timestamp, so it is memoized. A build costs one scan per distinct
+    (model, provider) pair instead of two per API request. _rebuild_indexes()
+    clears it whenever the tables or aliases change.
     """
-    if not model:
-        return None
     canon, detected = canonical_model(model)
     if canon is None:
         return None
     provider = provider or detected or ANTHROPIC
-    table = PROVIDER_PRICES.get(provider) or PROVIDER_PRICES[ANTHROPIC]
     index = (_BY_PREFIX_BY_PROVIDER.get(provider)
              or _BY_PREFIX_BY_PROVIDER[ANTHROPIC])
     m = canon.split("[")[0].strip()
-    base = None
     for known, _p in index:
         if m == known or m.startswith(known):
-            base = known
-            break
-    if base is None:
+            return known, provider
+    return None
+
+
+def resolve(model, ts=None, provider=None):
+    """Rate(input, output, cache_read_mult) per million tokens, or None.
+
+    ts is an optional ISO-8601 request timestamp; when given, promotional
+    pricing in effect at that time is applied. Only the timestamp-dependent
+    part is recomputed per call - the table lookup itself is memoized - so
+    callers may hold on to a Rate for a whole batch of requests at one price.
+    """
+    if not model:
         return None
+    found = _resolve_base(model, provider)
+    if found is None:
+        return None
+    base, provider = found
     intro = INTRO_PRICES.get(base)
     if intro and ts and str(ts) < intro[0] and provider == ANTHROPIC:
-        return intro[1]
-    return table[base]
+        inp, out = intro[1]
+    else:
+        table = PROVIDER_PRICES.get(provider) or PROVIDER_PRICES[ANTHROPIC]
+        inp, out = table[base]
+    return Rate(inp, out, CACHE_READ_MULT_BY_MODEL.get(base, CACHE_READ_MULT))
+
+
+def lookup(model, ts=None, provider=None):
+    """(input, output) prices per million tokens, or None. See resolve()."""
+    r = resolve(model, ts, provider)
+    return None if r is None else (r.inp, r.out)
 
 
 def estimate_cost(model, input_tokens=0, output_tokens=0, cache_read=0,
@@ -255,16 +295,27 @@ def estimate_cost(model, input_tokens=0, output_tokens=0, cache_read=0,
     the provider's UNSPLIT_CACHE_MULT (1h by default, which is what Claude
     Code uses against the Anthropic API).
     """
-    p = lookup(model, ts, provider)
-    if p is None:
+    rate = resolve(model, ts, provider)
+    if rate is None:
         return None
-    inp, out = p
+    return cost_at(rate, input_tokens, output_tokens, cache_read,
+                   cache_5m, cache_1h, cache_unsplit, provider)
+
+
+def cost_at(rate, input_tokens=0, output_tokens=0, cache_read=0,
+            cache_5m=0, cache_1h=0, cache_unsplit=0, provider=None):
+    """estimate_cost() against an already-resolved Rate.
+
+    Split out so a caller aggregating many requests at one price resolves once
+    and bills many times; estimate_cost() is this plus the resolve.
+    """
+    inp, out = rate.inp, rate.out
     unsplit_mult = UNSPLIT_CACHE_MULT.get(provider or ANTHROPIC,
                                           CACHE_WRITE_1H_MULT)
     return (
         input_tokens * inp
         + output_tokens * out
-        + cache_read * inp * CACHE_READ_MULT
+        + cache_read * inp * rate.cache_read_mult
         + cache_5m * inp * CACHE_WRITE_5M_MULT
         + cache_1h * inp * CACHE_WRITE_1H_MULT
         + cache_unsplit * inp * unsplit_mult
