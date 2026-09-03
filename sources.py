@@ -33,7 +33,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from collections import namedtuple
+from collections import deque, namedtuple
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE, "sources.json")
@@ -145,9 +145,11 @@ def find_claude_dirs(location, max_depth=DEFAULT_DEPTH):
     location = os.path.abspath(os.path.expanduser(location))
     if not os.path.isdir(location):
         return []
-    found, seen, queue = [], set(), [(location, 0)]
+    # deque, not a list: list.pop(0) is O(n), and a deep --extra-dir scan can
+    # queue tens of thousands of directories.
+    found, seen, queue = [], set(), deque([(location, 0)])
     while queue:
-        path, depth = queue.pop(0)
+        path, depth = queue.popleft()
         try:
             key = os.path.normcase(os.path.realpath(path))
         except OSError:
@@ -750,6 +752,22 @@ def remote_roots(host):
 # Configuration
 # ---------------------------------------------------------------------------
 
+def config_db_path(path=CONFIG_PATH):
+    """The "db" key from sources.json, or None.
+
+    Deliberately not routed through SourceConfig.load(): db.py asks this
+    question while opening the database, long before source discovery matters,
+    and a malformed config must not stop it from falling back to the default.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return None
+    value = raw.get("db") if isinstance(raw, dict) else None
+    return value or None
+
+
 class SourceConfig:
     """Which places to look. Loaded from sources.json, overridden by CLI flags.
 
@@ -763,8 +781,13 @@ class SourceConfig:
           "ssh_timeout": 300,
           "ssh_options": ["-i", "~/.ssh/id_claude"],
           "cowork": true,
-          "cowork_paths": []
+          "cowork_paths": [],
+          "db": "C:/local/metrics.db"
         }
+
+    "db" is where metrics.db lives. It is read by `db.resolve_path()` rather
+    than by anything here, so a checkout on a network share can keep SQLite's
+    WAL on local disk without every entry point growing a flag of its own.
     """
 
     def __init__(self, extra_locations=(), scan_siblings=True,
@@ -774,7 +797,7 @@ class SourceConfig:
                  ssh_connect_timeout=DEFAULT_CONNECT_TIMEOUT,
                  remote_budget=DEFAULT_REMOTE_BUDGET,
                  cowork=True, cowork_paths=(), code_session_paths=(),
-                 plan_usage_paths=()):
+                 plan_usage_paths=(), db_path=None):
         self.extra_locations = list(extra_locations)
         self.scan_siblings = scan_siblings
         self.depth = depth
@@ -791,6 +814,7 @@ class SourceConfig:
         self.cowork_paths = list(cowork_paths)
         self.code_session_paths = list(code_session_paths)
         self.plan_usage_paths = list(plan_usage_paths)
+        self.db_path = db_path
 
     @classmethod
     def load(cls, path=CONFIG_PATH):
@@ -817,7 +841,9 @@ class SourceConfig:
             cowork_paths=raw.get("cowork_paths") or [],
             code_session_paths=raw.get("code_session_paths") or [],
             plan_usage_paths=raw.get("plan_usage_paths") or [],
+            db_path=raw.get("db") or None,
         )
+
 
     def hosts(self):
         """Explicit remotes plus, when asked, every host in ~/.ssh/config."""

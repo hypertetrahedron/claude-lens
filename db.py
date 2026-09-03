@@ -4,7 +4,9 @@ dashboard generator.
 Dedupe strategy:
 - api_requests keyed by the Anthropic request_id. Both sources see the same id,
   so OTel + JSONL never double count. OTel rows win on conflict (they carry an
-  authoritative cost_usd); JSONL rows never overwrite OTel rows.
+  authoritative cost_usd); a JSONL row can only overwrite another JSONL row,
+  and only when it carries at least as many output tokens (schema v8) - which
+  is how a re-parse corrects a row written from a half-streamed request.
 - tool_calls keyed by tool_use_id (toolu_...), present in both sources.
 - prompts keyed by prompt_id; conflicting inserts merge, filling missing fields.
 """
@@ -12,6 +14,33 @@ import os
 import sqlite3
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics.db")
+
+# Environment override for the database location, so a machine whose checkout
+# sits on a network share can keep SQLite's WAL on local disk.
+DB_ENV_VAR = "CLAUDE_LENS_DB"
+
+
+def resolve_path(explicit=None):
+    """Where metrics.db lives: --db, then $CLAUDE_LENS_DB, then sources.json.
+
+    Every entry point resolves through this so one setting moves the database
+    for the ingester, the receiver, the dashboard and the digest at once.
+    `connect()` keeps its own default, so callers that pass a path explicitly
+    (tests, migrations against a copy) are unaffected.
+    """
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+    env = os.environ.get(DB_ENV_VAR)
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    try:
+        import sources
+        configured = sources.config_db_path()
+    except Exception:                       # sources.py absent or unreadable
+        configured = None
+    if configured:
+        return os.path.abspath(os.path.expanduser(configured))
+    return DB_PATH
 
 # ---------------------------------------------------------------------------
 # Schema versioning (stored in SQLite's PRAGMA user_version).
@@ -56,8 +85,22 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "metrics.db")
 #       with the original kept alongside. Existing rows are normalised in
 #       place, which is the only way to reprice Bedrock history - api_requests
 #       rows are insert-or-ignore, so a re-parse would never touch them.
+#   8 - what a request cost and what it was doing: api_requests gains effort,
+#       speed, thinking_tokens, stop_reason, server_tool_requests,
+#       service_tier, inference_geo, context_tokens, cost_basis and error;
+#       tool_calls gains input_bytes, result_bytes, is_error, duration_ms and
+#       error_type; sessions gains git_branch, cli_version, entrypoint,
+#       permission_mode, transcript_path, first_ts and last_ts; prompts gains
+#       kind. New tables `agents` (one row per subagent launch, with the
+#       requested and resolved model) and `session_events` (context readings,
+#       compactions, model/effort/speed switches). Transcript inserts stop
+#       being insert-or-ignore: a JSONL row now updates an existing JSONL row
+#       when it carries at least as many output tokens, so re-parsing corrects
+#       rows captured mid-stream. Clears ingest_state to force that re-parse,
+#       and strips the `agent-` filename prefix from agent_name so subagent
+#       rows join the new agents table on agentId.
 # ---------------------------------------------------------------------------
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS prompts (
@@ -68,7 +111,8 @@ CREATE TABLE IF NOT EXISTS prompts (
     text          TEXT DEFAULT '',
     source        TEXT,
     injected      INTEGER DEFAULT 0,
-    canonical_id  TEXT
+    canonical_id  TEXT,
+    kind          TEXT
 );
 CREATE TABLE IF NOT EXISTS api_requests (
     request_id        TEXT PRIMARY KEY,
@@ -88,7 +132,17 @@ CREATE TABLE IF NOT EXISTS api_requests (
     agent_name        TEXT,
     source            TEXT,
     model_raw         TEXT,
-    provider          TEXT
+    provider          TEXT,
+    effort            TEXT,
+    speed             TEXT,
+    thinking_tokens   INTEGER,
+    stop_reason       TEXT,
+    server_tool_requests INTEGER,
+    service_tier      TEXT,
+    inference_geo     TEXT,
+    context_tokens    INTEGER,
+    cost_basis        TEXT,
+    error             TEXT
 );
 CREATE TABLE IF NOT EXISTS tool_calls (
     tool_use_id TEXT PRIMARY KEY,
@@ -98,7 +152,12 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     tool_name   TEXT,
     agent_name  TEXT,
     source      TEXT,
-    detail      TEXT
+    detail      TEXT,
+    input_bytes  INTEGER,
+    result_bytes INTEGER,
+    is_error     INTEGER,
+    duration_ms  INTEGER,
+    error_type   TEXT
 );
 CREATE TABLE IF NOT EXISTS edits (
     tool_use_id  TEXT PRIMARY KEY,
@@ -119,8 +178,47 @@ CREATE TABLE IF NOT EXISTS sessions (
     project      TEXT,
     cwd          TEXT,
     source_label TEXT DEFAULT '',
-    title        TEXT
+    title        TEXT,
+    git_branch      TEXT,
+    cli_version     TEXT,
+    entrypoint      TEXT,
+    permission_mode TEXT,
+    transcript_path TEXT,
+    first_ts        TEXT,
+    last_ts         TEXT
 );
+-- One row per subagent launch. `agent_id` is the CLI's agentId, which is also
+-- what api_requests.agent_name / tool_calls.agent_name carry for work done in
+-- <session>/subagents/agent-<agentId>.jsonl, so the two join directly.
+CREATE TABLE IF NOT EXISTS agents (
+    agent_id       TEXT PRIMARY KEY,
+    session_id     TEXT,
+    prompt_id      TEXT,
+    ts             TEXT,
+    subagent_type  TEXT,
+    requested_model TEXT,
+    resolved_model TEXT,
+    description    TEXT,
+    tool_use_id    TEXT,
+    source         TEXT
+);
+-- Things that happened to a session rather than to one request: how much
+-- context was in play, when it was compacted, and when the model, effort or
+-- speed changed under it. `value` is kind-specific (tokens for "context").
+CREATE TABLE IF NOT EXISTS session_events (
+    id         INTEGER PRIMARY KEY,
+    session_id TEXT,
+    prompt_id  TEXT,
+    ts         TEXT,
+    kind       TEXT,
+    detail     TEXT,
+    value      INTEGER
+);
+-- Re-ingesting a transcript must not multiply its events, and the table has
+-- no natural key, so identity is the whole tuple.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_uniq
+    ON session_events(session_id, ts, kind, COALESCE(detail,''), COALESCE(value,-1));
+CREATE INDEX IF NOT EXISTS idx_events_session ON session_events(session_id, ts);
 -- Cost a CLI reported for a whole session, with the number of runs it covers.
 -- Only trusted when `runs` matches the prompts actually seen for that session;
 -- a partial record would silently under-report. See build_dashboard.collect().
@@ -146,6 +244,7 @@ CREATE INDEX IF NOT EXISTS idx_req_prompt ON api_requests(prompt_id);
 CREATE INDEX IF NOT EXISTS idx_tool_prompt ON tool_calls(prompt_id);
 CREATE INDEX IF NOT EXISTS idx_prompt_ts ON prompts(ts);
 CREATE INDEX IF NOT EXISTS idx_req_session ON api_requests(session_id);
+CREATE INDEX IF NOT EXISTS idx_req_ts ON api_requests(ts);
 """
 
 
@@ -221,8 +320,58 @@ def _migrate_to_7(con):
             (canon or raw, raw, provider, raw))
 
 
+_V8_COLUMNS = {
+    "api_requests": [
+        ("effort", "TEXT"), ("speed", "TEXT"), ("thinking_tokens", "INTEGER"),
+        ("stop_reason", "TEXT"), ("server_tool_requests", "INTEGER"),
+        ("service_tier", "TEXT"), ("inference_geo", "TEXT"),
+        ("context_tokens", "INTEGER"), ("cost_basis", "TEXT"),
+        ("error", "TEXT")],
+    "tool_calls": [
+        ("input_bytes", "INTEGER"), ("result_bytes", "INTEGER"),
+        ("is_error", "INTEGER"), ("duration_ms", "INTEGER"),
+        ("error_type", "TEXT")],
+    "sessions": [
+        ("git_branch", "TEXT"), ("cli_version", "TEXT"),
+        ("entrypoint", "TEXT"), ("permission_mode", "TEXT"),
+        ("transcript_path", "TEXT"), ("first_ts", "TEXT"),
+        ("last_ts", "TEXT")],
+    "prompts": [("kind", "TEXT")],
+}
+
+
+def _migrate_to_8(con):
+    """Per-request effort/speed/context, tool sizes, agents and session events.
+
+    The re-parse is the point of the release as much as the columns are: every
+    new field is only in the transcripts, and the upsert rule that lands with
+    it (a JSONL row may replace a JSONL row with no more output tokens) means
+    a re-parse can finally correct rows written from a half-streamed request.
+    """
+    for table, columns in _V8_COLUMNS.items():
+        have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+        for name, kind in columns:
+            if name not in have:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+    con.executescript(SCHEMA)               # new tables + indexes
+    # Fill context_tokens for history that will never be re-parsed (the
+    # transcript is gone); rows that are re-parsed get the same answer.
+    con.execute("""UPDATE api_requests SET context_tokens =
+                     COALESCE(input_tokens,0) + COALESCE(cache_read_tokens,0)
+                     + COALESCE(cache_create_tokens,0)
+                   WHERE context_tokens IS NULL""")
+    # Subagent work used to be labelled by its transcript's filename; the
+    # agents table is keyed on the CLI's agentId, so drop the file prefix and
+    # the two join without a rule to remember.
+    for table in ("api_requests", "tool_calls", "edits"):
+        con.execute(f"UPDATE {table} SET agent_name = substr(agent_name, 7) "
+                    f"WHERE agent_name LIKE 'agent-%'")
+    con.execute("DELETE FROM ingest_state")
+
+
 MIGRATIONS = {2: _migrate_to_2, 3: _migrate_to_3, 4: _migrate_to_4,
-              5: _migrate_to_5, 6: _migrate_to_6, 7: _migrate_to_7}
+              5: _migrate_to_5, 6: _migrate_to_6, 7: _migrate_to_7,
+              8: _migrate_to_8}
 
 
 def connect(path=DB_PATH, cross_thread=False):
@@ -255,41 +404,73 @@ def connect(path=DB_PATH, cross_thread=False):
     return con
 
 
-PROMPT_SQL = """INSERT INTO prompts (prompt_id, session_id, project, ts, text, source, injected, canonical_id)
-           VALUES (?,?,?,?,?,?,?,?)
+PROMPT_COLS = ("prompt_id", "session_id", "project", "ts", "text", "source",
+               "injected", "canonical_id", "kind")
+
+PROMPT_SQL = """INSERT INTO prompts (prompt_id, session_id, project, ts, text, source, injected, canonical_id, kind)
+           VALUES (?,?,?,?,?,?,?,?,?)
            ON CONFLICT(prompt_id) DO UPDATE SET
              session_id   = COALESCE(prompts.session_id, excluded.session_id),
              project      = COALESCE(prompts.project, excluded.project),
              ts           = COALESCE(prompts.ts, excluded.ts),
              text         = CASE WHEN prompts.text = '' THEN excluded.text ELSE prompts.text END,
              injected     = MAX(prompts.injected, excluded.injected),
-             canonical_id = COALESCE(prompts.canonical_id, excluded.canonical_id)
+             canonical_id = COALESCE(prompts.canonical_id, excluded.canonical_id),
+             kind         = COALESCE(excluded.kind, prompts.kind)
         """
 
 
+def _pad(row, width):
+    """A caller's tuple widened to `width` with NULLs.
+
+    Columns are only ever appended, so a tuple built against an older column
+    list stays valid; the receiver and any out-of-tree caller keep working
+    across a schema bump instead of raising a binding error.
+    """
+    row = tuple(row)
+    if len(row) == width:
+        return row
+    if len(row) > width:
+        raise ValueError(f"row has {len(row)} values, expected at most {width}")
+    return row + (None,) * (width - len(row))
+
+
 def upsert_prompt(con, prompt_id, session_id=None, project=None, ts=None,
-                  text="", source=None, injected=0, canonical_id=None):
+                  text="", source=None, injected=0, canonical_id=None,
+                  kind=None):
     con.execute(
         PROMPT_SQL,
-        (prompt_id, session_id, project, ts, text, source, injected, canonical_id),
+        (prompt_id, session_id, project, ts, text, source, injected,
+         canonical_id, kind),
     )
 
 
 def upsert_prompts(con, rows):
     """Batch of PROMPT_SQL parameter tuples, applied in order."""
-    con.executemany(PROMPT_SQL, rows)
+    con.executemany(PROMPT_SQL, (_pad(r, len(PROMPT_COLS)) for r in rows))
 
 
 # Column order used by every api_requests write. The two statements below are
 # built once at import instead of being re-assembled (four string joins) on
 # every row: the transcript ingester writes tens of thousands per run.
+#
+# New columns are appended, never inserted: a caller that builds a positional
+# tuple against an older column list is padded rather than broken.
 REQUEST_COLS = ("request_id", "prompt_id", "session_id", "ts", "model",
                 "input_tokens", "output_tokens", "cache_read_tokens",
                 "cache_create_tokens", "cache_5m_tokens", "cache_1h_tokens",
                 "cost_usd", "duration_ms", "query_source", "agent_name",
-                "model_raw", "provider")
+                "model_raw", "provider",
+                # v8
+                "effort", "speed", "thinking_tokens", "stop_reason",
+                "server_tool_requests", "service_tier", "inference_geo",
+                "context_tokens", "cost_basis", "error")
 _REQ_PLACEHOLDERS = ",".join("?" * len(REQUEST_COLS))
 _REQ_NAMES = ",".join(REQUEST_COLS)
+_CTX_IDX = REQUEST_COLS.index("context_tokens")
+_TOKEN_IDX = (REQUEST_COLS.index("input_tokens"),
+              REQUEST_COLS.index("cache_read_tokens"),
+              REQUEST_COLS.index("cache_create_tokens"))
 
 REQUEST_SQL_OTEL = (
     f"INSERT INTO api_requests ({_REQ_NAMES}, source)\n"
@@ -298,49 +479,155 @@ REQUEST_SQL_OTEL = (
     + ",".join(f"{c}=excluded.{c}" for c in REQUEST_COLS[1:])
     + ", source='otel'")
 
+# Transcript rows may correct each other but never an OTel row, and only
+# upwards: one API request is written to the transcript once per content block
+# and the last block carries the final usage, so the row with the most output
+# tokens is the complete one. Without the guard, re-parsing a file whose first
+# chunk was captured live would overwrite the full figures with a stub.
 REQUEST_SQL_JSONL = (
-    f"INSERT OR IGNORE INTO api_requests ({_REQ_NAMES}, source)\n"
-    f"VALUES ({_REQ_PLACEHOLDERS}, 'jsonl')")
+    f"INSERT INTO api_requests ({_REQ_NAMES}, source)\n"
+    f"VALUES ({_REQ_PLACEHOLDERS}, 'jsonl')\n"
+    "ON CONFLICT(request_id) DO UPDATE SET "
+    + ",".join(f"{c}=excluded.{c}" for c in REQUEST_COLS[1:])
+    + "\nWHERE api_requests.source='jsonl'"
+      " AND excluded.output_tokens >= api_requests.output_tokens")
+
+
+def _with_context(vals):
+    """context_tokens, computed at insert when the caller did not supply it."""
+    if vals[_CTX_IDX] is None:
+        vals[_CTX_IDX] = sum((vals[i] or 0) for i in _TOKEN_IDX)
+    return vals
 
 
 def upsert_request(con, row, source):
-    """row: dict with api_requests columns (minus source). OTel wins conflicts."""
-    vals = [row.get(c) for c in REQUEST_COLS]
+    """One api_requests row from a dict of column names. OTel wins conflicts.
+
+    Unknown-to-the-caller columns default to NULL, so a producer written
+    against an older schema keeps working.
+    """
+    vals = _with_context([row.get(c) for c in REQUEST_COLS])
     con.execute(REQUEST_SQL_OTEL if source == "otel" else REQUEST_SQL_JSONL,
                 vals)
 
 
 def insert_requests_jsonl(con, rows):
-    """Batch of REQUEST_COLS-ordered tuples from transcripts (OTel rows win)."""
-    con.executemany(REQUEST_SQL_JSONL, rows)
+    """Batch of REQUEST_COLS-ordered tuples (or dicts) from transcripts."""
+    width = len(REQUEST_COLS)
+
+    def prepared():
+        for row in rows:
+            if isinstance(row, dict):
+                yield _with_context([row.get(c) for c in REQUEST_COLS])
+            else:
+                yield _with_context(list(_pad(row, width)))
+
+    con.executemany(REQUEST_SQL_JSONL, prepared())
 
 
+TOOL_CALL_COLS = ("tool_use_id", "prompt_id", "session_id", "ts", "tool_name",
+                  "agent_name", "source", "detail",
+                  # v8
+                  "input_bytes", "result_bytes", "is_error", "duration_ms",
+                  "error_type")
+
+# The two sources know different halves of a tool call: the transcript has the
+# input and result bytes and the specific name, OTel has the duration and the
+# error type. Neither is ever authoritative over the other, so each write fills
+# NULLs and leaves everything already known alone.
 TOOL_CALL_SQL = """INSERT INTO tool_calls
-           (tool_use_id, prompt_id, session_id, ts, tool_name, agent_name, source, detail)
-           VALUES (?,?,?,?,?,?,?,?)
+           (tool_use_id, prompt_id, session_id, ts, tool_name, agent_name, source, detail,
+            input_bytes, result_bytes, is_error, duration_ms, error_type)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(tool_use_id) DO UPDATE SET
              tool_name = CASE
                WHEN tool_calls.tool_name = 'mcp_tool'
                     AND excluded.tool_name LIKE 'mcp__%'
                THEN excluded.tool_name ELSE tool_calls.tool_name END,
-             detail = COALESCE(tool_calls.detail, excluded.detail)"""
+             detail       = COALESCE(tool_calls.detail, excluded.detail),
+             input_bytes  = COALESCE(tool_calls.input_bytes, excluded.input_bytes),
+             result_bytes = COALESCE(tool_calls.result_bytes, excluded.result_bytes),
+             is_error     = COALESCE(tool_calls.is_error, excluded.is_error),
+             duration_ms  = COALESCE(tool_calls.duration_ms, excluded.duration_ms),
+             error_type   = COALESCE(tool_calls.error_type, excluded.error_type)"""
 
 
 def insert_tool_call(con, tool_use_id, prompt_id, session_id, ts, tool_name,
-                     agent_name, source, detail=None):
+                     agent_name, source, detail=None, input_bytes=None,
+                     result_bytes=None, is_error=None, duration_ms=None,
+                     error_type=None):
     # OTel tool_result events name MCP calls generically ('mcp_tool') and know
     # nothing of skill names; the transcript carries the specifics. On conflict,
-    # let a specific name upgrade the generic one and fill a missing detail.
+    # let a specific name upgrade the generic one and fill missing fields.
     con.execute(
         TOOL_CALL_SQL,
         (tool_use_id, prompt_id, session_id, ts, tool_name, agent_name, source,
-         detail),
+         detail, input_bytes, result_bytes, is_error, duration_ms, error_type),
     )
 
 
 def insert_tool_calls(con, rows):
     """Batch of TOOL_CALL_SQL parameter tuples, applied in order."""
-    con.executemany(TOOL_CALL_SQL, rows)
+    width = len(TOOL_CALL_COLS)
+    con.executemany(TOOL_CALL_SQL, (_pad(r, width) for r in rows))
+
+
+AGENT_SQL = """INSERT INTO agents
+           (agent_id, session_id, prompt_id, ts, subagent_type,
+            requested_model, resolved_model, description, tool_use_id, source)
+           VALUES (?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(agent_id) DO UPDATE SET
+             session_id      = COALESCE(agents.session_id, excluded.session_id),
+             prompt_id       = COALESCE(agents.prompt_id, excluded.prompt_id),
+             ts              = COALESCE(agents.ts, excluded.ts),
+             subagent_type   = COALESCE(agents.subagent_type, excluded.subagent_type),
+             requested_model = COALESCE(agents.requested_model, excluded.requested_model),
+             resolved_model  = COALESCE(agents.resolved_model, excluded.resolved_model),
+             description     = COALESCE(agents.description, excluded.description),
+             tool_use_id     = COALESCE(agents.tool_use_id, excluded.tool_use_id)"""
+
+AGENT_COLS = ("agent_id", "session_id", "prompt_id", "ts", "subagent_type",
+              "requested_model", "resolved_model", "description",
+              "tool_use_id", "source")
+
+
+def upsert_agent(con, agent_id, session_id=None, prompt_id=None, ts=None,
+                 subagent_type=None, requested_model=None, resolved_model=None,
+                 description=None, tool_use_id=None, source="jsonl"):
+    """One subagent launch. The launch and its result are two transcript
+    entries and the subagent's own file is a third, so every write fills gaps
+    rather than replacing what an earlier one already established."""
+    con.execute(AGENT_SQL, (agent_id, session_id, prompt_id, ts, subagent_type,
+                            requested_model, resolved_model, description,
+                            tool_use_id, source))
+
+
+def upsert_agents(con, rows):
+    """Batch of AGENT_SQL parameter tuples."""
+    width = len(AGENT_COLS)
+    con.executemany(AGENT_SQL, (_pad(r, width) for r in rows))
+
+
+# session_events has no natural key, so re-ingesting a transcript would
+# otherwise multiply its events; idx_events_uniq makes the whole tuple the
+# identity and this insert is a no-op on the second pass.
+EVENT_SQL = """INSERT OR IGNORE INTO session_events
+           (session_id, prompt_id, ts, kind, detail, value)
+           VALUES (?,?,?,?,?,?)"""
+
+EVENT_COLS = ("session_id", "prompt_id", "ts", "kind", "detail", "value")
+
+
+def insert_event(con, session_id, ts, kind, prompt_id=None, detail=None,
+                 value=None):
+    con.execute(EVENT_SQL, (session_id, prompt_id, ts, kind, detail, value))
+
+
+def insert_events(con, rows):
+    """Batch of EVENT_SQL parameter tuples (session_id, prompt_id, ts, kind,
+    detail, value)."""
+    width = len(EVENT_COLS)
+    con.executemany(EVENT_SQL, (_pad(r, width) for r in rows))
 
 
 EDIT_SQL = """INSERT OR IGNORE INTO edits
@@ -382,19 +669,40 @@ def set_run_cost(con, session_id, cost_usd, runs, source):
         (session_id, cost_usd, runs, source))
 
 
-def upsert_session(con, session_id, project=None, cwd=None, source_label=None):
+def upsert_session(con, session_id, project=None, cwd=None, source_label=None,
+                   git_branch=None, cli_version=None, entrypoint=None,
+                   permission_mode=None, transcript_path=None, first_ts=None,
+                   last_ts=None):
     # source_label is authoritative on every write: it names the Claude
     # directory the transcript was just read from, so a session whose origin
     # is renamed (a host alias changed in ~/.ssh/config, a folder relabeled)
     # re-labels instead of keeping a stale prefix. NULL = caller doesn't know.
+    #
+    # The v8 descriptors follow "last seen wins" where the answer can change
+    # during a session (branch, CLI version, permission mode) and MIN/MAX for
+    # the timestamps, so a transcript ingested in two passes still reports the
+    # full span.
     con.execute(
-        """INSERT INTO sessions (session_id, project, cwd, source_label)
-           VALUES (?,?,?,COALESCE(?,''))
+        """INSERT INTO sessions (session_id, project, cwd, source_label,
+             git_branch, cli_version, entrypoint, permission_mode,
+             transcript_path, first_ts, last_ts)
+           VALUES (?,?,?,COALESCE(?,''),?,?,?,?,?,?,?)
            ON CONFLICT(session_id) DO UPDATE SET
              project      = COALESCE(sessions.project, excluded.project),
              cwd          = COALESCE(sessions.cwd, excluded.cwd),
-             source_label = COALESCE(?, sessions.source_label)""",
-        (session_id, project, cwd, source_label, source_label),
+             source_label = COALESCE(?, sessions.source_label),
+             git_branch      = COALESCE(excluded.git_branch, sessions.git_branch),
+             cli_version     = COALESCE(excluded.cli_version, sessions.cli_version),
+             entrypoint      = COALESCE(excluded.entrypoint, sessions.entrypoint),
+             permission_mode = COALESCE(excluded.permission_mode, sessions.permission_mode),
+             transcript_path = COALESCE(excluded.transcript_path, sessions.transcript_path),
+             first_ts = MIN(COALESCE(excluded.first_ts, sessions.first_ts),
+                            COALESCE(sessions.first_ts, excluded.first_ts)),
+             last_ts  = MAX(COALESCE(excluded.last_ts, sessions.last_ts),
+                            COALESCE(sessions.last_ts, excluded.last_ts))""",
+        (session_id, project, cwd, source_label, git_branch, cli_version,
+         entrypoint, permission_mode, transcript_path, first_ts, last_ts,
+         source_label),
     )
 
 

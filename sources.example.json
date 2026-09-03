@@ -7,6 +7,9 @@
   "scan_sibling_claude_dirs": true,
   "depth": 4,
 
+  "_db_comment": "Where metrics.db lives. Read by every entry point (--db and $CLAUDE_LENS_DB override it). Point it at local disk if this checkout sits on a network share: SQLite's write-ahead log is not reliable there.",
+  "db": "C:/claude-lens/metrics.db",
+
   "_cowork_comment": "Claude Desktop's Cowork sessions are auto-detected at the platform path; set false to skip, or give explicit stores.",
   "cowork": true,
   "cowork_paths": [],

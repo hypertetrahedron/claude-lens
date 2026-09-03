@@ -154,13 +154,34 @@ sources, since it reconciles on its own schedule:
   "ssh_timeout": 300,
   "remote_budget": 600,
   "cowork": true,
-  "cowork_paths": []
+  "cowork_paths": [],
+  "db": "C:/claude-lens/metrics.db"
 }
 ```
 
 CLI flags add to this file rather than replacing it. The three timing keys
 bound how long a bad host may make anything wait — see
 [A broken remote must never cost you anything](#a-broken-remote-must-never-cost-you-anything).
+
+### Where the database lives
+
+`metrics.db` sits next to the scripts by default. Every entry point
+(`jsonl_ingest.py`, `build_dashboard.py`, `digest.py`, `receiver.py`,
+`check_live.py`, `report_index.py`) takes `--db PATH` to put it somewhere
+else, and resolves the location the same way:
+
+| Order | Source |
+|---|---|
+| 1 | `--db PATH` on the command line |
+| 2 | the `CLAUDE_LENS_DB` environment variable |
+| 3 | the `"db"` key in `sources.json` |
+| 4 | `metrics.db` beside the scripts |
+
+The reason to move it: SQLite's write-ahead log is not reliable on a network
+share, and a checkout that lives on one will eventually meet a transient
+`disk I/O error`. Point `"db"` at local disk and leave the reports on the
+share. The setting is read by every entry point, so setting it once in
+`sources.json` moves the database for the background receiver too.
 
 ### How remote collection works
 
@@ -261,6 +282,52 @@ Upgrading re-parses every transcript once (schema v5) to backfill what earlier
 versions dropped. On the machine this was developed against, one older remote
 went from 209 recorded API requests to 1,201, and from 25K output tokens to
 917K.
+
+## What a prompt row actually says
+
+### The text
+
+A prompt is not always one block of text. Working through the IDE extension,
+what reaches the transcript is *several* text blocks: one or more envelopes
+describing the editor's state, then the sentence the person typed.
+
+```
+<ide_opened_file>The user opened the file /very/long/path/to/module.py in
+the IDE. This may or may not be related to the current task.</ide_opened_file>
+rename the widget factory
+```
+
+Claude Lens drops the envelopes -- `<ide_opened_file>`, `<ide_selection>`,
+`<ide_diagnostics>`, any other `<ide_...>` wrapper, and `<system-reminder>` --
+and stores what is left. Before it did, every IDE-driven prompt was stored
+envelope-first, so the dashboard showed rows of identical "The user opened the
+file..." text and searching for a phrase someone had typed found nothing.
+
+If a turn is *nothing but* an envelope, the envelope's contents are stored
+rather than an empty string: a row that says something is more use than a
+blank one. A turn is treated as harness-injected only when every one of its
+text blocks is an envelope or a known harness opener.
+
+### The kind
+
+Not every prompt was typed. `prompts.kind` says which is which:
+
+| kind | What it is |
+|---|---|
+| `human` | someone typed it (`origin.kind == "human"`); `injected = 0` |
+| `task-notification` | a background agent reporting back |
+| `coordinator` | a coordinating agent driving the session |
+| `loop` | a turn dispatched by `/loop` |
+| `scheduled` | a turn dispatched by a schedule or cron routine |
+| `team` | a message from another Claude session |
+| `other` | marked as non-human by a marker this version does not know |
+
+Everything but `human` is stored with `injected = 1` and a `canonical_id`
+pointing at the most recent human prompt at or before it, so its cost is
+folded into the turn that caused it. This matters most for background agents:
+their transcripts are attributed to the `<task-notification>` prompt, not to
+the prompt you typed, and without the fold their spend appears as rows nobody
+recognises.
 
 ## Pricing and cost estimates
 
@@ -695,10 +762,31 @@ counterfactual.
 ## File-change tracking
 
 Files / Lines ± / chars per prompt come from the `structuredPatch` diffs that
-Edit/Write tool results leave in transcripts (subagent edits included).
-Changes made via Bash (git operations, scripts, generators) leave no diff in
-transcripts and aren't counted. These columns update on ingest/reconcile, not
-via OTel (its tool events carry no diffs).
+Edit/Write tool results leave in transcripts. Changes made via Bash (git
+operations, scripts, generators) leave no diff in transcripts and aren't
+counted. These columns update on ingest/reconcile, not via OTel (its tool
+events carry no diffs).
+
+**Subagent edits and the undo history.** A subagent's transcript records its
+Edit and Write *calls* but not their results — there is no `toolUseResult` on
+those turns, so there is no `structuredPatch` to measure. What Claude Code
+does keep is its own undo history:
+
+```
+~/.claude/file-history/<session-id>/<hash>@v<N>
+```
+
+a complete copy of a file at each checkpoint, where `<hash>` is the first 16
+hex digits of the SHA-256 of the file's absolute path. Where two consecutive
+versions of a file survive, Claude Lens diffs them and records the change with
+`edits.source = 'file-history'`. It only does so for sessions that actually
+have unmeasured subagent edits, and only for files that session has no `edits`
+row for at all, so nothing is counted twice.
+
+Recovery is best-effort by nature: only the newest version or two of a file is
+kept, so the earliest change to a file usually has no earlier version to diff
+against, and a run of edits between two checkpoints is recovered as one net
+change attributed to the prompt open at the later checkpoint. See ROADMAP.md.
 
 ## Database versioning
 
@@ -722,6 +810,7 @@ add a changelog line in `db.py` and below.
 | 5 | No column change — clears `ingest_state` to force one re-parse of every transcript, backfilling usage that older formats had dropped (see [Older transcript formats](#older-transcript-formats)) |
 | 6 | `sessions.title` (the name Claude Desktop gives a session), `run_cost` (a CLI-reported cost per session, spent only where it provably covers every run), and an index on `api_requests.session_id` |
 | 7 | `api_requests.provider` and `.model_raw` — model ids are stored canonically with the original kept alongside, so Bedrock and Vertex ids resolve against the pricing table. Existing rows are normalised in place |
+| 8 | Per-request detail: `api_requests` gains `effort`, `speed`, `thinking_tokens`, `stop_reason`, `server_tool_requests`, `service_tier`, `inference_geo`, `context_tokens`, `cost_basis` and `error`; `tool_calls` gains `input_bytes`, `result_bytes`, `is_error`, `duration_ms` and `error_type`; `sessions` gains `git_branch`, `cli_version`, `entrypoint`, `permission_mode`, `transcript_path`, `first_ts` and `last_ts`; `prompts` gains `kind`. New tables `agents` (one row per subagent launch, with the requested and resolved model) and `session_events` (context readings, compactions, model/effort/speed switches). Transcript rows stop being insert-or-ignore: a re-parse may raise an existing transcript row but never lower it, and never touches an OTel row. Clears `ingest_state` to force that re-parse, and strips the `agent-` filename prefix from `agent_name` so subagent rows join `agents` |
 
 ## Known limitations
 
