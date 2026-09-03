@@ -1017,15 +1017,35 @@ class TemplateWiring(unittest.TestCase):
     def test_project_runs_are_marked_only_under_a_project_sort(self):
         """Consecutive rows of one project are otherwise indistinguishable."""
         self.assertIn('const byProject = state.sort === "project";', self.html)
-        self.assertIn('tr.classList.add("proj-start")', self.html)
+        self.assertIn('tr.classList.add("proj-start", tint(run))', self.html)
         # the styling, including the no-double-rule-under-the-header case
-        self.assertIn("tr.proj-start > td { border-top: 2px solid var(--baseline); }",
+        self.assertIn("tr.proj-start > td { border-top: 2px solid var(--pj, var(--baseline)); }",
                       self.html)
         self.assertIn("tbody tr.proj-start:first-child > td { border-top: 0; }",
                       self.html)
         # the project cell must be targetable to un-mute it on a boundary row
         self.assertIn('el("td", "muted proj", projLabel(r.project))', self.html)
         self.assertIn("tr.proj-start > td.proj", self.html)
+
+    def test_each_project_block_gets_its_own_colour(self):
+        """The banding is what makes one project's block end visibly."""
+        # eight slots, taken in turn and cycled - the class the row wears
+        self.assertIn("const PROJ_TINTS = 8;", self.html)
+        self.assertIn('const tint = (i) => "pj-" + (i % PROJ_TINTS + 1);', self.html)
+        self.assertIn('el("tr", "group-row " + tint(gi))', self.html)
+        self.assertIn('tr.classList.add("proj-start", tint(run))', self.html)
+        for n in range(1, 9):
+            self.assertIn("tr.pj-%d { --pj: var(--proj-%d); }" % (n, n), self.html)
+        # every theme block defines the full scale: light, OS-dark, toggled dark
+        for token in ("--proj-1:", "--proj-8:", "--proj-wash:"):
+            self.assertEqual(self.html.count(token), 3, token)
+        # the tint must come after the plain wash, or the cascade drops it -
+        # and the plain wash must survive, since it is the fallback wherever
+        # color-mix is unsupported (the declaration is dropped at parse time)
+        plain = self.html.index("tr.group-row { cursor: pointer; background: var(--hover-wash); }")
+        tinted = self.html.index(
+            "tr.group-row { background: color-mix(in srgb, var(--pj, transparent)")
+        self.assertLess(plain, tinted)
 
     def test_hidden_attribute_is_not_defeated_by_a_display_rule(self):
         """#chart-legend { display: flex } outranked [hidden] and beat it."""
@@ -1154,6 +1174,64 @@ class RemoteExtract(unittest.TestCase):
         """Guard against bashisms creeping into the script sent to remotes."""
         for bashism in ("[[", "function ", "$'", "&>"):
             self.assertNotIn(bashism, sources.REMOTE_SH)
+
+    @unittest.skipIf(os.name == "nt", "the script needs a POSIX sh/find/tar")
+    def test_remote_script_collects_docker_host_mounts(self):
+        """`~/.claude-<project>/data/projects` must be collected, not skipped.
+
+        A container's `~/.claude` bind-mounted to `~/.claude-<project>/data`
+        on the host puts projects/ one level below the `.claude*` match, where
+        find's -prune has already stopped the walk.
+        """
+        tmp = tempfile.mkdtemp(prefix="claude-lens-remote-")
+        try:
+            for rel in (".claude/projects/p1/a.jsonl",
+                        ".claude-whisper/data/projects/p2/b.jsonl",
+                        ".claude-template/data/projects/p3/c.jsonl"):
+                path = os.path.join(tmp, rel)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("{}\n")
+            # a .claude* directory with no transcripts anywhere below it
+            os.makedirs(os.path.join(tmp, ".claude-empty", "data", "other"))
+            archive = os.path.join(tmp, "out.tar.gz")
+            env = dict(os.environ, HOME=tmp)
+            with open(archive, "wb") as out:
+                proc = subprocess.run(
+                    ["/bin/sh", "-c", sources.REMOTE_SH, "sh", "3", "0"],
+                    stdout=out, stderr=subprocess.PIPE, env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with tarfile.open(archive) as tar:
+                names = sorted(m.name.lstrip("./") for m in tar if m.isfile())
+            self.assertEqual(names, [
+                ".claude-template/data/projects/p3/c.jsonl",
+                ".claude-whisper/data/projects/p2/b.jsonl",
+                ".claude/projects/p1/a.jsonl",
+            ])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_docker_mount_roots_are_labeled_by_project(self):
+        """Two mounts on one host must not both come back as `host/data`."""
+        self.assertEqual(sources._label_for("/cache/box/.claude", "box"), "box")
+        self.assertEqual(
+            sources._label_for("/cache/box/.claude-work", "box"), "box/.claude-work")
+        self.assertEqual(
+            sources._label_for("/cache/box/.claude-whisper/data", "box"),
+            "box/.claude-whisper")
+        # a root that is neither named .claude* nor sitting under one keeps
+        # its own folder name - a backup directory, say
+        self.assertEqual(sources._label_for("/cache/box/backup", "box"),
+                         "box/backup")
+
+    def test_docker_mount_roots_do_not_collide(self):
+        roots, taken = [], set()
+        for name in (".claude-whisper", ".claude-template"):
+            sources._add_root(roots, taken,
+                              os.path.join("/cache", "box", name, "data"),
+                              "remote", host="box")
+        self.assertEqual([r.label for r in roots],
+                         ["box/.claude-whisper", "box/.claude-template"])
 
 
 class FailureBackoff(unittest.TestCase):

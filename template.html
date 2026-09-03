@@ -33,6 +33,23 @@
     --iron-3:         #cc3a17;
     --iron-4:         #b87b00;
     --iron-other:     #8a8880;
+    /* Project banding for the table. The eight categorical hues in the fixed
+       order that clears the colour-vision and normal-vision separation floors
+       in both themes; each project's block takes the next one in turn. This is
+       a separator, not an identity: there are more projects than hues, so the
+       order cycles and two distant projects can share a colour. What has to
+       differ is neighbours, and consecutive slots always do. */
+    --proj-1:         #2a78d6;
+    --proj-2:         #eb6834;
+    --proj-3:         #1baf7a;
+    --proj-4:         #eda100;
+    --proj-5:         #e87ba4;
+    --proj-6:         #008300;
+    --proj-7:         #4a3aa7;
+    --proj-8:         #e34948;
+    /* How much of that hue the header row's wash carries. Dark needs more:
+       the same mix disappears into a near-black surface. */
+    --proj-wash:      16%;
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
@@ -56,6 +73,15 @@
       --iron-3:         #ef6a1a;
       --iron-4:         #ffcf4d;
       --iron-other:     #6f6d66;
+      --proj-1:         #3987e5;
+      --proj-2:         #d95926;
+      --proj-3:         #199e70;
+      --proj-4:         #c98500;
+      --proj-5:         #d55181;
+      --proj-6:         #008300;
+      --proj-7:         #9085e9;
+      --proj-8:         #e66767;
+      --proj-wash:      24%;
     }
   }
   :root[data-theme="dark"] {
@@ -79,6 +105,15 @@
     --iron-3:         #ef6a1a;
     --iron-4:         #ffcf4d;
     --iron-other:     #6f6d66;
+    --proj-1:         #3987e5;
+    --proj-2:         #d95926;
+    --proj-3:         #199e70;
+    --proj-4:         #c98500;
+    --proj-5:         #d55181;
+    --proj-6:         #008300;
+    --proj-7:         #9085e9;
+    --proj-8:         #e66767;
+    --proj-wash:      24%;
   }
 
   /* The hidden attribute only hides via a UA rule of attribute specificity,
@@ -219,14 +254,33 @@
     overflow: hidden; color: var(--text-primary);
   }
   tr.open td.prompt .txt { -webkit-line-clamp: unset; }
+  /* One project's colour, handed to the rows that start its block. Assigned
+     in display order and cycled, so two projects next to each other never
+     share a slot; see the --proj-* note above for why the colour is a
+     separator rather than a name. */
+  tr.pj-1 { --pj: var(--proj-1); }
+  tr.pj-2 { --pj: var(--proj-2); }
+  tr.pj-3 { --pj: var(--proj-3); }
+  tr.pj-4 { --pj: var(--proj-4); }
+  tr.pj-5 { --pj: var(--proj-5); }
+  tr.pj-6 { --pj: var(--proj-6); }
+  tr.pj-7 { --pj: var(--proj-7); }
+  tr.pj-8 { --pj: var(--proj-8); }
   /* First row of each project when the table is sorted by project: a rule
-     above it and its name un-muted, so runs of one project are separable at a
-     glance. No rule on the very first body row - the header already draws
-     one there. */
-  tr.proj-start > td { border-top: 2px solid var(--baseline); }
+     above it in that project's colour and its name un-muted, so runs of one
+     project are separable at a glance. No rule on the very first body row -
+     the header already draws one there. */
+  tr.proj-start > td { border-top: 2px solid var(--pj, var(--baseline)); }
   tbody tr.proj-start:first-child > td { border-top: 0; }
   tr.proj-start > td.proj { color: var(--text-primary); font-weight: 600; }
   tr.group-row { cursor: pointer; background: var(--hover-wash); }
+  /* The tinted header is the whole point of the banding, but a browser without
+     color-mix must not be left with no highlight at all - hence the plain wash
+     above, which stands if this declaration is dropped at parse time. The wash
+     is faint by design: the row's own text carries the name, the colour only
+     says "a different project starts here". */
+  tr.group-row { background: color-mix(in srgb, var(--pj, transparent) var(--proj-wash), var(--surface-1)); }
+  tr.group-row > td:first-child { box-shadow: inset 4px 0 0 var(--pj, transparent); }
   tr.group-row td { font-weight: 600; color: var(--text-primary); border-bottom: 1px solid var(--baseline); }
   tr.group-row .cnt { color: var(--text-muted); font-weight: 400; }
   .pill {
@@ -974,6 +1028,13 @@ function shortModel(m) {
   return m.replace(/^claude-/, "").replace(/-\d{8}$/, "");
 }
 
+/* The colour a project's block wears in the table: the --proj-* slots taken in
+   display order and cycled, so consecutive projects always differ. It marks
+   where one project ends, nothing more - the same colour recurs further down
+   the list once there are more projects than slots. */
+const PROJ_TINTS = 8;
+const tint = (i) => "pj-" + (i % PROJ_TINTS + 1);
+
 function appendRow(body, r) {
     const tr = el("tr", "data-row");
     for (const c of visibleCols()) tr.append(c.cell(r));
@@ -998,12 +1059,12 @@ function renderTable(rs) {
        nothing is marked there. Grouped mode never reaches this branch; its
        header rows already do the separating. */
     const byProject = state.sort === "project";
-    let prev = null;
+    let prev = null, run = -1;
     sorted.slice(0, 500).forEach((r, i) => {
       const tr = appendRow(body, r);
       if (!byProject) return;
       const name = projLabel(r.project);
-      if (i === 0 || name !== prev) tr.classList.add("proj-start");
+      if (i === 0 || name !== prev) { run++; tr.classList.add("proj-start", tint(run)); }
       prev = name;
     });
     return;
@@ -1018,8 +1079,8 @@ function renderTable(rs) {
   }
   const order = [...groups.entries()].sort((a, b) =>
     b[1].reduce((s, r) => s + r.cost, 0) - a[1].reduce((s, r) => s + r.cost, 0));
-  for (const [proj, list] of order) {
-    const gtr = el("tr", "group-row");
+  order.forEach(([proj, list], gi) => {
+    const gtr = el("tr", "group-row " + tint(gi));
     const cols = visibleCols();
     // label cell spans the leading columns that have no subtotal
     let firstSub = cols.findIndex(c => c.groupVal);
@@ -1043,7 +1104,7 @@ function renderTable(rs) {
           sib.style.display = hide ? "none" : "";
       }
     });
-  }
+  });
 }
 
 /* ---------- column configuration panel ---------- */

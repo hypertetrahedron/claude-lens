@@ -56,7 +56,7 @@ The places looked at:
 | Primary `~/.claude` | `CLAUDE_CONFIG_DIR`, else `~/.claude` | none (names unchanged) |
 | Sibling directories | any `.claude*` folder next to the primary one, searched to the same depth as an extra location | the folder name |
 | Extra locations | each configured path searched a few levels deep | the folder name, or its parent when the folder is just `.claude` |
-| Remote machines | SSH, from `~/.ssh/config` or an explicit list | the host name |
+| Remote machines | SSH, from `~/.ssh/config` or an explicit list | the host name, plus the directory name when a machine has more than one |
 | **Cowork** | Claude Desktop's session store, auto-detected | `cowork` |
 
 A directory counts as a Claude directory when it has a `projects/`
@@ -163,6 +163,11 @@ like a local directory.
 - **Incremental.** Only transcripts modified since the last successful fetch
   are sent (with an hour of slack for clock skew). The first fetch from a busy
   machine is the slow one.
+- **Container mounts.** `projects/` is also looked for one level below the
+  match, which is where a Docker host-mount puts it: a container's `~/.claude`
+  bound to `~/.claude-<project>/data` on the host. Each such mount is labeled
+  after its `.claude-<project>` folder, so several on one machine stay
+  distinct instead of all being called `data`.
 - **Read-only and quiet.** Nothing is written on the remote, and no `sudo` is
   used. Only `*.jsonl` transcripts are transferred — no settings, no
   credentials.
@@ -513,13 +518,18 @@ counterfactual.
 - **Session names** — sessions started from Claude Desktop carry the title
   the app shows. Add the optional **Session** column to see it.
 - **Project runs when sorted by project** — sort by the Project column and
-  the first row of each project gets a rule above it and its name un-muted, so
-  a run of one project is separable from the next at a glance. Only under that
-  sort: under any other, the rows are not grouped by project and such a rule
-  would divide nothing.
+  the first row of each project gets a rule above it, in that project's colour,
+  and its name un-muted, so a run of one project is separable from the next at a
+  glance. Only under that sort: under any other, the rows are not grouped by
+  project and such a rule would divide nothing.
 - **Group by project** — subtotal header rows, ordered by cost, click to
   collapse; subtotals follow the configured columns (rates aggregate at the
-  group level).
+  group level). Each header wears its own colour — a tinted row and a bar down
+  its left edge — so where one project's block ends is obvious. The colours are
+  eight hues taken in turn and cycled, chosen to stay distinguishable to
+  colour-blind readers in both themes; they mark a boundary rather than name a
+  project, so with more than eight projects on screen two distant blocks share
+  one. Neighbours never do.
 - **Export CSV** — the current filtered/sorted view, incl. cost components.
 - **Notices** — if a build embedded only the newest N prompts, or withheld
   prompt text, the page says so rather than quietly showing less.
