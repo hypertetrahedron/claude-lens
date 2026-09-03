@@ -1111,6 +1111,50 @@ class TemplateWiring(unittest.TestCase):
         self.assertIn("const g = projLabel(r.project);", self.html)
         self.assertIn("esc(projLabel(r.project))", self.html)
 
+    def test_view_switch_is_wired(self):
+        """The Prompts/Sessions toggle and its state must exist and persist."""
+        self.assertIn('id="view-seg"', self.html)
+        self.assertIn('data-view="prompts"', self.html)
+        self.assertIn('data-view="sessions"', self.html)
+        self.assertIn("function initViewSwitch", self.html)
+        self.assertIn("function renderView", self.html)
+        self.assertIn('const VIEWS = ["prompts", "sessions"]', self.html)
+        # the view must round-trip through localStorage like the other filters
+        self.assertIn("cols: state.cols, view: state.view", self.html)
+
+    def test_sessions_table_is_wired(self):
+        self.assertIn('id="sess-tbl"', self.html)
+        self.assertIn('id="sess-body"', self.html)
+        self.assertIn('id="sess-head"', self.html)
+        self.assertIn('id="sessions-card"', self.html)
+        self.assertIn("function renderSessions", self.html)
+        self.assertIn("function toggleSessionDetail", self.html)
+        self.assertIn("function setSessionFilter", self.html)
+        # the session detail's "Show prompts" escape hatch must exist
+        self.assertIn('el("button", "btn", "Show prompts")', self.html)
+        self.assertIn('id="session-chip"', self.html)
+
+    def test_new_chart_keys_are_registered(self):
+        """blocks/heat use their own draw(); ctx/miss ride the day-bucket path."""
+        for key in ("blocks", "heat", "ctx", "miss"):
+            self.assertIn('value="%s"' % key, self.html)
+        self.assertIn("blocks:{ title: \"Cost per 5-hour billing block\", draw: drawBlocks }",
+                      self.html)
+        self.assertIn('heat:  { title: "Daily cost", draw: drawHeatmap }', self.html)
+        self.assertIn("function drawBlocks", self.html)
+        self.assertIn("function drawHeatmap", self.html)
+        self.assertIn("if (chart.draw) { chart.draw(wrap, rs); return; }", self.html)
+
+    def test_notices_are_rendered(self):
+        self.assertIn("for (const n of (DATA.notices || [])) bits.push(String(n));",
+                      self.html)
+
+    def test_session_rows_are_keyboard_reachable(self):
+        """A session row must be tabbable and answer Enter/Space like a click."""
+        self.assertIn("tr.tabIndex = 0;", self.html)
+        self.assertIn('if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return;',
+                      self.html)
+
 
 class SshConfig(unittest.TestCase):
     def test_hosts_and_includes(self):

@@ -128,6 +128,23 @@
     padding: 5px 8px; font: inherit; font-size: 13px;
   }
   .filters input { min-width: 220px; }
+  /* Active cross-view filter (currently only "prompts of one session"). It
+     lives in the filter bar rather than beside the table because it survives
+     a view switch, and a filter you cannot see is a bug report waiting to
+     happen. */
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 999px; padding: 3px 6px 3px 10px;
+    color: var(--text-secondary); font-size: 12px; max-width: 340px;
+  }
+  .chip .chip-x {
+    background: none; border: 0; color: var(--text-muted); cursor: pointer;
+    font: inherit; font-size: 13px; line-height: 1; padding: 1px 5px;
+    border-radius: 999px;
+  }
+  .chip .chip-x:hover { background: var(--hover-wash); color: var(--text-primary); }
+  .chip .chip-t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 16px; }
   .tile {
@@ -158,6 +175,38 @@
   .sw-i1 { background: var(--iron-1); } .sw-i2 { background: var(--iron-2); }
   .sw-i3 { background: var(--iron-3); } .sw-i4 { background: var(--iron-4); }
   .sw-io { background: var(--iron-other); }
+  /* Cache-miss causes. These are categories, not magnitudes, so they use the
+     categorical series palette rather than the ironbow ramp - a ramp would
+     imply "idle gap is worse than a model switch", which is not a thing this
+     page knows. c-0 is the unknown cause, deliberately the muted grey. */
+  .c-1 { fill: var(--series-1); } .c-2 { fill: var(--series-2); }
+  .c-3 { fill: var(--series-3); } .c-4 { fill: var(--series-4); }
+  .c-5 { fill: var(--series-5); } .c-0 { fill: var(--text-muted); }
+  .sw-c1 { background: var(--series-1); } .sw-c2 { background: var(--series-2); }
+  .sw-c3 { background: var(--series-3); } .sw-c4 { background: var(--series-4); }
+  .sw-c5 { background: var(--series-5); } .sw-c0 { background: var(--text-muted); }
+  /* Context-growth chart. The stacked area sums to the context total, so the
+     line on top is the context curve itself rather than a fourth series. */
+  .ctx-svg { display: block; width: 100%; }
+  .ctx-line { fill: none; stroke: var(--text-primary); stroke-width: 1.2; }
+  .ctx-miss { stroke: var(--surface-1); stroke-width: 1; }
+  .ev-line { stroke: var(--text-secondary); stroke-width: 1; stroke-dasharray: 3 2; }
+  .ev-hit { stroke: transparent; stroke-width: 7; cursor: pointer; }
+  .mini-legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 11px;
+    color: var(--text-secondary); margin: 6px 0 0; }
+  .mini-legend .sw { display: inline-block; width: 9px; height: 9px;
+    border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  /* Calendar heatmap: an empty day is the gridline colour, not a missing
+     cell, so the shape of the calendar survives a quiet fortnight. */
+  .heat-0 { fill: var(--grid); }
+  .sw-heat0 { background: var(--grid); }
+  .heat-cell { cursor: pointer; }
+  .heat-cell:focus { outline: 1px solid var(--text-primary); outline-offset: 1px; }
+  .streak { color: var(--text-secondary); font-size: 12px; margin-top: 8px; }
+  .streak b { color: var(--text-primary); }
+  /* The open 5h block, outlined rather than recoloured: its colour already
+     means "cost" like every other bar's does. */
+  .blk-active { stroke: var(--text-primary); stroke-width: 1.5; }
   .bar-hit { fill: transparent; cursor: pointer; }
   .bar-hit:hover + .bar, .bar.hot { opacity: 0.8; }
   #chart-legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-secondary); margin: 0 0 6px; }
@@ -242,6 +291,12 @@
   .detail table { width: auto; font-size: 12.5px; }
   .detail td, .detail th { padding: 3px 10px 3px 0; border-bottom: none; cursor: default; position: static; }
   .detail th { color: var(--text-muted); }
+  /* A section that must own the whole row rather than share it with the
+     others: the context chart is a time axis and reads as nonsense squeezed
+     into a flex column. */
+  .detail .wide { flex: 1 0 100%; min-width: 0; }
+  .detail .scroll-y { max-height: 220px; overflow-y: auto; }
+  tr.sess-row:focus { outline: 2px solid var(--series-1); outline-offset: -2px; }
   .empty { color: var(--text-muted); padding: 24px; text-align: center; }
   footer { color: var(--text-muted); font-size: 11px; margin-top: 8px; }
 </style>
@@ -258,6 +313,10 @@
   <div id="notice" class="notice" hidden></div>
 
   <div class="filters">
+    <span class="seg" id="view-seg" role="group" aria-label="View">
+      <button data-view="prompts" aria-pressed="true">Prompts</button>
+      <button data-view="sessions">Sessions</button>
+    </span>
     <span class="seg" id="range-seg" role="group" aria-label="Date range">
       <button data-range="1">Today</button>
       <button data-range="7">7d</button>
@@ -269,7 +328,8 @@
     <select id="f-kind" aria-label="Product" hidden></select>
     <select id="f-project" aria-label="Project"></select>
     <select id="f-model" aria-label="Model"></select>
-    <input id="f-search" type="search" placeholder="Search prompt text…" aria-label="Search prompts">
+    <input id="f-search" type="search" placeholder="Search prompts and sessions…" aria-label="Search prompts and sessions">
+    <span class="chip" id="session-chip" hidden></span>
   </div>
 
   <div class="tiles">
@@ -278,7 +338,9 @@
     <div class="tile"><div class="label">Input tokens</div><div class="value" id="t-in">–</div><div class="hint">incl. cache read/write</div></div>
     <div class="tile"><div class="label">Lines written</div><div class="value" id="t-lines">–</div><div class="hint" id="t-lines-h"></div></div>
     <div class="tile"><div class="label">Cost</div><div class="value" id="t-cost">–</div><div class="hint" id="t-cost-h">actual + estimated</div></div>
+    <div class="tile" id="tile-cache"><div class="label">Cache health</div><div class="value" id="t-cache">–</div><div class="hint" id="t-cache-h"></div></div>
     <div class="tile" id="tile-window"><div class="label">Current 5h window</div><div class="value" id="t-window">–</div><div class="hint" id="t-window-h"></div></div>
+    <div class="tile" id="tile-burn" hidden><div class="label">Current 5h block</div><div class="value" id="t-burn">–</div><div class="hint" id="t-burn-h"></div></div>
     <div class="tile" id="tile-plan" hidden><div class="label">Plan limits used</div><div class="value" id="t-plan">–</div><div class="hint" id="t-plan-h"></div></div>
   </div>
 
@@ -294,6 +356,10 @@
         <option value="plan5h" data-plan>Plan limit: 5h peak / day</option>
         <option value="plan7d" data-plan>Plan limit: 7d peak / day</option>
         <option value="cache">Cache hit rate / day</option>
+        <option value="ctx">Context: peak / day</option>
+        <option value="miss">Cache misses: cost / day</option>
+        <option value="blocks">5h blocks</option>
+        <option value="heat">Heatmap</option>
         <option value="cpk">Cost per 1K lines / day</option>
         <option value="mix">Model mix / day</option>
         <option value="agents">Subagent share / day</option>
@@ -303,7 +369,7 @@
     <div id="chart-wrap"><div id="tooltip"></div></div>
   </div>
 
-  <div class="card">
+  <div class="card" id="prompts-card">
     <div class="card-head">
       <button class="btn" id="group-btn" type="button" aria-pressed="false">Group by project</button>
       <span class="head-right">
@@ -319,6 +385,16 @@
       </table>
     </div>
     <div class="empty" id="empty" hidden>No prompts match the current filters.</div>
+  </div>
+
+  <div class="card" id="sessions-card" hidden>
+    <div class="tbl-scroll">
+      <table id="sess-tbl">
+        <thead><tr id="sess-head"></tr></thead>
+        <tbody id="sess-body"></tbody>
+      </table>
+    </div>
+    <div class="empty" id="sess-empty" hidden>No sessions match the current filters.</div>
   </div>
 
   <footer>One row per user prompt; subagent work and harness-injected turns are folded into the prompt that caused them. Costs marked ~ are estimated from the public pricing table (historical backfill); others are reported by Claude Code itself.</footer>
@@ -512,15 +588,25 @@ const kindLabel = id =>
    projects apart, so it has to stay. */
 const kindPrefix = id => (PRODUCT_META[id] || {}).prefix || "";
 
+/* The page has two tables over the same filtered slice: one row per prompt
+   and one row per session. `view` chooses which card is on screen; every
+   filter, the tiles and the chart are shared, so switching views is not
+   switching pages. `session` is the one filter the sessions view sets on the
+   prompts view ("show me this session's prompts") - it is deliberately not
+   persisted, because a session id restored from a previous payload would
+   filter everything away with no way to see why. */
+const VIEWS = ["prompts", "sessions"];
 const state = { range: saved.range ?? 30, project: saved.project || "all",
                 kind: saved.kind || DEFAULT_KIND,
                 model: saved.model || "all", q: "", sort: "ts", dir: -1,
                 chart: saved.chart || "out", group: !!saved.group,
-                cols: saved.cols };
+                cols: saved.cols,
+                view: VIEWS.includes(saved.view) ? saved.view : "prompts",
+                session: null, ssort: "start", sdir: -1 };
 const persist = () => localStorage.setItem("ccu-state", JSON.stringify(
   { range: state.range, project: state.project, kind: state.kind,
     model: state.model, chart: state.chart, group: state.group,
-    cols: state.cols }));
+    cols: state.cols, view: state.view }));
 const rows = DATA.rows;
 
 /* Project name as shown: the active product's label prefix carries no
@@ -660,7 +746,61 @@ function filtered() {
     (state.kind === ALL_KINDS || kindOf(r) === state.kind) &&
     (state.project === "all" || r.project === state.project) &&
     (state.model === "all" || r.models.some(m => m.model === state.model)) &&
+    (!state.session || r.session === state.session) &&
     (!state.q || lcText(r).includes(state.q)));
+}
+
+/* ---------- sessions ---------- */
+const sessions = DATA.sessions || [];
+const sessById = new Map(sessions.map(s => [s.id, s]));
+/* Session timestamps come from the sessions table rather than from a prompt
+   row, so they are not guaranteed to be the same ISO spelling the rows use.
+   Comparing them as numbers costs one parse per session and cannot be wrong
+   about a "+00:00" that a lexical compare would sort after a "Z". */
+const tsMs = (x) => { const v = Date.parse(x || ""); return isNaN(v) ? 0 : v; };
+const lcSess = (s) => s._lc !== undefined ? s._lc
+  : (s._lc = ((s.title || "") + " " + (s.first_prompt_text || "")).toLowerCase());
+const sessDur = (s) => Math.max(0, Math.round((tsMs(s.end) - tsMs(s.start)) / 1000));
+
+/* The same slice the prompts view shows, one row up. A session counts as
+   inside the range when it was still running inside it, so a long session
+   that opened last week does not vanish from "Today". */
+function filteredSessions() {
+  const cutoff = rangeCutoff();
+  const from = cutoff ? tsMs(cutoff) : 0;
+  return sessions.filter(s =>
+    (!from || tsMs(s.end || s.start) >= from) &&
+    (state.kind === ALL_KINDS || (s.kind || DEFAULT_KIND) === state.kind) &&
+    (state.project === "all" || s.project === state.project) &&
+    (state.model === "all" || (s.models || []).includes(state.model)) &&
+    (!state.q || lcSess(s).includes(state.q)));
+}
+
+/* The single entry point for "show me this session's prompts". E2/E3 can call
+   it from anywhere (a chip's close button, a detail-panel link) and get the
+   view switch, the chip and the re-render for free; nothing else should
+   assign to state.session. */
+function setSessionFilter(id) {
+  state.session = id || null;
+  if (id) state.view = "prompts";
+  persist();
+  render();
+}
+
+function renderChip() {
+  const chip = $("session-chip");
+  if (!state.session) { chip.hidden = true; chip.replaceChildren(); return; }
+  const s = sessById.get(state.session);
+  const name = (s && (s.title || s.first_prompt_text)) || state.session;
+  chip.hidden = false;
+  const x = el("button", "chip-x", "x");
+  x.type = "button";
+  x.title = "Clear the session filter";
+  x.setAttribute("aria-label", "Clear the session filter");
+  x.addEventListener("click", () => setSessionFilter(null));
+  const label = el("span", "chip-t", "Session: " + String(name).slice(0, 60));
+  label.title = state.session;
+  chip.replaceChildren(label, x);
 }
 
 /* ---------- tiles ---------- */
@@ -724,6 +864,18 @@ const CHARTS = {
            val: b => b.cost || null, fmt: fmtUsd },
   cache: { title: "Cache hit rate per day (% of input served from cache)",
            val: b => b.inp > 0 ? 100 * b.cr / b.inp : null, fmt: fmtPct, top: 100 },
+  ctx:   { title: "Peak context per day (largest single request)",
+           val: b => b.peakCtx || null, fmt: fmtC },
+  miss:  { title: "Cache misses: cost of the re-written context per day",
+           val: b => b.missCost || null, fmt: fmtUsd },
+  /* Charts whose x axis is not a day. `draw` takes over completely: it is
+     handed the chart wrapper and the filtered rows and owns everything from
+     the axis up. renderChart still clears the wrapper, sets the title and
+     resets the legend first, so a `draw` chart starts from the same blank
+     slate a bar chart does. Add a chart by adding an entry here and an
+     <option> with the same key. */
+  blocks:{ title: "Cost per 5-hour billing block", draw: drawBlocks },
+  heat:  { title: "Daily cost", draw: drawHeatmap },
   cpk:   { title: "Cost per 1,000 lines written",
            val: b => b.lines >= 50 ? b.cost / (b.lines / 1000) : null, fmt: fmtUsd },
   agents:{ title: "Subagent share of output tokens",
@@ -781,7 +933,8 @@ const famSlot = (fam) => (FAMILIES.find(([n]) => n === fam) || [])[2] || "o";
    part of the key. */
 let dayCache = null, dayCacheKey = "";
 const filterKey = () =>
-  [state.range, state.kind, state.project, state.model, state.q].join("\u0001");
+  [state.range, state.kind, state.project, state.model, state.q,
+   state.session || ""].join("\u0001");
 
 function dayBuckets(rs) {
   const key = filterKey();
@@ -790,10 +943,15 @@ function dayBuckets(rs) {
   for (const r of rs) {
     const d = dayOf(r.ts); if (!d) continue;
     const b = byDay.get(d) || { out: 0, inp: 0, cost: 0, prompts: 0, wall: 0,
-                                lines: 0, cr: 0, agentOut: 0, fams: {} };
+                                lines: 0, cr: 0, agentOut: 0, fams: {},
+                                peakCtx: 0, misses: 0, missCost: 0 };
     b.out += r.out; b.inp += r.inp; b.cost += r.cost; b.prompts++;
     b.wall += r.wall_s || 0; b.lines += (r.ladd || 0) + (r.lrem || 0);
     b.cr += r.cr || 0; b.agentOut += r.agent_out || 0;
+    /* Peak context is a maximum, not a sum: two 200K-token turns on one day
+       is not a 400K-token context. */
+    if ((r.peak_ctx || 0) > b.peakCtx) b.peakCtx = r.peak_ctx;
+    b.misses += r.misses || 0; b.missCost += r.cache_miss_cost || 0;
     b.alt = (b.alt || 0) + (r.alt || 0);
     b.comp = b.comp || [0, 0, 0, 0];
     (r.comp || []).forEach((c, i) => b.comp[i] += c);
@@ -819,6 +977,9 @@ function renderChart(rs) {
   const legend = $("chart-legend");
   legend.hidden = true;
   legend.replaceChildren();
+
+  // Charts with their own x axis draw themselves; see CHARTS.blocks/heat.
+  if (chart.draw) { chart.draw(wrap, rs); return; }
 
   let byDay = dayBuckets(rs);
   if (chart.plan != null) {
@@ -962,6 +1123,14 @@ function renderChart(rs) {
         rows.push(ttRow("Cost/1K lines", v != null ? fmtUsd(v) : "–"),
                   ttRow("Lines ±", fmtFull(b.lines)));
         break;
+      case "ctx":
+        rows.push(ttRow("Peak context", fmtFull(b.peakCtx)),
+                  ttRow("Cache read", fmtFull(b.cr)));
+        break;
+      case "miss":
+        rows.push(ttRow("Miss cost", fmtUsd(b.missCost)),
+                  ttRow("Misses", fmtFull(b.misses)));
+        break;
       case "agents":
         rows.push(ttRow("Subagent share", v != null ? fmtPct(v) : "–"),
                   ttRow("Subagent out", fmtFull(b.agentOut)),
@@ -1003,6 +1172,734 @@ function renderChart(rs) {
   svg.addEventListener("pointerleave", () => { tt.style.display = "none"; svg.querySelectorAll(".bar.hot").forEach(x => x.classList.remove("hot")); });
   svg.addEventListener("focusin", e => { if (e.target.classList.contains("bar-hit")) show(e); });
   wrap.append(svg);
+}
+
+/* ---------- shared SVG helpers ---------- */
+const SVGNS = "http://www.w3.org/2000/svg";
+const svgEl = (t, at) => {
+  const e = document.createElementNS(SVGNS, t);
+  for (const k in at) e.setAttribute(k, at[k]);
+  return e;
+};
+/* A <title> child is the only tooltip that works on a focused element as well
+   as a hovered one, and it costs no JavaScript. The floating #tooltip is
+   still worth its code on the daily bars, where several numbers are wanted at
+   once; everywhere else this is enough. */
+const svgTip = (node, text) => {
+  const t = document.createElementNS(SVGNS, "title");
+  t.textContent = text;
+  node.append(t);
+  return node;
+};
+/* Clean axis ceiling: 1, 2 or 5 times a power of ten. */
+const niceTop = (maxV) => {
+  const m = Math.max(maxV, 1e-9);
+  const pow = Math.pow(10, Math.floor(Math.log10(m)));
+  return [1, 2, 5, 10].map(k => k * pow).find(v => v >= m);
+};
+const hhmm = (ms) => new Date(ms).toLocaleTimeString([],
+  { hour: "2-digit", minute: "2-digit" });
+
+/* The ironbow ramp as a scale rather than a rank. famSlot() maps a category
+   to a fixed rung; this maps a magnitude to one, by quartiles of the non-zero
+   values rather than by a fraction of the maximum - one $90 afternoon in a
+   quarter would otherwise push every ordinary day onto the same dark rung and
+   the calendar would say nothing. Rung 0 is "no activity", which is the grid
+   colour, not the bottom of the ramp: a quiet day is not a cheap day. */
+function ironScale(values) {
+  const nz = values.filter(v => v > 0).sort((a, b) => a - b);
+  if (!nz.length) return () => 0;
+  const q = (p) => nz[Math.min(nz.length - 1, Math.floor(p * nz.length))];
+  const c1 = q(0.25), c2 = q(0.5), c3 = q(0.75);
+  return (v) => v <= 0 ? 0 : v <= c1 ? 1 : v <= c2 ? 2 : v <= c3 ? 3 : 4;
+}
+
+/* ---------- 5-hour billing blocks ---------- */
+/* One bar per block, in time order, with the open block outlined. The date
+   range applies: a block is in when any part of it is. */
+function drawBlocks(wrap) {
+  const from = tsMs(rangeCutoff());
+  const blocks = (DATA.blocks || []).filter(b => !from || tsMs(b.end) >= from);
+  if (!blocks.length) {
+    wrap.append(el("div", "empty", "No 5-hour blocks in this range."));
+    return;
+  }
+  const W = Math.max(wrap.clientWidth || 900, 320), H = 190;
+  const padL = 46, padR = 8, padT = 8, padB = 26;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const top = niceTop(Math.max(...blocks.map(b => b.cost || 0)));
+  const band = plotW / blocks.length;
+  const barW = Math.min(28, Math.max(2, band - 2));
+
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H });
+  for (let i = 0; i <= 4; i++) {
+    const v = top * i / 4, y = padT + plotH - plotH * v / top;
+    svg.append(svgEl("line", { x1: padL, x2: W - padR, y1: y, y2: y,
+                               class: i ? "grid-line" : "base-line" }));
+    const t = svgEl("text", { x: padL - 6, y: y + 4, "text-anchor": "end",
+                              class: "tick-label" });
+    t.textContent = v ? fmtUsd(v) : "0";
+    svg.append(t);
+  }
+  const labelEvery = Math.max(1, Math.ceil(blocks.length /
+    Math.max(1, Math.floor(plotW / 78))));
+  blocks.forEach((b, i) => {
+    const x = padL + i * band + (band - barW) / 2;
+    const h = Math.max(2, plotH * (b.cost || 0) / top);
+    const y = padT + plotH - h;
+    const bar = svgEl("rect", { x, y, width: barW, height: h,
+                                rx: Math.min(4, barW / 2),
+                                class: "bar" + (b.active ? " blk-active" : ""),
+                                tabindex: 0 });
+    svgTip(bar, (b.start || "").slice(0, 16).replace("T", " ") + " to " +
+                (b.end || "").slice(11, 16) +
+                (b.active ? " (open)" : "") +
+                " | " + fmtCost(b.cost || 0, false) +
+                " | " + fmtFull(b.calls) + " calls" +
+                " | " + fmtC(b.out) + " out, " + fmtC(b.inp) + " in" +
+                ((b.models || []).length
+                  ? " | " + b.models.map(shortModel).join(", ") : ""));
+    svg.append(bar);
+    if (i % labelEvery === 0) {
+      const t = svgEl("text", { x: padL + i * band + band / 2, y: H - 8,
+                                "text-anchor": "middle", class: "tick-label" });
+      t.textContent = (b.start || "").slice(5, 10) + " " +
+                      (b.start || "").slice(11, 13) + "h";
+      svg.append(t);
+    }
+  });
+  wrap.append(svg);
+  const open = blocks.find(b => b.active);
+  const note = el("div", "streak");
+  if (open && DATA.burn) {
+    note.append(
+      document.createTextNode("Open block so far "),
+      el("b", null, fmtCost(open.cost || 0, false)),
+      document.createTextNode(", projected "),
+      el("b", null, fmtCost(DATA.burn.projected_cost || 0, false)),
+      document.createTextNode(" by close in " +
+        Math.round(DATA.burn.minutes_left) + " min."));
+  } else {
+    note.textContent = "A block opens with the first request after the " +
+      "previous one closed and runs five hours. No block is open now.";
+  }
+  wrap.append(note);
+}
+
+/* ---------- activity heatmap ---------- */
+/* Weeks as columns, weekdays as rows. Under a date range the calendar covers
+   exactly that range; under "All" it covers the last 26 weeks, because a
+   two-year calendar squeezed into a card is a grey smear. */
+const HEAT_WEEKS_ALL = 26;
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+/* The calendar is built in UTC, because dayBuckets' keys are the UTC date of
+   a row's timestamp. Drawing local weeks over UTC buckets would put a day's
+   cost in the wrong square for everyone west of Greenwich. */
+function drawHeatmap(wrap, rs) {
+  const byDay = dayBuckets(rs);
+  const known = [...byDay.keys()].sort();
+  const utcMidnight = (d) => new Date(Date.UTC(
+    d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  const today = utcMidnight(new Date());
+  const lastKnown = known.length
+    ? new Date(known[known.length - 1] + "T00:00:00Z") : null;
+  const end = lastKnown && lastKnown > today ? lastKnown : today;
+  const cutoff = rangeCutoff();
+  const start = cutoff ? utcMidnight(new Date(cutoff)) : new Date(end);
+  if (!cutoff) start.setUTCDate(start.getUTCDate() - (HEAT_WEEKS_ALL * 7 - 1));
+  if (start > end) start.setTime(end.getTime());
+  // pad back to the start of that week so every column is a full week
+  const gridStart = new Date(start);
+  gridStart.setUTCDate(gridStart.getUTCDate() - gridStart.getUTCDay());
+  const days = [];
+  for (let d = new Date(gridStart); d <= end; d.setUTCDate(d.getUTCDate() + 1))
+    days.push(new Date(d));
+  if (!days.length) {
+    wrap.append(el("div", "empty", "No days in this range."));
+    return;
+  }
+  const weeks = Math.ceil(days.length / 7);
+  const W = Math.max(wrap.clientWidth || 900, 320);
+  const gutterL = 30, gutterT = 16;
+  const step = Math.max(6, Math.min(20, Math.floor((W - gutterL - 6) / weeks)));
+  const cell = Math.max(4, step - 3);
+  const H = gutterT + 7 * step + 4;
+  const svgW = gutterL + weeks * step + 4;
+
+  const keyOf = (d) => d.toISOString().slice(0, 10);
+  const costOf = (d) => { const b = byDay.get(keyOf(d)); return b ? b.cost : 0; };
+  const slot = ironScale(days.map(costOf));
+
+  const svg = svgEl("svg", { viewBox: `0 0 ${svgW} ${H}`, width: svgW,
+                             height: H });
+  /* An inline width beats "#chart-wrap svg { width: 100% }", which would
+     otherwise blow a two-week calendar up to card width and draw squares the
+     size of postage stamps. max-width keeps it inside a narrow card. */
+  svg.style.display = "block";
+  svg.style.width = svgW + "px";
+  svg.style.maxWidth = "100%";
+  let lastMonth = -1;
+  days.forEach((d, i) => {
+    const col = Math.floor(i / 7), row = d.getUTCDay();
+    const x = gutterL + col * step, y = gutterT + row * step;
+    const key = keyOf(d);
+    const b = byDay.get(key);
+    const c = b ? b.cost : 0;
+    const s = slot(c);
+    const r = svgEl("rect", { x, y, width: cell, height: cell, rx: 2,
+                              class: "heat-cell " + (s ? "fill-i" + s : "heat-0"),
+                              tabindex: 0 });
+    svgTip(r, key + ": " + (b
+      ? fmtCost(c, false) + ", " + fmtFull(b.prompts) + " prompt" +
+        (b.prompts === 1 ? "" : "s") + ", " + fmtC(b.out) + " out"
+      : "no activity"));
+    svg.append(r);
+    if (row === 0 && d.getUTCMonth() !== lastMonth) {
+      lastMonth = d.getUTCMonth();
+      const t = svgEl("text", { x, y: gutterT - 5, class: "tick-label" });
+      t.textContent = MONTHS[lastMonth];
+      svg.append(t);
+    }
+  });
+  for (const [row, name] of [[1, "Mon"], [3, "Wed"], [5, "Fri"]]) {
+    const t = svgEl("text", { x: 0, y: gutterT + row * step + cell - 2,
+                              class: "tick-label" });
+    t.textContent = name;
+    svg.append(t);
+  }
+  wrap.append(svg);
+
+  const leg = el("div", "mini-legend");
+  leg.append(el("span", null, "less"));
+  for (const s of [0, 1, 2, 3, 4]) {
+    const sp = el("span");
+    sp.append(el("span", "sw " + (s ? "sw-i" + s : "sw-heat0")));
+    leg.append(sp);
+  }
+  leg.append(el("span", null, "more"));
+  wrap.append(leg);
+
+  const st = streaks(days.map(d => costOf(d) > 0));
+  const line = el("div", "streak");
+  line.append(document.createTextNode("Current streak "),
+              el("b", null, st.current + (st.current === 1 ? " day" : " days")),
+              document.createTextNode(" · longest "),
+              el("b", null, st.longest + (st.longest === 1 ? " day" : " days")),
+              document.createTextNode(" · " + st.active + " active of " +
+                                      days.length + " days shown"));
+  wrap.append(line);
+}
+
+/* Consecutive active days. The current streak is counted back from the last
+   day of the window, and a quiet final day is skipped once: at nine in the
+   morning "0 days" would be wrong about yesterday rather than right about
+   today. Two quiet days do end it. */
+function streaks(active) {
+  let longest = 0, run = 0, total = 0;
+  for (const a of active) {
+    if (a) { run++; total++; if (run > longest) longest = run; }
+    else run = 0;
+  }
+  let i = active.length - 1;
+  if (i >= 0 && !active[i]) i--;
+  let current = 0;
+  for (; i >= 0 && active[i]; i--) current++;
+  return { current, longest, active: total };
+}
+
+/* ---------- context growth ---------- */
+/* Cache-miss causes are categories, not magnitudes, so they take the
+   categorical series palette. The slot numbers are the .c-N / .sw-cN CSS
+   classes; 0 is the muted grey kept for "unknown". */
+const CAUSES = [
+  ["model_switch", "model switch", 1],
+  ["effort_switch", "effort switch", 2],
+  ["speed_switch", "speed switch", 3],
+  ["idle_gap", "idle gap", 4],
+  ["compact", "compaction", 5],
+  ["unknown", "unknown", 0],
+];
+const CAUSE_BY = new Map(CAUSES.map(c => [c[0], c]));
+const causeMeta = (c) => CAUSE_BY.get(c) || CAUSE_BY.get("unknown");
+const EVENT_LABEL = { compact: "compaction", model_switch: "model switch",
+                      effort_switch: "effort switch",
+                      speed_switch: "speed switch" };
+
+/* DATA.ctx is one flat array ordered by session then time; the sessions view
+   asks for one session at a time, so it is indexed once on first use. */
+let ctxIndex = null;
+function ctxFor(sid) {
+  if (!ctxIndex) {
+    ctxIndex = new Map();
+    for (const p of (DATA.ctx || [])) {
+      let a = ctxIndex.get(p.session);
+      if (!a) ctxIndex.set(p.session, a = []);
+      a.push(p);
+    }
+  }
+  return ctxIndex.get(sid) || [];
+}
+
+/* The three parts of a request's context - what was read from cache, what was
+   uncached input, and what was written to cache - add up to the context total
+   exactly, so the stack's own outline is the context curve and no fourth
+   series is needed. Order is cost order, cheapest at the bottom, the same
+   order the cost-composition bars use. */
+const CTX_LAYERS = [
+  ["cache read", 1, p => p.cr || 0],
+  ["uncached input", 2, p => Math.max((p.ctx || 0) - (p.cr || 0) - (p.cw || 0), 0)],
+  ["cache write", 3, p => p.cw || 0],
+];
+
+function ctxChartSvg(points, W, H) {
+  W = Math.max(W || 860, 320); H = H || 200;
+  const padL = 52, padR = 12, padT = 10, padB = 22;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H,
+                             class: "ctx-svg" });
+  if (!points.length) return svg;
+  const t0 = points[0].t, t1 = points[points.length - 1].t;
+  const span = Math.max(1, t1 - t0);
+  // A single-point session has no span to spread across, so it sits centred.
+  const px = (p) => points.length < 2 ? padL + plotW / 2
+                                      : padL + plotW * (p.t - t0) / span;
+  const top = niceTop(Math.max(...points.map(p => p.ctx || 0), 1));
+  const py = (v) => padT + plotH - plotH * Math.min(v, top) / top;
+
+  for (let i = 0; i <= 4; i++) {
+    const v = top * i / 4, y = py(v);
+    svg.append(svgEl("line", { x1: padL, x2: W - padR, y1: y, y2: y,
+                               class: i ? "grid-line" : "base-line" }));
+    const t = svgEl("text", { x: padL - 6, y: y + 4, "text-anchor": "end",
+                              class: "tick-label" });
+    t.textContent = v ? fmtC(v) : "0";
+    svg.append(t);
+  }
+  // stacked areas, bottom-up
+  let base = points.map(() => 0);
+  for (const [, slot, get] of CTX_LAYERS) {
+    const upper = points.map((p, i) => base[i] + get(p));
+    const fwd = points.map((p, i) => px(p) + "," + py(upper[i]));
+    const back = [];
+    for (let i = points.length - 1; i >= 0; i--)
+      back.push(px(points[i]) + "," + py(base[i]));
+    svg.append(svgEl("polygon", { points: fwd.concat(back).join(" "),
+                                  class: "fill-i" + slot, opacity: 0.85 }));
+    base = upper;
+  }
+  svg.append(svgEl("polyline", { class: "ctx-line",
+    points: points.map(p => px(p) + "," + py(p.ctx || 0)).join(" ") }));
+
+  for (const p of points) {
+    if (!p.event) continue;
+    const x = px(p);
+    const line = svgEl("line", { x1: x, x2: x, y1: padT, y2: padT + plotH,
+                                 class: "ev-line" });
+    svg.append(line);
+    const hit = svgEl("line", { x1: x, x2: x, y1: padT, y2: padT + plotH,
+                                class: "ev-hit", tabindex: 0 });
+    svgTip(hit, hhmm(p.t * 1000) + " " + (EVENT_LABEL[p.event] || p.event) +
+                (p.model ? " · " + shortModel(p.model) : ""));
+    svg.append(hit);
+  }
+  for (const p of points) {
+    if (!p.miss) continue;
+    const m = causeMeta(p.cause);
+    const c = svgEl("circle", { cx: px(p), cy: py(p.ctx || 0), r: 4,
+                                class: "ctx-miss c-" + m[2], tabindex: 0 });
+    svgTip(c, hhmm(p.t * 1000) + " cache miss · " + m[1] +
+              " · " + fmtC(p.cw || 0) + " tokens re-written");
+    svg.append(c);
+  }
+  for (const [frac, anchor] of [[0, "start"], [1, "end"]]) {
+    const t = svgEl("text", { x: padL + plotW * frac, y: H - 6,
+                              "text-anchor": anchor, class: "tick-label" });
+    t.textContent = hhmm((frac ? t1 : t0) * 1000);
+    svg.append(t);
+  }
+  return svg;
+}
+
+/* The chart's own legend: the three stacked layers, plus one swatch per cause
+   that actually occurs in this session, plus the event mark. Built from the
+   points so it never names a colour that is not on screen. */
+function ctxLegend(points) {
+  const box = el("div", "mini-legend");
+  for (const [name, slot] of CTX_LAYERS) {
+    const s = el("span");
+    s.append(el("span", "sw sw-i" + slot), document.createTextNode(name));
+    box.append(s);
+  }
+  const seen = [];
+  for (const p of points)
+    if (p.miss) {
+      const m = causeMeta(p.cause);
+      if (!seen.includes(m)) seen.push(m);
+    }
+  for (const m of seen) {
+    const s = el("span");
+    s.append(el("span", "sw sw-c" + m[2]), document.createTextNode("miss: " + m[1]));
+    box.append(s);
+  }
+  if (points.some(p => p.event))
+    box.append(el("span", null, "dashed line: model switch / compaction"));
+  return box;
+}
+
+/* ---------- cache health ---------- */
+/* Misses are counted per point in the context series, which is the only place
+   the cause lives. Indexing them by session and day once keeps the tile off
+   the 200,000-point array on every keystroke. */
+let missIdx = null;
+function missCauseCounts(sids, fromDay) {
+  if (!missIdx) {
+    missIdx = new Map();
+    for (const p of (DATA.ctx || [])) {
+      if (!p.miss) continue;
+      const day = new Date(p.t * 1000).toISOString().slice(0, 10);
+      let a = missIdx.get(p.session);
+      if (!a) missIdx.set(p.session, a = []);
+      a.push([day, p.cause || "unknown"]);
+    }
+  }
+  const counts = new Map();
+  for (const sid of sids)
+    for (const [day, c] of (missIdx.get(sid) || []))
+      if (!fromDay || day >= fromDay)
+        counts.set(c, (counts.get(c) || 0) + 1);
+  return counts;
+}
+
+function renderCacheTile(rs) {
+  const cr = rs.reduce((a, r) => a + (r.cr || 0), 0);
+  const inp = rs.reduce((a, r) => a + r.inp, 0);
+  const misses = rs.reduce((a, r) => a + (r.misses || 0), 0);
+  const cost = rs.reduce((a, r) => a + (r.cache_miss_cost || 0), 0);
+  const val = $("t-cache"), hint = $("t-cache-h");
+  if (!inp) {
+    val.textContent = "–";
+    val.title = "";
+    hint.textContent = "no cached input in this slice";
+    return;
+  }
+  val.textContent = fmtPct(100 * cr / inp);
+  val.title = fmtFull(cr) + " of " + fmtFull(inp) + " input tokens came from cache";
+  if (!misses) {
+    hint.textContent = "no cache misses";
+    return;
+  }
+  const sids = new Set();
+  for (const r of rs) if (r.session) sids.add(r.session);
+  const counts = missCauseCounts(sids, (rangeCutoff() || "").slice(0, 10));
+  let topCause = null;
+  for (const [c, n] of counts)
+    if (!topCause || n > topCause[1] ||
+        (n === topCause[1] && c < topCause[0])) topCause = [c, n];
+  hint.textContent = fmtFull(misses) + " miss" + (misses === 1 ? "" : "es") +
+    " · " + fmtCost(cost, false) + " re-written" +
+    (topCause ? " · mostly " + causeMeta(topCause[0])[1] : "");
+}
+
+/* The burn rate of the open 5h block. Absent between blocks, which is not a
+   zero: there is nothing to project. */
+function renderBurnTile() {
+  const burn = DATA.burn;
+  const tile = $("tile-burn");
+  if (!burn) { tile.hidden = true; return; }
+  tile.hidden = false;
+  $("t-burn").textContent = fmtCost(burn.projected_cost || 0, false);
+  $("t-burn").title = "Projected cost by the time this block closes, at the " +
+    "rate of the last " + burn.window_min + " minutes";
+  $("t-burn-h").textContent = fmtC(Math.round(burn.tokens_per_min)) +
+    " tok/min · $" + (burn.usd_per_min || 0).toFixed(3) + "/min · " +
+    Math.round(burn.minutes_left) + " min left";
+}
+
+/* ---------- sessions table ---------- */
+const sessName = (s) => s.title || s.first_prompt_text || s.id;
+const SESSCOLS = [
+  { k: "title", label: "Session", val: s => sessName(s).toLowerCase(),
+    cell: s => { const td = el("td", "prompt");
+                 td.append(el("div", "txt", sessName(s)));
+                 td.title = s.id; return td; } },
+  { k: "project", label: "Project", val: s => projLabel(s.project),
+    cell: s => el("td", "muted proj", projLabel(s.project)) },
+  { k: "start", label: "Start", val: s => tsMs(s.start),
+    cell: s => { const td = el("td", null,
+                   (s.start || "").slice(0, 16).replace("T", " ") || "–");
+                 td.style.whiteSpace = "nowrap"; return td; } },
+  { k: "dur", label: "Duration", num: true, val: sessDur,
+    cell: s => numCell(fmtDur(sessDur(s))) },
+  { k: "prompts", label: "Prompts", num: true, val: s => s.prompts,
+    cell: s => numCell(fmtFull(s.prompts)) },
+  { k: "calls", label: "API calls", num: true, val: s => s.calls,
+    cell: s => numCell(fmtFull(s.calls)) },
+  { k: "cost", label: "Cost", num: true, val: s => s.cost,
+    cell: s => numCell(fmtCost(s.cost, s.est)) },
+  { k: "hit", label: "Cache hit %", num: true, val: s => s.hit || 0,
+    cell: s => numCell(fmtPct(100 * (s.hit || 0))) },
+  { k: "misses", label: "Misses", num: true, val: s => s.misses || 0,
+    cell: s => numCell(s.misses ? fmtFull(s.misses) : "–") },
+  { k: "miss_cost", label: "Miss cost", num: true, val: s => s.miss_cost || 0,
+    cell: s => numCell(s.miss_cost ? fmtUsd(s.miss_cost) : "–") },
+  { k: "models", label: "Models", val: s => (s.models || []).length,
+    cell: s => { const td = el("td");
+                 for (const m of (s.models || [])) {
+                   const pill = el("span", "pill");
+                   pill.append(el("span", "dot"),
+                               document.createTextNode(shortModel(m)));
+                   td.append(pill);
+                 }
+                 if (!(s.models || []).length) td.textContent = "–";
+                 return td; } },
+  { k: "switches", label: "Switches", num: true, val: s => s.switches || 0,
+    cell: s => numCell(s.switches ? String(s.switches) : "–") },
+  { k: "compactions", label: "Compactions", num: true,
+    val: s => s.compactions || 0,
+    cell: s => numCell(s.compactions ? String(s.compactions) : "–") },
+  { k: "peak_ctx", label: "Peak context", num: true, val: s => s.peak_ctx || 0,
+    cell: s => numCell(s.peak_ctx ? fmtC(s.peak_ctx) : "–",
+                       s.peak_ctx ? fmtFull(s.peak_ctx) : "") },
+  { k: "subagent_ttl", label: "Subagent TTL", val: s => s.subagent_ttl || "",
+    cell: s => { const td = el("td");
+                 if (!s.subagent_ttl) { td.textContent = "–"; return td; }
+                 const p = el("span", "pill", s.subagent_ttl);
+                 p.title = "Subagent prompt caching used the " +
+                           s.subagent_ttl + " time to live";
+                 td.append(p); return td; } },
+];
+const SESSCOL_BY_KEY = Object.fromEntries(SESSCOLS.map(c => [c.k, c]));
+// Same cap the prompts table uses, for the same reason: a table nobody can
+// scroll to the end of costs the same to build as one they can.
+const SESS_ROW_CAP = 500;
+
+function renderSessHead() {
+  const tr = $("sess-head");
+  tr.replaceChildren();
+  for (const c of SESSCOLS) {
+    const th = el("th", c.num ? "num" : null, c.label + " ");
+    if (state.ssort === c.k)
+      th.append(el("span", "arrow", state.sdir < 0 ? "▼" : "▲"));
+    th.addEventListener("click", () => {
+      if (state.ssort === c.k) state.sdir *= -1;
+      else { state.ssort = c.k; state.sdir = c.num || c.k === "start" ? -1 : 1; }
+      renderSessions(filteredSessions());
+    });
+    tr.append(th);
+  }
+}
+
+/* Session rows are cached exactly like prompt rows: the cells depend on the
+   product filter (which is what projLabel strips) and on nothing else, so a
+   re-sort re-orders elements instead of rebuilding them. */
+let sessCache = new Map(), sessCacheKey = null;
+function sessEl(s) {
+  const cached = sessCache.get(s);
+  if (cached) { cached.className = "data-row sess-row"; return cached; }
+  const tr = el("tr", "data-row sess-row");
+  for (const c of SESSCOLS) tr.append(c.cell(s));
+  tr.tabIndex = 0;
+  tr.setAttribute("aria-expanded", "false");
+  tr.__sess = s;
+  sessCache.set(s, tr);
+  return tr;
+}
+
+function renderSessions(ss) {
+  renderSessHead();
+  if (sessCacheKey !== state.kind) { sessCache = new Map(); sessCacheKey = state.kind; }
+  const col = SESSCOL_BY_KEY[state.ssort] || SESSCOL_BY_KEY.start;
+  const dir = state.sdir;
+  const sorted = [...ss].sort((a, b) => {
+    const va = col.val(a), vb = col.val(b);
+    return (va < vb ? -1 : va > vb ? 1 : 0) * dir;
+  });
+  $("sess-empty").hidden = sorted.length > 0;
+  const out = sorted.slice(0, SESS_ROW_CAP).map(sessEl);
+  $("sess-body").replaceChildren(...out);
+  if (sessCache.size > 2000 && sessCache.size > out.length * 3) {
+    const keep = new Map();
+    for (const tr of out) keep.set(tr.__sess, tr);
+    sessCache = keep;
+  }
+}
+
+function initSessionEvents() {
+  const body = $("sess-body");
+  const hit = (e) => {
+    const tr = e.target.closest("tr");
+    if (!tr || tr.parentNode !== body || !tr.classList.contains("sess-row"))
+      return null;
+    return tr;
+  };
+  body.addEventListener("click", (e) => {
+    const tr = hit(e);
+    if (tr) toggleSessionDetail(tr, tr.__sess);
+  });
+  /* Enter and Space on a focused row, the same two keys a button answers to.
+     Space is prevented from scrolling the page, which is what it would
+     otherwise do the instant the row is reachable by keyboard at all. */
+  body.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " " && e.key !== "Spacebar") return;
+    const tr = hit(e);
+    if (!tr) return;
+    e.preventDefault();
+    toggleSessionDetail(tr, tr.__sess);
+  });
+}
+
+function toggleSessionDetail(tr, s) {
+  if (tr.nextSibling && tr.nextSibling.classList &&
+      tr.nextSibling.classList.contains("detail-row")) {
+    tr.nextSibling.remove();
+    tr.classList.remove("open");
+    tr.setAttribute("aria-expanded", "false");
+    return;
+  }
+  tr.classList.add("open");
+  tr.setAttribute("aria-expanded", "true");
+  const dtr = el("tr", "detail-row");
+  const td = el("td");
+  td.colSpan = SESSCOLS.length;
+  const box = el("div", "detail");
+  const points = ctxFor(s.id);
+
+  const secC = el("div", "wide");
+  secC.append(el("h3", null, "Context growth"));
+  if (points.length) {
+    const wide = $("sessions-card");
+    secC.append(ctxChartSvg(points, (wide && wide.clientWidth ? wide.clientWidth - 60 : 860)),
+                ctxLegend(points));
+  } else {
+    secC.append(el("div", "muted", DATA.ctx_truncated
+      ? "No context series for this session: the payload's context cap was " +
+        "reached and the oldest sessions were left out of it."
+      : "No context series for this session."));
+  }
+  box.append(secC);
+
+  const misses = points.filter(p => p.miss);
+  const secM = el("div");
+  secM.append(el("h3", null, "Cache misses (" + (s.misses || misses.length) + ")"));
+  if (misses.length) {
+    const wrap2 = el("div", "scroll-y");
+    const mt = el("table");
+    const hr = el("tr");
+    for (const h of ["Time", "Cause", "Context", "Re-written", "Cost"])
+      hr.append(el("th", null, h));
+    // The session's miss cost is exact; the per-miss split is the session
+    // total shared out by re-written tokens, which is what it is made of.
+    hr.lastChild.title = "The session's miss cost, shared out in proportion " +
+      "to the tokens each miss re-wrote";
+    mt.append(hr);
+    const cwTotal = misses.reduce((a, p) => a + (p.cw || 0), 0);
+    for (const p of misses.slice(0, 50)) {
+      const m = causeMeta(p.cause);
+      const row = el("tr");
+      const tdC = el("td");
+      const sw = el("span", "sw sw-c" + m[2]);
+      sw.style.cssText = "display:inline-block;width:9px;height:9px;" +
+                         "border-radius:2px;margin-right:5px;";
+      tdC.append(sw, document.createTextNode(m[1]));
+      const share = cwTotal ? (s.miss_cost || 0) * (p.cw || 0) / cwTotal
+                            : (s.miss_cost || 0) / misses.length;
+      row.append(el("td", null, hhmm(p.t * 1000)), tdC,
+                 el("td", "num", fmtC(p.ctx || 0)),
+                 el("td", "num", fmtC(p.cw || 0)),
+                 el("td", "num", fmtUsd(share)));
+      mt.append(row);
+    }
+    if (misses.length > 50) {
+      // append() returns undefined; chaining appendChild onto it throws and
+      // takes the whole panel with it - the same trap as the file list.
+      const more = el("tr");
+      more.append(el("td", "muted", "… " + (misses.length - 50) + " more"));
+      mt.append(more);
+    }
+    wrap2.append(mt);
+    secM.append(wrap2);
+  } else {
+    secM.append(el("div", "muted", "None recorded."));
+  }
+  box.append(secM);
+
+  const events = points.filter(p => p.event);
+  const secE = el("div");
+  secE.append(el("h3", null, "Events"));
+  if (events.length) {
+    const wrap3 = el("div", "scroll-y");
+    const et = el("table");
+    for (const p of events.slice(0, 50)) {
+      const row = el("tr");
+      row.append(el("td", null, hhmm(p.t * 1000)),
+                 el("td", null, EVENT_LABEL[p.event] || p.event),
+                 el("td", "muted", p.model ? shortModel(p.model) : ""));
+      et.append(row);
+    }
+    wrap3.append(et);
+    secE.append(wrap3);
+  } else {
+    secE.append(el("div", "muted",
+      (s.compactions || s.switches)
+        ? "Counted for this session but not timestamped in the context series."
+        : "No model switches or compactions."));
+  }
+  box.append(secE);
+
+  const secA = el("div");
+  secA.append(el("h3", null, "This session"));
+  const at = el("table");
+  const addRow = (k, v) => {
+    const row = el("tr");
+    row.append(el("th", null, k), el("td", null, v));
+    at.append(row);
+  };
+  addRow("Id", s.id);
+  addRow("Effort", s.effort || "–");
+  addRow("Ended", (s.end || "").slice(0, 16).replace("T", " ") || "–");
+  addRow("Output", fmtFull(s.out));
+  secA.append(at);
+  const show = el("button", "btn", "Show prompts");
+  show.type = "button";
+  show.addEventListener("click", (e) => {
+    e.stopPropagation();
+    setSessionFilter(s.id);
+  });
+  secA.append(show);
+  box.append(secA);
+
+  td.append(box);
+  dtr.append(td);
+  tr.after(dtr);
+}
+
+/* ---------- view switch ---------- */
+function initViewSwitch() {
+  const seg = $("view-seg");
+  for (const b of seg.children)
+    b.setAttribute("aria-pressed", String(b.dataset.view === state.view));
+  seg.addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    state.view = b.dataset.view;
+    for (const x of seg.children) x.setAttribute("aria-pressed", x === b);
+    persist();
+    render();
+  });
+  initSessionEvents();
+}
+
+/* Both tables read the same filtered slice; only one is on screen. */
+function renderView(rs) {
+  const isSess = state.view === "sessions";
+  for (const b of $("view-seg").children)
+    b.setAttribute("aria-pressed", String(b.dataset.view === state.view));
+  $("prompts-card").hidden = isSess;
+  $("sessions-card").hidden = !isSess;
+  renderChip();
+  if (isSess) renderSessions(filteredSessions());
+  else renderTable(rs);
 }
 
 /* ---------- table ---------- */
@@ -1601,6 +2498,10 @@ function renderNotice() {
               `--max-rows to change that.`);
   if (DATA.redacted)
     bits.push("Prompt text was withheld from this build (--no-prompt-text).");
+  /* Whatever the build itself wants to say about this payload: conversation
+     pages it could not write, a context series it had to cap. They are
+     already sentences, so they are shown as they arrive. */
+  for (const n of (DATA.notices || [])) bits.push(String(n));
   const box = $("notice");
   box.textContent = bits.join(" ");
   box.hidden = !bits.length;
@@ -1626,6 +2527,7 @@ function hideSubscriptionTiles() {
   if (DATA.subscription !== false) return false;
   $("tile-window").hidden = true;
   $("tile-plan").hidden = true;
+  $("tile-burn").hidden = true;
   return true;
 }
 
@@ -1633,14 +2535,16 @@ function hideSubscriptionTiles() {
 function render() {
   const rs = filtered();
   renderTiles(rs);
+  renderCacheTile(rs);
   renderChart(rs);
-  renderTable(rs);
+  renderView(rs);
 }
 
 $("generated-at").textContent = "generated " + (DATA.generated_at || "").replace("T", " ").slice(0, 16);
 renderNotice();
 initFilters();
-if (!hideSubscriptionTiles()) { renderWindow(); renderPlanTile(); }
+initViewSwitch();
+if (!hideSubscriptionTiles()) { renderWindow(); renderPlanTile(); renderBurnTile(); }
 render();
 /* resize fires continuously while a window is dragged, and each one re-ran
    the filter, re-aggregated the days and rebuilt the SVG - after reading
