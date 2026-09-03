@@ -345,8 +345,20 @@ class Fingerprint(ReceiverCase):
         self.assertEqual(second, receiver.data_fingerprint(self.con))
 
     def test_covers_every_table_the_dashboard_reads(self):
+        # agents and session_events are included because a reconcile can add
+        # nothing but those (a subagent launch, a compaction) and the page has
+        # something new to show for each.
         self.assertEqual(set(receiver.FINGERPRINT_TABLES),
-                         {"api_requests", "prompts", "tool_calls", "edits"})
+                         {"api_requests", "prompts", "tool_calls", "edits",
+                          "agents", "session_events"})
+
+    def test_missing_fingerprint_table_contributes_none(self):
+        self.con.execute("DROP TABLE session_events")
+        self.con.commit()
+        receiver.reset_column_cache()
+        fp = receiver.data_fingerprint(self.con)
+        self.assertEqual(len(fp), len(receiver.FINGERPRINT_TABLES))
+        self.assertIsNone(fp[receiver.FINGERPRINT_TABLES.index("session_events")])
 
 
 TRANSCRIPT = [
