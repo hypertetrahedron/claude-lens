@@ -886,21 +886,24 @@ carry the CLI's authoritative `cost_usd`).
 
 ## Chart metrics
 
-The chart card offers fifteen views (dropdown, persisted): output tokens/day,
+The chart card offers seventeen views (dropdown, persisted): output tokens/day,
 tokens & lines per **active minute** (day total ÷ summed wall-clock span of
 each prompt; days under a minute of activity are skipped), cost/day, **cost
 composition** (stacked $: cache read / cache write / output / uncached input —
 cache reads typically dominate despite the 0.1x discount because input volume
 dwarfs output), cache hit rate, **context: peak/day** (the largest single
 request's measured context per day), **cache misses: cost/day** (what the
-day's cold-cache re-writes cost), **5h blocks** (bar per billing block, the
-open one outlined), **heatmap** (a daily-cost calendar), cost per 1K lines
-written (≥50 lines/day), model mix (stacked by family), subagent share, and —
-when Claude Desktop is installed — the daily peak of the account's 5-hour and
-7-day **plan limits**. The plan views are account-wide, so only the date
-range applies to them; the 5h-blocks and heatmap views draw their own x axis
-(a block index, a calendar) instead of the shared day-bucket bar chart the
-others share, so they own their own scale and legend.
+day's cold-cache re-writes cost), **tool errors/day**, **5h blocks** (bar per
+billing block, the open one outlined), **heatmap** (a daily-cost calendar),
+**tool cost (top 12)** (attributed cost per tool name, dearest first), cost
+per 1K lines written (≥50 lines/day), model mix (stacked by family), subagent
+share, and — when Claude Desktop is installed — the daily peak of the
+account's 5-hour and 7-day **plan limits**. The plan views are account-wide,
+so only the date range applies to them; the 5h-blocks, heatmap and tool-cost
+views draw their own x axis (a block index, a calendar, a tool name) instead
+of the shared day-bucket bar chart the others share, so they own their own
+scale and legend. Tool cost comes from the same `tool_attrib` attribution the
+per-prompt detail panel's Tools table shows, summed across the filtered rows.
 
 **Stacked charts are coloured by cost, on an ironbow ramp** — darkest is
 cheapest, brightest is dearest. Model families run haiku → sonnet → opus →
@@ -934,14 +937,40 @@ counterfactual.
 - **Current 5h window tile** — ccusage-style rate-limit block (starts at the
   floored hour of the first request after the previous block ends): output
   tokens, cost, reset time. Global, not filter-scoped.
+- **Errors tile** — tool-call errors and their share of tool calls, for the
+  filtered rows; the hint adds the account-wide count of API-level errors
+  (OTel `claude_code.api_error`), which has no per-prompt home so it rides
+  along rather than pretending to be scoped to the filters.
+- **Per-day vs baseline tile** — cost per day the filtered range was actually
+  touched (a day with no activity does not count against it), next to
+  Anthropic's published "typical" and "p90" per-active-day figures.
+- **Fixed overhead tile** — the tool-use system prompt Claude Code re-sends on
+  every request, estimated per model and summed to tokens and cost. Global,
+  not filter-scoped, and hidden outright when there is nothing to show.
+- **Cost-basis badge** — next to the Cost tile, "list prices" / "contracted
+  rates" / "mixed" when the OTel rows say which (see
+  [List price or your price](#list-price-or-your-price)).
+- **Claude Code's own insights link** — a small link in the header to
+  `~/.claude/usage-data/report.html`, the CLI's own account-wide report, when
+  it exists on this machine. It answers a different question than this
+  dashboard does and is easy to forget exists.
 - **Per-prompt detail** (click a row) — cost-composition donut + table,
-  per-model breakdown, files changed with lines +/−, tool-call histogram,
-  subagents.
+  per-model breakdown, files changed with lines +/−, a **Tools** table
+  (`tool_attrib`: calls, result size, attributed cost, dearest first),
+  **Subagents** by name and model ("Explore on claude-sonnet-5" rather than
+  the opaque agent id), an **Effort & signals** line (effort, thinking share
+  of output, fast calls, errors, max-token stops, web searches, peak
+  context), and an **Open conversation** link to the prompt's page when one
+  was written.
 - **Configurable columns** — the ⚙ button opens a panel to add, remove, and
   reorder table columns (persisted). Beyond the defaults, opt-in columns
   include per-prompt derived metrics: tokens/min and lines/min (over the
   prompt's own duration), cache hit %, cost per 1K lines, subagent share,
-  cost without caching, API calls, cache-read tokens, chars written.
+  cost without caching, API calls, cache-read tokens, chars written, effort,
+  thinking tokens, fast calls, max-token stops, web searches, peak context,
+  cache misses and their cost, and the session id (click it to filter the
+  table to that session). Errors is the one opt-in column shown by default;
+  a row with any errors gets a red-tinted count. All of these export to CSV.
 - **Date range** — Today, 7d, **MTD** (calendar month to date, in your own
   timezone), 30d, 90d, All. MTD is a calendar period rather than a rolling
   window, so early in the month it covers less than 7d.
