@@ -392,7 +392,59 @@ within a minute of new data.
      ```
      then `systemctl --user enable --now claude-metrics`.
 
-   Only one receiver can run (port 4318 is the lock).
+   Only one receiver can run (port 4318 is the lock). `--port N` moves it and
+   `--db PATH` chooses the database; `python receiver.py --help` lists both.
+
+### What live rows carry that transcripts do not
+
+Every attribute below is read straight from Claude Code's documented
+[OpenTelemetry events](https://code.claude.com/docs/en/monitoring-usage):
+
+| Event | Stored as |
+|---|---|
+| `claude_code.api_request` | `effort`, `speed` (`fast`/`normal`), `cost_usd` (or `cost_usd_micros`), `duration_ms`, and `context_tokens` = `input_tokens` + `cache_read_tokens` + `cache_creation_tokens` |
+| `claude_code.api_error` | an `api_requests` row with `error` set (`"<status_code>: <error>"`) and every token count zero, so failures are visible without inflating usage |
+| `claude_code.tool_result` | `input_bytes` (`tool_input_size_bytes`), `result_bytes` (`tool_result_size_bytes`), `duration_ms`, `is_error` (from `success`) and `error_type` |
+| `claude_code.user_prompt` | `prompts.kind` from `command_name` / `command_source`, so `/loop`, `/schedule` and other command dispatches are separable from typed prompts |
+
+Two details worth knowing:
+
+- **Rows are keyed on `request_id`, falling back to `client_request_id`.** The
+  Anthropic request id exists only when the API answered; a timeout or a
+  connection failure has none. Without the client-side id those rows would all
+  be written with a NULL primary key — which SQLite accepts as often as it is
+  asked — and a flaky network would fill the table with rows nothing can join
+  or deduplicate.
+- **An error never overwrites a success.** A retried attempt can carry the id
+  of an attempt that later succeeded, so an existing row only gains the error
+  text; its token counts are left alone.
+
+### List price or your price
+
+If your organization has contracted rates, an administrator sets
+[`modelPricing`](https://code.claude.com/docs/en/settings-reference#modelpricing)
+in managed settings and Claude Code reports *those* rates in `cost_usd`. Since
+the numbers on the page then mean something different, every live row is
+stamped with the basis in force when it arrived — `cost_basis` is `contracted`
+when `modelPricing` is found, `list` otherwise. The files checked, in order:
+
+```
+$CLAUDE_CONFIG_DIR/settings.json  (or ~/.claude/settings.json)
+/Library/Application Support/ClaudeCode/managed-settings.json   macOS
+/etc/claude-code/managed-settings.json                          Linux and WSL
+C:\Program Files\ClaudeCode\managed-settings.json               Windows
+   ...plus managed-settings.d/*.json next to each
+```
+
+`modelPricing` is a managed-scope key — Claude Code ignores it in user,
+project and local settings. The user file is read anyway so that someone
+trying the setting locally sees why the label did not change, but only a
+managed source actually alters the costs Claude Code reports. The result is
+cached for five minutes.
+
+`python check_live.py` reports the fill rate of each of these columns over the
+newest rows, which is the quick way to confirm live capture is working (and to
+tell "my CLI is too old for this attribute" from "the receiver is not running").
 
 ## Sharing and size
 
@@ -440,6 +492,64 @@ you are standing.
 Task Scheduler did not restart on a non-zero exit, and a re-exec left nothing
 running at all — worse than a stale page.)
 
+## Optional: SessionEnd hook (fresh data without a daemon)
+
+A background receiver is the most complete option, but it is a service to
+install and keep alive. If you would rather have nothing running, let Claude
+Code tell this project when a session finishes: `hooks/session_end_hook.py`
+reads the [hook payload](https://code.claude.com/docs/en/hooks) from stdin,
+ingests the one transcript it names, and rebuilds `dashboard.html`.
+
+Add to `~/.claude/settings.json`:
+
+```json
+"hooks": {
+  "SessionEnd": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 /path/to/claude-lens/hooks/session_end_hook.py",
+          "timeout": 60
+        }
+      ]
+    }
+  ]
+}
+```
+
+On Windows use `hooks\session_end_hook.ps1`; on Linux/macOS
+`hooks/session_end_hook.sh` is there if you would rather not name an
+interpreter. Both wrappers find a Python and the script relative to
+themselves, so the repository can live anywhere.
+
+**Set the `timeout`.** SessionEnd hooks share a 1.5-second budget unless a
+per-hook `timeout` raises it (up to 60 seconds), and a dashboard rebuild does
+not fit in 1.5 seconds. If you would rather keep the hook instant, add
+`--no-build` to the command and let the next `generate-dashboard` run render
+the page; the ingest alone is milliseconds.
+
+What the hook guarantees:
+
+| Guarantee | Why |
+|---|---|
+| Always exits 0 | A usage dashboard is never worth failing the end of someone's work. Anything that goes wrong is logged and swallowed. |
+| Writes nothing to stdout | Claude Code interprets hook stdout, so everything the ingester or builder prints is captured into the log instead. |
+| Skips the rebuild when a receiver is listening | The receiver owns `dashboard.html`; two writers would fight. |
+| Logs to `hooks/hook.log` | Rotated at 1 MB, one backup kept. One line per session: what was ingested, whether the page was rebuilt, and how long it took. |
+
+`--db PATH` picks a database, and `--transcript PATH` ingests a named file
+instead of the one on stdin (useful when testing the hook by hand).
+
+Why a hook rather than watching the files: Anthropic documents the transcript
+JSONL layout as internal and subject to change, and points at hooks as the
+supported way to react to a session's lifecycle. Parsing the transcripts is
+still this project's own business — but the *timing* no longer depends on
+polling something undocumented. `PreCompact` and `Stop` receive the same
+`transcript_path` and would work with the identical script if you want the
+page refreshed mid-session; `Stop` fires after every assistant turn, so expect
+it to be noisy.
+
 ## Optional: weekly digest
 
 `python digest.py` writes a self-contained report for the last 7 full days
@@ -482,14 +592,16 @@ carry the CLI's authoritative `cost_usd`).
 | `jsonl_ingest.py` | Transcript ingest/reconcile (`--force` = full re-parse) |
 | `build_dashboard.py` | Aggregates metrics.db → dashboard.html |
 | `report_index.py` | Writes index.html linking every report |
-| `receiver.py` | Optional live OTLP listener + scheduler |
+| `receiver.py` | Optional live OTLP listener + scheduler (`--db`, `--port`) |
+| `hooks/session_end_hook.py` | Optional SessionEnd hook: ingest one transcript, refresh the page (`.sh` / `.ps1` wrappers alongside) |
 | `digest.py` | Weekly digest with collision-proof filenames |
 | `template.html` | Dashboard UI (no external deps) |
 | `db.py` / `pricing.py` | Storage / pricing, model-id canonicalisation |
 | `pricing.example.json` | Template for `pricing.local.json` rate + alias overrides |
-| `check_live.py` | Diagnostic: dump recent live rows |
+| `check_live.py` | Diagnostic: recent live rows + fill rates for the live-only columns (`--db`) |
 | `test_sources.py` | Test suite (discovery, ingest, pricing, payload, template wiring) |
 | `test_pricing.py` | Test suite (rates, cache multipliers, fast mode, retirement, overrides) |
+| `test_receiver.py` | Test suite (OTel attribute mapping, dirty fingerprint, SessionEnd hook) |
 
 ## Chart metrics
 
