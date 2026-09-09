@@ -43,6 +43,36 @@ def resolve_path(explicit=None):
     return DB_PATH
 
 # ---------------------------------------------------------------------------
+# query_source vocabulary
+#
+# The transcript and OTel each name the same thing differently, and OTel wins
+# every conflict - so a row both sources saw ends up spelled the telemetry
+# way, while a row only the transcript ever saw keeps the transcript's word.
+# Any query that means "the main conversation" or "a subagent" has to check
+# both spellings or it silently keeps only whichever source never overlapped.
+# This is the one place that vocabulary is written down, so both the ingester
+# (which seeds a session's model/effort/speed from its own past rows) and the
+# dashboard (which reports on them) stay in sync when a CLI update adds a
+# third spelling.
+#
+# main conversation: transcript says "main", OTel says "repl_main_thread".
+MAIN_QUERY_SOURCES = ("main", "repl_main_thread")
+MAIN_QS_SQL = ("(query_source IS NULL OR query_source IN ("
+               + ", ".join("'%s'" % q for q in MAIN_QUERY_SOURCES) + "))")
+
+# subagents: transcript says "subagent", OTel says "agent:builtin:<type>" (or
+# any other "agent:..." shape). There is deliberately no tuple of literals to
+# go with these two: OTel's spelling carries the subagent type inside the
+# value, so no finite list can express it, and a constant that looked like one
+# would invite precisely the `IN (...)` this vocabulary exists to prevent.
+SUBAGENT_QS_SQL = "(query_source = 'subagent' OR query_source LIKE 'agent:%')"
+
+
+def is_subagent_qs(value):
+    """SUBAGENT_QS_SQL's twin, for the same test in Python."""
+    return bool(value) and (value == "subagent" or value.startswith("agent:"))
+
+# ---------------------------------------------------------------------------
 # Schema versioning (stored in SQLite's PRAGMA user_version).
 #
 # A database with user_version 0 predates version tracking and is treated as
@@ -433,6 +463,26 @@ def connect(path=DB_PATH, cross_thread=False):
     con = sqlite3.connect(path, timeout=30, check_same_thread=not cross_thread)
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
+    # The default page cache is 2MB (cache_size=-2000) and mmap is off - fine
+    # for a small database, but collect() makes 4-5 full passes over
+    # api_requests/tool_calls/prompts/edits/session_events on every rebuild,
+    # the receiver triggers a rebuild up to once a minute, and the working set
+    # here is already well past 10MB. 20MB of page cache keeps those repeat
+    # scans from re-reading pages off disk every time; memory-mapping the file
+    # lets SQLite read pages straight out of the OS cache instead of copying
+    # them through its own, which matters most for exactly this read-heavy,
+    # rarely-written workload.
+    con.execute("PRAGMA cache_size=-20000")
+    # mmap_size is a request, not a guarantee: SQLite silently uses less (or
+    # none) when the platform can't back it - a 32-bit build, a filesystem
+    # that doesn't support mmap, WSL's view of a Windows drive - and that is
+    # fine to ignore. What isn't fine is a platform where even naming the
+    # pragma raises, so the attempt is wrapped rather than left to break
+    # connect() on whatever machine that turns out to be.
+    try:
+        con.execute("PRAGMA mmap_size=268435456")
+    except sqlite3.Error:
+        pass
     fresh = con.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='prompts'"
     ).fetchone() is None
@@ -448,7 +498,7 @@ def connect(path=DB_PATH, cross_thread=False):
         con.close()  # a connection left open here blocks rmtree on Windows
         raise RuntimeError(
             f"metrics.db is schema v{version} but this code only knows "
-            f"v{SCHEMA_VERSION} — update the project before running.")
+            f"v{SCHEMA_VERSION} - update the project before running.")
     while version < SCHEMA_VERSION:
         version += 1
         MIGRATIONS[version](con)

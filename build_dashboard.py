@@ -63,23 +63,27 @@ OTHER_TTL_MIN = 5
 # checked; "compact" is the only one that is not also visible on the requests.
 MISS_EVENT_KINDS = ("compact", "model_switch", "effort_switch", "speed_switch")
 
-# What the main conversation calls itself. A transcript writes "main"; the
-# CLI's own telemetry writes "repl_main_thread" for exactly the same requests,
-# and an OTel row wins every conflict, so a request both sources saw ends up
+# What the main conversation and a subagent call themselves - db.py owns this
+# vocabulary (jsonl_ingest.py needs it too, to seed a session's model/effort/
+# speed from its own past rows) and this module just uses it. A transcript
+# writes "main"/"subagent"; the CLI's own telemetry writes "repl_main_thread"
+# for the same requests and "agent:builtin:<type>" for the same subagents, and
+# an OTel row wins every conflict, so a request both sources saw ends up
 # labelled the telemetry way. Filtering on "main" alone therefore kept only
 # the requests OTel never saw - on a live-monitored machine under a tenth of
 # the conversation - and the context curve drawn from what was left jumped
 # days at a time and invented idle-gap cache misses across the holes.
-# Anything not named here (subagent, agent:*, sdk, away_summary,
-# prompt_suggestion, the search and title-generation helpers) is a genuine
-# side thread against its own context and stays out.
-MAIN_QUERY_SOURCES = ("main", "repl_main_thread")
+# Anything not named here (sdk, away_summary, prompt_suggestion, the search
+# and title-generation helpers) is a genuine side thread against its own
+# context and stays out.
+MAIN_QUERY_SOURCES = db.MAIN_QUERY_SOURCES
+MAIN_QS_SQL = db.MAIN_QS_SQL
+SUBAGENT_QS_SQL = db.SUBAGENT_QS_SQL
+is_subagent_qs = db.is_subagent_qs
 # A sentinel for "no prompt seen yet in this session" that no prompt id can
 # equal - None cannot be used, because a request with a NULL prompt_id is a
 # real case and must not read as the start of a turn.
 _NO_PROMPT = object()
-MAIN_QS_SQL = ("(query_source IS NULL OR query_source IN ("
-               + ", ".join("'%s'" % q for q in MAIN_QUERY_SOURCES) + "))")
 
 # The context series carries one point per main-conversation request, so a
 # long history is a lot of points. Past the cap whole sessions are dropped,
@@ -105,8 +109,11 @@ EXTRAS = {}
 # unless we say something. Populated by collect(), reported by warn_unpriced().
 UNPRICED = {}
 
-# Rows whose cost was replaced by a CLI-reported figure during the last
-# collect(); reported by build() so a run says how much of it is exact.
+# Rows whose cost was re-derived from a CLI-reported session total during the
+# last collect(). The total is exact; each row holds its share of it, scaled
+# by that row's own estimate, so these rows stay flagged estimated. Surfaced
+# in the payload's notices and in build()'s result so a run says how much of
+# it came from the CLI's figure rather than from the rate table.
 REPRICED = {"rows": 0}
 
 # Provider -> request count from the last collect(). Bedrock and Vertex users
@@ -385,11 +392,18 @@ def agent_spans(con, since=None):
     subagent requests carry no cost_usd at all, so summing that column
     reported every jsonl-only subagent as free.
     """
+    # `since` bounds this half too. It is not only the fallback below that
+    # would otherwise leak: an agent launched months before the window would
+    # come back through it as a request-less span, and one whose requests are
+    # in the window would have its span dragged back to a launch outside it.
+    # collect(con, since=...) is a real call shape - digest.py builds the
+    # weekly report with it - so the two queries have to agree on the cutoff.
     meta = {}
-    for aid, sid, ts, typ, model, desc in con.execute(
-            "SELECT agent_id, session_id, ts, subagent_type, "
-            "COALESCE(resolved_model, requested_model), description "
-            "FROM agents"):
+    meta_sql, meta_args = _since_clause(
+        "SELECT agent_id, session_id, ts, subagent_type, "
+        "COALESCE(resolved_model, requested_model), description "
+        "FROM agents WHERE 1=1", since)
+    for aid, sid, ts, typ, model, desc in con.execute(meta_sql, meta_args):
         meta[aid] = (sid, ts, typ, model, desc)
 
     sql, args = _since_clause(
@@ -681,6 +695,12 @@ def collect(con, since=None):
             "effort_calls": defaultdict(int), "thinking": 0, "fast_calls": 0,
             "errors": 0, "max_tokens_stops": 0, "web_searches": 0,
             "peak_ctx": 0, "tool_bytes": defaultdict(int),
+            # Internal to collect(): true once any of this prompt's requests
+            # ran on a model the rate table does not know, so its $0.00 is an
+            # absence rather than a measurement. Never reaches the payload -
+            # the notice bar names the models from UNPRICED instead - but the
+            # run_cost repricing below has to see it.
+            "unpriced": False,
         }
 
     prompt_sql, prompt_args = _since_clause(
@@ -740,8 +760,17 @@ def collect(con, since=None):
                   SUM(COALESCE(thinking_tokens, 0)),
                   SUM(COALESCE(server_tool_requests, 0)),
                   SUM(CASE WHEN stop_reason = 'max_tokens' THEN 1 ELSE 0 END),
-                  MAX(COALESCE(context_tokens, 0))
+                  MAX(CASE WHEN """ + MAIN_QS_SQL + """
+                           THEN COALESCE(context_tokens, 0) ELSE 0 END)
            FROM api_requests WHERE prompt_id IS NOT NULL""", since)
+    # Peak context is the main conversation's window, not a subagent's: a
+    # subagent runs against its own, so its context_tokens is not a reading of
+    # the window this prompt was filling. cache_scan() filters the session's
+    # figure the same way and the session row takes the max of the two, so
+    # without this a session's "Peak context" could report a subagent's window
+    # as the main thread's. It is a CASE rather than a WHERE because every
+    # other column here does want the subagent's requests - they are this
+    # prompt's tokens and this prompt's cost.
     # effort/speed/inference_geo join the key because they move the price:
     # fast mode is billed at 2x and a pinned US region at 1.1x, so a group
     # that mixed them would be costed at whichever one the row happened to
@@ -780,6 +809,7 @@ def collect(con, since=None):
             note_unpriced(model, inp + out + cr + cw,
                           uncosted=bool(nocost), provider=provider,
                           calls=calls)
+            r["unpriced"] = True
         if nocost:
             cost = 0.0 if rate is None else cost_at(
                 rate, inp, out, cr, c5, c1, unsplit, provider)
@@ -895,11 +925,25 @@ def collect(con, since=None):
         est_total = sum(g["cost"] for g in group)
         if not group or not auth_cost or runs != len(group) or est_total <= 0:
             continue
+        # An unpriced model costs $0.00, so a prompt that ran on one carries no
+        # weight in `est_total` and would take none of the session total away
+        # from its neighbours: the whole session's spend would be shared out
+        # over the priced prompts while that one stayed at a confident $0.00 -
+        # a model we know we cannot price, displayed as free. The estimate is
+        # incomplete for such a session, so the authoritative total is left
+        # unspent and the notice bar names the model instead.
+        if any(g["unpriced"] for g in group):
+            continue
         factor = auth_cost / est_total
         for g in group:
             g["cost"] *= factor
             g["comp"] = [c * factor for c in g["comp"]]
-            g["est"] = False
+            # The session total is authoritative; this row's share of it is
+            # not. Each prompt gets the total scaled by its own estimate, so
+            # the figure on the row is still an estimate - a better one - and
+            # clearing `est` here would claim a per-prompt measurement the CLI
+            # never made. Only the session sum is exact.
+            g["est"] = True
         repriced += len(group)
     REPRICED["rows"] = repriced
 
@@ -1015,7 +1059,7 @@ def collect(con, since=None):
     for sid, c5, c1 in con.execute(
             "SELECT session_id, SUM(COALESCE(cache_5m_tokens, 0)), "
             "SUM(COALESCE(cache_1h_tokens, 0)) FROM api_requests "
-            "WHERE query_source = 'subagent' GROUP BY session_id"):
+            "WHERE " + SUBAGENT_QS_SQL + " GROUP BY session_id"):
         if (c5 or 0) or (c1 or 0):
             subagent_ttl[sid] = "5m" if (c5 or 0) >= (c1 or 0) else "1h"
     EXTRAS.update({
@@ -1457,116 +1501,134 @@ def build(con=None, max_rows=DEFAULT_MAX_ROWS, redact=False, cfg=None,
     if own:
         resolved = db.resolve_path(db_path)
         con = db.connect() if resolved == db.DB_PATH else db.connect(resolved)
-    out_rows, window = collect(con)
-    total = len(out_rows)
-    truncated = 0
-    notices = []
-    if max_rows and total > max_rows:
-        out_rows = out_rows[:max_rows]      # already newest-first
-        truncated = total - max_rows
-    if redact:
-        for r in out_rows:
-            r["text"] = ""
-    # A subscription concept (plan gauges, the 5h rate-limit block) only means
-    # something if some traffic actually went through the Anthropic API. Rows
-    # predating provider tracking carry no provider and are treated as
-    # first-party, so nothing changes for an existing install.
-    third_party = {p for p in PROVIDERS if p != pricing.ANTHROPIC}
-    subscription = bool(PROVIDERS.get(pricing.ANTHROPIC)) or not third_party
+    # Only a connection opened here is ours to close, and only in `finally` -
+    # collect() and everything after it can raise (a malformed row, a full
+    # disk while writing dashboard.html), and leaking `own`'s connection past
+    # that holds a WAL read mark that blocks checkpointing indefinitely. A
+    # connection the caller handed us is theirs for the whole of its life;
+    # closing it out from under them here would be a different bug.
+    try:
+        out_rows, window = collect(con)
+        total = len(out_rows)
+        truncated = 0
+        notices = []
+        if max_rows and total > max_rows:
+            out_rows = out_rows[:max_rows]      # already newest-first
+            truncated = total - max_rows
+        if redact:
+            for r in out_rows:
+                r["text"] = ""
+        # A subscription concept (plan gauges, the 5h rate-limit block) only
+        # means something if some traffic actually went through the Anthropic
+        # API. Rows predating provider tracking carry no provider and are
+        # treated as first-party, so nothing changes for an existing install.
+        third_party = {p for p in PROVIDERS if p != pricing.ANTHROPIC}
+        subscription = (bool(PROVIDERS.get(pricing.ANTHROPIC))
+                        or not third_party)
 
-    out_dir = os.path.dirname(os.path.abspath(OUTPUT))
-    conv = conversations.write_pages(
-        con, out_dir, out_rows,
-        limit=0 if redact else (conversations_n or 0), redact=redact)
-    if conv.get("skipped_missing"):
-        notices.append(
-            f"{conv['skipped_missing']} conversation page(s) were not written: "
-            "their transcript is no longer on disk.")
-    if conv.get("capped"):
-        notices.append(
-            f"Conversation pages cover the newest {conversations_n:,} "
-            f"prompt(s); the other {conv['capped']:,} have no page. Rebuild "
-            "with --conversations to change that.")
+        out_dir = os.path.dirname(os.path.abspath(OUTPUT))
+        conv = conversations.write_pages(
+            con, out_dir, out_rows,
+            limit=0 if redact else (conversations_n or 0), redact=redact)
+        if conv.get("skipped_missing"):
+            notices.append(
+                f"{conv['skipped_missing']} conversation page(s) were not "
+                "written: their transcript is no longer on disk.")
+        if conv.get("capped"):
+            notices.append(
+                f"Conversation pages cover the newest {conversations_n:,} "
+                f"prompt(s); the other {conv['capped']:,} have no page. "
+                "Rebuild with --conversations to change that.")
 
-    sessions = session_rows(out_rows, redact)
-    points, ctx_dropped = ctx_points([s["id"] for s in sessions])
-    # Subagent spans ride along with the sessions the page actually lists;
-    # spans for a session that is not in the payload have nothing to draw on.
-    # Descriptions are prompt text the user typed, so --no-prompt-text drops
-    # them for the same reason it drops everything else a prompt said.
-    by_session = EXTRAS.get("agent_spans") or {}
-    spans = [dict(sp, desc=None) if redact else sp
-             for s in sessions for sp in by_session.get(s["id"], ())]
-    if ctx_dropped:
-        notices.append(
-            f"The context series is capped at {CTX_CAP:,} points; the "
-            f"{ctx_dropped} oldest session(s) were left out of it.")
+        sessions = session_rows(out_rows, redact)
+        points, ctx_dropped = ctx_points([s["id"] for s in sessions])
+        # Subagent spans ride along with the sessions the page actually
+        # lists; spans for a session that is not in the payload have nothing
+        # to draw on. Descriptions are prompt text the user typed, so
+        # --no-prompt-text drops them for the same reason it drops
+        # everything else a prompt said.
+        by_session = EXTRAS.get("agent_spans") or {}
+        spans = [dict(sp, desc=None) if redact else sp
+                 for s in sessions for sp in by_session.get(s["id"], ())]
+        if ctx_dropped:
+            notices.append(
+                f"The context series is capped at {CTX_CAP:,} points; the "
+                f"{ctx_dropped} oldest session(s) were left out of it.")
 
-    strings = Strings()
-    cols, string_table = compact(out_rows, strings)
-    payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "window": window,
-        "n_rows": len(out_rows),
-        "total_rows": total,
-        "truncated": truncated,
-        "redacted": bool(redact),
-        "plan": plan_usage(cfg) if subscription else None,
-        "providers": dict(PROVIDERS),
-        "subscription": subscription,
-        "cols": cols,
-        "sessions": compact_table(
-            sessions, SESSION_COLUMNS, strings,
-            str_cols=("id", "title", "project", "kind", "effort",
-                      "subagent_ttl"),
-            list_str_cols=("models",)),
-        "ctx": compact_ctx(points, strings),
-        "ctx_truncated": bool(ctx_dropped),
-        "agent_spans": compact_table(
-            spans, AGENT_SPAN_COLUMNS, strings,
-            str_cols=("session", "type", "desc", "model")),
-        "blocks": compact_table(
-            [dict(b, start=b["start"].isoformat(timespec="seconds"),
-                  end=b["end"].isoformat(timespec="seconds"),
-                  models=sorted(b["models"]))
-             for b in (EXTRAS.get("blocks") or [])],
-            BLOCK_COLUMNS, strings, list_str_cols=("models",)),
-        "burn": EXTRAS.get("burn"),
-        "errors": EXTRAS.get("errors") or {"tools": [], "api": 0,
-                                           "api_kinds": []},
-        "baseline": dict(BASELINE),
-        "overhead": EXTRAS.get("overhead") or {"by_model": [], "tokens": 0,
-                                               "usd": 0.0},
-        # A file: URL under the home directory, so it carries the account
-        # name. --no-prompt-text exists to make the page safe to hand to
-        # someone else, and a username is exactly the kind of thing that
-        # build is supposed to withhold. The template hides the link when
-        # this is null.
-        "insights_report": None if redact else insights_report(),
-        "cost_basis": EXTRAS.get("cost_basis"),
-        "conversations": conv.get("count", 0),
-        "notices": notices,
-        "strings": string_table,
-        # Every unpriced model, not a slice of them: the notice bar derives
-        # both its count and its list from this array, so dropping the tail
-        # made the page understate how many models it was costing at $0.00
-        # and leave the rest unnamed anywhere. Dearest first.
-        "unpriced": [
-            {"model": m, "rows": e["rows"], "tokens": e["tokens"],
-             "provider": e.get("provider")}
-            for m, e in sorted(unpriced_models().items(),
-                               key=lambda kv: -kv[1]["tokens"])
-        ],
-    }
-    with open(TEMPLATE, encoding="utf-8") as f:
-        html = f.read()
-    html = html.replace("/*__DATA__*/null", embed_json(payload))
-    tmp = OUTPUT + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(html)
-    os.replace(tmp, OUTPUT)
-    if own:
-        con.close()
+        strings = Strings()
+        cols, string_table = compact(out_rows, strings)
+        payload = {
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "window": window,
+            "n_rows": len(out_rows),
+            "total_rows": total,
+            "truncated": truncated,
+            "redacted": bool(redact),
+            "plan": plan_usage(cfg) if subscription else None,
+            "providers": dict(PROVIDERS),
+            "subscription": subscription,
+            "cols": cols,
+            "sessions": compact_table(
+                sessions, SESSION_COLUMNS, strings,
+                str_cols=("id", "title", "project", "kind", "effort",
+                          "subagent_ttl"),
+                list_str_cols=("models",)),
+            "ctx": compact_ctx(points, strings),
+            "ctx_truncated": bool(ctx_dropped),
+            "agent_spans": compact_table(
+                spans, AGENT_SPAN_COLUMNS, strings,
+                str_cols=("session", "type", "desc", "model")),
+            "blocks": compact_table(
+                [dict(b, start=b["start"].isoformat(timespec="seconds"),
+                      end=b["end"].isoformat(timespec="seconds"),
+                      models=sorted(b["models"]))
+                 for b in (EXTRAS.get("blocks") or [])],
+                BLOCK_COLUMNS, strings, list_str_cols=("models",)),
+            "burn": EXTRAS.get("burn"),
+            "errors": EXTRAS.get("errors") or {"tools": [], "api": 0,
+                                               "api_kinds": []},
+            "baseline": dict(BASELINE),
+            "overhead": EXTRAS.get("overhead") or {"by_model": [], "tokens": 0,
+                                                   "usd": 0.0},
+            # A file: URL under the home directory, so it carries the account
+            # name. --no-prompt-text exists to make the page safe to hand to
+            # someone else, and a username is exactly the kind of thing that
+            # build is supposed to withhold. The template hides the link when
+            # this is null.
+            "insights_report": None if redact else insights_report(),
+            "cost_basis": EXTRAS.get("cost_basis"),
+            "conversations": conv.get("count", 0),
+            # How many prompts hold a share of a CLI-reported session total
+            # instead of a figure worked out from the rate table. It used to
+            # live only in the CLI result, which the receiver - running with
+            # no console - throws away, so under normal operation nobody ever
+            # learned which half of the page's money came from where. The
+            # notice bar says it for the same reason it names unpriced models.
+            "repriced": REPRICED["rows"],
+            "notices": notices,
+            "strings": string_table,
+            # Every unpriced model, not a slice of them: the notice bar
+            # derives both its count and its list from this array, so
+            # dropping the tail made the page understate how many models it
+            # was costing at $0.00 and leave the rest unnamed anywhere.
+            # Dearest first.
+            "unpriced": [
+                {"model": m, "rows": e["rows"], "tokens": e["tokens"],
+                 "provider": e.get("provider")}
+                for m, e in sorted(unpriced_models().items(),
+                                   key=lambda kv: -kv[1]["tokens"])
+            ],
+        }
+        with open(TEMPLATE, encoding="utf-8") as f:
+            html = f.read()
+        html = html.replace("/*__DATA__*/null", embed_json(payload))
+        tmp = OUTPUT + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(html)
+        os.replace(tmp, OUTPUT)
+    finally:
+        if own:
+            con.close()
     # The landing page is rebuilt alongside the dashboard so a single
     # bookmark always reaches every report, however many digests pile up.
     index = report_index.build()
