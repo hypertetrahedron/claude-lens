@@ -310,15 +310,27 @@
   .turn-num { fill: var(--text-muted); font-size: 10px;
               font-variant-numeric: tabular-nums; }
   .turn-hit { fill: transparent; cursor: default; }
-  .turn-hit:focus { outline: 1px solid var(--text-primary); outline-offset: -1px; }
+  /* :focus-visible, not :focus, matching the convention at the generic
+     [tabindex]:focus-visible rule below: a mouse click on a turn column must
+     not ring it, only real keyboard navigation should. (That generic rule
+     also matches this element, since it carries a bare tabindex attribute; on
+     an actual keyboard focus it sits later in the sheet at equal specificity
+     and so still wins the tie for the outline shown - unchanged from before
+     this fix. What changes is that a mouse click no longer paints an outline
+     at all, because :focus-visible does not match a pointer-focused SVG
+     element the way plain :focus did.) */
+  .turn-hit:focus-visible { outline: 1px solid var(--text-primary); outline-offset: -1px; }
   /* Subagent runs. One colour for all of them on purpose: the categorical
      palette is already spoken for by cache-miss cause in this same drawing,
      and a second meaning for the same five colours would read as the first.
      Which agent a bar is belongs on the bar, in words. */
   .agent-bar { fill: var(--series-5); opacity: 0.8; }
-  .agent-run:hover .agent-bar, .agent-run:focus .agent-bar { opacity: 1; }
+  /* :focus-visible here too, so a mouse click does not also brighten the bar
+     as though it were keyboard-focused - the same reasoning as the outline
+     below, applied to the one other property a click was leaving behind. */
+  .agent-run:hover .agent-bar, .agent-run:focus-visible .agent-bar { opacity: 1; }
   .agent-run { cursor: pointer; }
-  .agent-run:focus { outline: 1px solid var(--text-primary); outline-offset: 1px; }
+  .agent-run:focus-visible { outline: 1px solid var(--text-primary); outline-offset: 1px; }
   .agent-label { fill: var(--surface-1); font-size: 9px; pointer-events: none; }
   .lane-label { fill: var(--text-muted); font-size: 10px; }
   /* Compressed idle time. Hatched rather than blank: a blank column reads as
@@ -344,7 +356,7 @@
   .heat-0 { fill: var(--grid); }
   .sw-heat0 { background: var(--grid); }
   .heat-cell { cursor: pointer; }
-  .heat-cell:focus { outline: 1px solid var(--text-primary); outline-offset: 1px; }
+  .heat-cell:focus-visible { outline: 1px solid var(--text-primary); outline-offset: 1px; }
   .streak { color: var(--text-secondary); font-size: 12px; margin-top: 8px; }
   .streak b { color: var(--text-primary); }
   /* The open 5h block, outlined rather than recoloured: its colour already
@@ -647,7 +659,7 @@
       <button class="btn" id="group-btn" type="button" aria-pressed="false">Group by project</button>
       <span class="head-right">
         <button class="btn" id="csv-btn" type="button">Export CSV</button>
-        <button class="btn" id="cols-btn" type="button" title="Configure columns" aria-label="Configure columns" aria-expanded="false">⚙</button>
+        <button class="btn" id="cols-btn" type="button" title="Configure columns" aria-label="Configure columns" aria-expanded="false" aria-controls="col-panel">⚙</button>
         <div id="col-panel" hidden></div>
       </span>
     </div>
@@ -1257,11 +1269,36 @@ function initMoreFilters() {
     commit();
   });
   btn.addEventListener("click", () => {
-    const opening = panel.hidden;
-    panel.hidden = !opening;
-    btn.setAttribute("aria-expanded", String(opening));
+    if (panel.hidden) {
+      panel.hidden = false;
+      btn.setAttribute("aria-expanded", "true");
+      // Move focus into the panel on open, the same as initColPanel() does
+      // for its own popover - otherwise a keyboard user has opened a panel
+      // they are not actually in yet.
+      const first = panel.querySelector("input, button");
+      if (first) first.focus();
+    } else {
+      closeMoreFilters(true);
+    }
+  });
+  // Escape dismisses the panel and returns focus to the button that opened
+  // it. One document-level listener, a no-op while the panel is already
+  // hidden - the same shape as initColPanel()'s and initTilePop()'s.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !panel.hidden) closeMoreFilters(true);
   });
   updateMoreFiltersBtn();
+}
+// `restoreFocus` is false only when nothing should be forced back to the
+// button - there is no such caller for this panel yet (no outside-click
+// dismissal today), but the parameter matches closeColPanel()'s so both
+// popovers read the same way.
+function closeMoreFilters(restoreFocus) {
+  const btn = $("more-filters-btn"), panel = $("more-filters");
+  if (panel.hidden) return;
+  panel.hidden = true;
+  btn.setAttribute("aria-expanded", "false");
+  if (restoreFocus) btn.focus();
 }
 
 /* Applies to both tables where the field exists on the row/session; see
@@ -2370,9 +2407,18 @@ function sessionTimelineSvg(points, spans, sid, W, mode, readout) {
      the line has to be one number both it and the layout agree on. */
   const zoneSplit = costH ? costY + costH + LANE_GAP / 2 : rulerY + rulerH;
 
+  // Not role="img": that flattens the whole subtree into one opaque picture
+  // for a screen reader's browse mode, which would bury the tabindex="0"
+  // turn columns, subagent bars, event ticks and cache-miss marks inside it -
+  // native Tab order still reaches them, but browse mode might never surface
+  // them. role="group" keeps the children as their own focusable stops, each
+  // with its own <title> for a name; the group's own aria-label says what the
+  // whole drawing is.
   const svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H, width: W, height: H,
                              preserveAspectRatio: "xMinYMin meet",
-                             class: "ctx-svg", role: "img" });
+                             class: "ctx-svg", role: "group",
+                             "aria-label": "Session timeline: context, " +
+                               "turns, tool calls and subagent runs over time" });
   const cap = svgEl("title", {});
   cap.textContent = points.length + " requests, " + turns.length +
     " turn(s), " + spans.length + " subagent run(s), " +
@@ -2913,6 +2959,17 @@ function addTracking(svg, points, spans, sc, readout, geo) {
   svg.addEventListener("focusin", (e) => {
     if (e.target.__turn) showTurn(e.target.__turn);
     else if (e.target.__span) showSpan(e.target.__span);
+  });
+  // focusin has no matching cleanup of its own: Tab past the last turn-hit or
+  // agent-run leaves the hot rect and readout pinned to whatever was focused
+  // last, the same staleness mouseleave exists to prevent. relatedTarget is
+  // where focus is going *to*, so this only fires the same clear() mouseleave
+  // uses once focus has actually left the svg subtree - not on every move
+  // between two focusable children inside it. It can be null (focus left the
+  // document entirely, e.g. Tab to the browser chrome), which is also outside
+  // the svg.
+  svg.addEventListener("focusout", (e) => {
+    if (!e.relatedTarget || !svg.contains(e.relatedTarget)) clear();
   });
   clear();
 }
@@ -3462,6 +3519,12 @@ function toggleSessionDetail(tr, s) {
   td.append(box);
   dtr.append(td);
   tr.after(dtr);
+  // Reachable from the window resize handler below, which redraws every open
+  // timeline so a resize after expanding a session does not leave its chart
+  // sized to a stale width. detail-row is shared with the prompts table's own
+  // toggleDetail() (see below), which never sets this, so a resize sweep over
+  // every ".detail-row" can call it unconditionally.
+  dtr.__drawTimeline = drawTimeline;
   /* Sized from the element it actually lands in, and only once that element
      is in the document and has a width. Measuring #sessions-card instead got
      the viewBox wrong by however much the fixed-width table overflows the
@@ -3936,13 +3999,22 @@ function renderColPanel() {
   });
   const done = el("button", "btn", "Done");
   done.type = "button";
-  done.addEventListener("click", closeColPanel);
+  done.addEventListener("click", () => closeColPanel(true));
   foot.append(reset, done);
   panel.append(foot);
 }
-function closeColPanel() {
-  $("col-panel").hidden = true;
+// `restoreFocus` moves focus back to the toggle button - wanted after Escape
+// or the panel's own Done button, where focus is otherwise left on a node
+// that closing the panel just hid (or removed, since renderColPanel() rebuilds
+// it from scratch). Left false for an outside click, which already moved
+// focus to whatever the reader clicked - yanking it back to the gear button
+// would undo their own navigation.
+function closeColPanel(restoreFocus) {
+  const panel = $("col-panel");
+  if (panel.hidden) return;
+  panel.hidden = true;
   $("cols-btn").setAttribute("aria-expanded", "false");
+  if (restoreFocus) $("cols-btn").focus();
 }
 function initColPanel() {
   $("cols-btn").addEventListener("click", (e) => {
@@ -3952,8 +4024,14 @@ function initColPanel() {
       renderColPanel();
       panel.hidden = false;
       $("cols-btn").setAttribute("aria-expanded", "true");
+      // Move focus into the panel on open, same as a menu or dialog would -
+      // otherwise a keyboard user has opened something they cannot reach
+      // without a further Tab, and Escape from the still-focused button would
+      // close a panel they never actually entered.
+      const first = panel.querySelector("input, button");
+      if (first) first.focus();
     } else {
-      closeColPanel();
+      closeColPanel(true);
     }
   });
   document.addEventListener("click", (e) => {
@@ -3964,7 +4042,14 @@ function initColPanel() {
     // handler runs — panel.contains(e.target) would wrongly report "outside".
     const path = e.composedPath();
     if (!path.includes(panel) && !path.includes($("cols-btn")))
-      closeColPanel();
+      closeColPanel(false);
+  });
+  // Escape dismisses the panel and hands focus back to the button that opened
+  // it, matching initTilePop()'s Escape handling below rather than a second
+  // scheme: a single document-level listener that is a no-op while the panel
+  // is already hidden.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("col-panel").hidden) closeColPanel(true);
   });
 }
 
@@ -4342,15 +4427,30 @@ try {
    clientWidth, which forces layout of the table sitting below it. One redraw
    per frame, and none at all if the width did not actually change. */
 let resizeQueued = false, lastChartW = 0;
+// Any session row expanded open (see toggleSessionDetail()) carries its own
+// redraw closure on its detail row; a plain SVG resize does not fire any
+// event of its own; the window resize is the only signal there is that the
+// chart's measured width might now be wrong.
+function resizeOpenTimelines() {
+  for (const dtr of document.querySelectorAll(".detail-row"))
+    if (dtr.__drawTimeline) dtr.__drawTimeline();
+}
 addEventListener("resize", () => {
   if (resizeQueued) return;
   resizeQueued = true;
   requestAnimationFrame(() => {
     resizeQueued = false;
     const w = $("chart-wrap").clientWidth || 0;
-    if (w === lastChartW) return;
-    lastChartW = w;
-    renderChart(filtered());
+    // The unchanged-width skip stays scoped to the summary chart, whose
+    // redraw re-runs the filter and re-aggregates every day - real cost worth
+    // avoiding. A session timeline redraw is bounded by one session's own
+    // points, so it is simply run every settled resize rather than adding a
+    // second stale-width memo per open row to guard something this cheap.
+    if (w !== lastChartW) {
+      lastChartW = w;
+      renderChart(filtered());
+    }
+    resizeOpenTimelines();
   });
 });
 </script>

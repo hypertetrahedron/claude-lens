@@ -8,13 +8,17 @@ adds are asserted only when the database actually has them, so this file is
 green both before and after the schema lands; whatever was skipped is printed
 at the end rather than passing in silence.
 """
+import gzip
+import http.client
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import HTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -155,6 +159,35 @@ class ApiRequest(ReceiverCase):
         self.assertEqual(
             self.con.execute("SELECT COUNT(*) FROM api_requests")
             .fetchone()[0], 0)
+
+    def test_agent_name_stays_null_but_the_type_survives_in_query_source(self):
+        """The type used to be written into agent_name, which is the CLI's
+        agentId column and the only thing that joins the agents table (see
+        CLAUDE.md's schema v9 note - it turned 36 distinct ids into 3 type
+        names and broke every join). request_row() must never write it there
+        again, and losing the type outright would be just as bad, so it has
+        to still be readable off query_source.
+        """
+        attrs = dict(self.ATTRS, request_id="req_sub",
+                    query_source="agent:builtin:general-purpose")
+        self.feed("claude_code.api_request", attrs)
+        r = self.row("api_requests", "request_id", "req_sub")
+        self.assertIsNone(r["agent_name"])
+        self.assertEqual(r["query_source"], "agent:builtin:general-purpose")
+        self.assertTrue(db.is_subagent_qs(r["query_source"]))
+
+    def test_speed_normal_is_stored_as_standard(self):
+        """OTel's word for "not fast" is "normal"; the transcript's is
+        "standard", and build_dashboard's switch detector and the fast-mode
+        price multiplier both compare against the transcript's spelling.
+        Storing OTel's own word here would fork live data into two spellings
+        of the same thing that nothing joins - test_core_columns never
+        exercises this because its fixture already uses "fast".
+        """
+        attrs = dict(self.ATTRS, request_id="req_speed", speed="normal")
+        self.feed("claude_code.api_request", attrs)
+        r = self.row("api_requests", "request_id", "req_speed")
+        self.check("api_requests", r, {"speed": "standard"})
 
 
 class ApiError(ReceiverCase):
@@ -449,6 +482,128 @@ class SessionEndHook(unittest.TestCase):
         self.assertEqual(mod.read_payload(_io.StringIO("[]")), {})
         self.assertEqual(mod.read_payload(_io.StringIO("  ")), {})
         self.assertEqual(mod.read_payload(_io.StringIO("{oops")), {})
+
+
+class HttpSurface(unittest.TestCase):
+    """The real request path, not handle_record() called directly.
+
+    Every other test in this file drives receiver.handle_record straight, so
+    none of them would notice a wrong path, a missing gzip decode, or one of
+    the hardening checks (Origin, content type, size cap) silently dropped -
+    all of which return 200 while quietly ingesting nothing, which is
+    indistinguishable from telemetry that simply stopped arriving.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="lens-receiver-http-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        receiver.reset_column_cache()
+        self.addCleanup(receiver.reset_column_cache)
+        # do_POST reads these two module globals directly (see receiver.py's
+        # Handler), so the real HTTP path can only be tested by pointing them
+        # at a temp database the way main() would, then restoring them.
+        self._old_con = receiver._con
+        self._old_lock = receiver._db_lock
+        receiver._con = db.connect(os.path.join(self.dir, "metrics.db"),
+                                   cross_thread=True)
+        receiver._db_lock = threading.Lock()
+        self.server = HTTPServer(("127.0.0.1", 0), receiver.Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+        self.addCleanup(self._shutdown)
+
+    def _shutdown(self):
+        # shutdown()+server_close() release the ephemeral port even if a test
+        # fails partway through; join() with a timeout keeps a misbehaving
+        # handler from hanging the whole suite instead of just this test.
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        receiver._con.close()
+        receiver._con = self._old_con
+        receiver._db_lock = self._old_lock
+
+    def payload(self):
+        rec = record("claude_code.api_request",
+                     dict(ApiRequest.ATTRS, request_id="req_http"))
+        return json.dumps(
+            {"resourceLogs": [{"scopeLogs": [{"logRecords": [rec]}]}]}
+        ).encode("utf-8")
+
+    def post(self, path, body, headers=None):
+        """POST `body` and return (status, response bytes).
+
+        A short client-side timeout so a hang in do_POST fails this test
+        instead of the whole suite.
+        """
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            hdrs = {"Content-Type": "application/json"}
+            if headers:
+                hdrs.update(headers)
+            conn.request("POST", path, body=body, headers=hdrs)
+            resp = conn.getresponse()
+            return resp.status, resp.read()
+        finally:
+            conn.close()
+
+    def count(self):
+        return receiver._con.execute(
+            "SELECT COUNT(*) FROM api_requests").fetchone()[0]
+
+    def test_a_plain_post_is_ingested(self):
+        status, _ = self.post("/v1/logs", self.payload())
+        self.assertEqual(status, 200)
+        self.assertEqual(self.count(), 1)
+
+    def test_gzip_encoded_body_is_decoded_and_ingested(self):
+        status, _ = self.post("/v1/logs", gzip.compress(self.payload()),
+                              headers={"Content-Encoding": "gzip"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.count(), 1)
+
+    def test_a_wrong_path_is_ignored(self):
+        """200 (it might be some other OTLP signal this receiver does not
+        collect), but nothing must land in the database - the only half of
+        this that a drifted path check would get silently wrong.
+        """
+        status, _ = self.post("/v1/traces", self.payload())
+        self.assertEqual(status, 200)
+        self.assertEqual(self.count(), 0)
+
+    def test_an_origin_header_is_rejected(self):
+        """A page the user has open can fetch() to 127.0.0.1; a real
+        OTLP/HTTP exporter never sends this header at all."""
+        status, _ = self.post("/v1/logs", self.payload(),
+                              headers={"Origin": "http://evil.example"})
+        self.assertEqual(status, 403)
+        self.assertEqual(self.count(), 0)
+
+    def test_a_non_json_content_type_is_rejected(self):
+        status, _ = self.post("/v1/logs", self.payload(),
+                              headers={"Content-Type": "text/plain"})
+        self.assertEqual(status, 415)
+        self.assertEqual(self.count(), 0)
+
+    def test_an_over_cap_content_length_is_rejected(self):
+        """Rejected off the declared header alone, before a byte of the body
+        is read - so this does not actually send MAX_BODY_BYTES of data."""
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.putrequest("POST", "/v1/logs", skip_accept_encoding=True)
+            conn.putheader("Content-Type", "application/json")
+            conn.putheader("Content-Length",
+                          str(receiver.MAX_BODY_BYTES + 1))
+            conn.endheaders()
+            resp = conn.getresponse()
+            status = resp.status
+            resp.read()
+        finally:
+            conn.close()
+        self.assertEqual(status, 413)
+        self.assertEqual(self.count(), 0)
 
 
 class CliFlags(unittest.TestCase):
