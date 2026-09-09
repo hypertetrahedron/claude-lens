@@ -136,18 +136,30 @@ def code_is_stale():
 
 
 _stale = False            # set once watched files change under us
+_schema_seen = None       # PRAGMA user_version as of the last check
+
+
+def _note_schema_version():
+    """Drop the PRAGMA caches if the database was migrated under us."""
+    global _schema_seen
+    if _con is None:
+        return
+    version = _con.execute("PRAGMA user_version").fetchone()[0]
+    if _schema_seen is not None and version != _schema_seen:
+        reset_column_cache()
+        log.info("database migrated to schema v%s; re-read its columns",
+                 version)
+    _schema_seen = version
+
 _db_lock = threading.Lock()
 _con = None               # opened in main(), so importing this module is free
                           # of side effects (the tests rely on that) and --db
                           # can still choose the file.
 
 
-def resolve_db(explicit=None):
-    """Which metrics.db to use. Prefers db.resolve_path once it exists."""
-    fn = getattr(db, "resolve_path", None)
-    if fn is not None:
-        return fn(explicit)
-    return explicit or os.environ.get("CLAUDE_LENS_DB") or db.DB_PATH
+# db.resolve_path is the one implementation; this name is kept because main()
+# and the tests already call it.
+resolve_db = db.resolve_path
 
 
 # ---------------------------------------------------------------------------
@@ -233,9 +245,11 @@ SETTINGS_TTL = 300          # seconds between re-reads of the settings files
 
 def settings_paths():
     """Every settings file that could carry `modelPricing`, in read order."""
-    home = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(
-        os.path.expanduser("~"), ".claude")
-    paths = [os.path.join(home, "settings.json")]
+    # sources.primary_dir() rather than a fourth copy of these two lines: the
+    # copy that used to be here read CLAUDE_CONFIG_DIR without expanding it,
+    # so a value like "~/alt" sent the receiver looking in a directory
+    # literally named "~" while every other module found the real one.
+    paths = [os.path.join(sources.primary_dir(), "settings.json")]
     for d in MANAGED_DIRS:
         paths.append(os.path.join(d, "managed-settings.json"))
         # Drop-ins let several teams own parts of one policy.
@@ -682,8 +696,17 @@ def reconcile(db_path=None):
     # transcript, the lock can go entirely: run() writes on its own connection,
     # so SQLite's own writer serialisation is enough.
     with _db_lock:
-        return jsonl_ingest.run(config=cfg, skip_remote_fetch=True,
-                                **ingest_kwargs(db_path))
+        stats = jsonl_ingest.run(config=cfg, skip_remote_fetch=True,
+                                 **ingest_kwargs(db_path))
+        # jsonl_ingest.run() opens its own connection, so it is the thing most
+        # likely to have just migrated the file - and this process's cached
+        # PRAGMA results still describe the schema from before. Every write
+        # here is filtered to the columns those caches list, so a receiver
+        # that missed a migration silently drops the new ones until someone
+        # restarts it. code_is_stale() catches an edited *file*; this catches
+        # a changed *database*.
+        _note_schema_version()
+        return stats
 
 
 def build_kwargs(db_path=None):

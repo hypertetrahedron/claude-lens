@@ -71,11 +71,10 @@ def read_payload(stream=None):
 
 
 def resolve_db(explicit=None):
+    # Imported here rather than at module scope: this hook must not pay for
+    # loading the storage layer on the paths that exit before touching it.
     import db
-    fn = getattr(db, "resolve_path", None)
-    if fn is not None:
-        return fn(explicit)
-    return explicit or os.environ.get("CLAUDE_LENS_DB") or db.DB_PATH
+    return db.resolve_path(explicit)
 
 
 def ingest(con, path):

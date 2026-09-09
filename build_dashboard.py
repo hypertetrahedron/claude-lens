@@ -632,6 +632,107 @@ def cost_basis(con, since=None):
     return "mixed"
 
 
+def session_lookups(con):
+    """Per-session display facts as five dicts keyed by session_id:
+    (project, kind, title, meta, slug_display).
+
+    Split out of collect() because it is a self-contained read that
+    depends on nothing collect() has worked out yet.
+    """
+    session_project = {}
+    session_kind = {}
+    session_title = {}
+    session_meta = {}
+    slug_display = {}
+    for sid, proj, cwd, label, title, first_ts, last_ts in con.execute(
+            "SELECT session_id, project, cwd, source_label, title, "
+            "first_ts, last_ts FROM sessions"):
+        if title:
+            session_title[sid] = title
+        session_meta[sid] = {"first_ts": first_ts, "last_ts": last_ts}
+        label = label or ""
+        base = os.path.basename((cwd or "").rstrip("\\/"))
+        disp = f"{label}/{base}" if (label and base) else (base or proj)
+        session_project[sid] = disp
+        # Which Claude product produced this row. Recorded explicitly rather
+        # than inferred from the name prefix in the UI, so a local folder that
+        # happens to be called "cowork" can't be mistaken for the desktop app.
+        session_kind[sid] = COWORK_KIND if label == sources.COWORK_LABEL else CODE_KIND
+        if proj and disp:
+            slug_display[proj] = disp
+    return (session_project, session_kind, session_title, session_meta,
+            slug_display)
+
+
+def reprice_from_run_cost(con, emitted):
+    """Spend the CLI's own per-session total where it provably covers
+    every run, and return how many rows were repriced.
+
+    `emitted` maps session_id to the rows that actually ran something.
+    Those rows are mutated in place: cost and composition scale by the
+    same factor, and `est` stays set, because what the CLI measured is
+    the session and not the prompt.
+    """
+    repriced = 0
+    for sid, auth_cost, runs in con.execute(
+            "SELECT session_id, cost_usd, runs FROM run_cost"):
+        group = emitted.get(sid) or []
+        est_total = sum(g["cost"] for g in group)
+        if not group or not auth_cost or runs != len(group) or est_total <= 0:
+            continue
+        # An unpriced model costs $0.00, so a prompt that ran on one carries no
+        # weight in `est_total` and would take none of the session total away
+        # from its neighbours: the whole session's spend would be shared out
+        # over the priced prompts while that one stayed at a confident $0.00 -
+        # a model we know we cannot price, displayed as free. The estimate is
+        # incomplete for such a session, so the authoritative total is left
+        # unspent and the notice bar names the model instead.
+        if any(g["unpriced"] for g in group):
+            continue
+        factor = auth_cost / est_total
+        for g in group:
+            g["cost"] *= factor
+            g["comp"] = [c * factor for c in g["comp"]]
+            # The session total is authoritative; this row's share of it is
+            # not. Each prompt gets the total scaled by its own estimate, so
+            # the figure on the row is still an estimate - a better one - and
+            # clearing `est` here would claim a per-prompt measurement the CLI
+            # never made. Only the session sum is exact.
+            g["est"] = True
+        repriced += len(group)
+    return repriced
+
+
+def agent_identity(con):
+    """agent_id -> (subagent type, the model it actually ran on).
+
+    `agents.agent_id` is what api_requests.agent_name and
+    tool_calls.agent_name carry, so the opaque id a row collected can be
+    traded for the type that was launched and the model it resolved to.
+    """
+    agent_meta = {}
+    for aid, kind, resolved, requested in con.execute(
+            "SELECT agent_id, subagent_type, resolved_model, requested_model "
+            "FROM agents"):
+        agent_meta[aid] = (kind, resolved or requested)
+    return agent_meta
+
+
+def subagent_cache_ttl(con):
+    """session_id -> "5m"/"1h", whichever tier this session's subagents
+    wrote more cache into. Both query_source spellings count - see
+    db.SUBAGENT_QS_SQL, which is why this is not a bare literal.
+    """
+    subagent_ttl = {}
+    for sid, c5, c1 in con.execute(
+            "SELECT session_id, SUM(COALESCE(cache_5m_tokens, 0)), "
+            "SUM(COALESCE(cache_1h_tokens, 0)) FROM api_requests "
+            "WHERE " + SUBAGENT_QS_SQL + " GROUP BY session_id"):
+        if (c5 or 0) or (c1 or 0):
+            subagent_ttl[sid] = "5m" if (c5 or 0) >= (c1 or 0) else "1h"
+    return subagent_ttl
+
+
 def collect(con, since=None):
     """Aggregate the DB into per-prompt rows + current-window stats.
 
@@ -655,27 +756,8 @@ def collect(con, since=None):
     # every box has a `src` or a `web` - and because the origin is worth
     # seeing. Stored project slugs are already qualified by the ingester, so
     # slug_display keys stay unique per source.
-    session_project = {}
-    session_kind = {}
-    session_title = {}
-    session_meta = {}
-    slug_display = {}
-    for sid, proj, cwd, label, title, first_ts, last_ts in con.execute(
-            "SELECT session_id, project, cwd, source_label, title, "
-            "first_ts, last_ts FROM sessions"):
-        if title:
-            session_title[sid] = title
-        session_meta[sid] = {"first_ts": first_ts, "last_ts": last_ts}
-        label = label or ""
-        base = os.path.basename((cwd or "").rstrip("\\/"))
-        disp = f"{label}/{base}" if (label and base) else (base or proj)
-        session_project[sid] = disp
-        # Which Claude product produced this row. Recorded explicitly rather
-        # than inferred from the name prefix in the UI, so a local folder that
-        # happens to be called "cowork" can't be mistaken for the desktop app.
-        session_kind[sid] = COWORK_KIND if label == sources.COWORK_LABEL else CODE_KIND
-        if proj and disp:
-            slug_display[proj] = disp
+    (session_project, session_kind, session_title, session_meta,
+     slug_display) = session_lookups(con)
     canon = resolve_map(con)
 
     rows = {}
@@ -918,43 +1000,10 @@ def collect(con, since=None):
     for r in rows.values():
         if (r["api_calls"] or r["tools"]) and r["session"]:
             emitted[r["session"]].append(r)
-    repriced = 0
-    for sid, auth_cost, runs in con.execute(
-            "SELECT session_id, cost_usd, runs FROM run_cost"):
-        group = emitted.get(sid) or []
-        est_total = sum(g["cost"] for g in group)
-        if not group or not auth_cost or runs != len(group) or est_total <= 0:
-            continue
-        # An unpriced model costs $0.00, so a prompt that ran on one carries no
-        # weight in `est_total` and would take none of the session total away
-        # from its neighbours: the whole session's spend would be shared out
-        # over the priced prompts while that one stayed at a confident $0.00 -
-        # a model we know we cannot price, displayed as free. The estimate is
-        # incomplete for such a session, so the authoritative total is left
-        # unspent and the notice bar names the model instead.
-        if any(g["unpriced"] for g in group):
-            continue
-        factor = auth_cost / est_total
-        for g in group:
-            g["cost"] *= factor
-            g["comp"] = [c * factor for c in g["comp"]]
-            # The session total is authoritative; this row's share of it is
-            # not. Each prompt gets the total scaled by its own estimate, so
-            # the figure on the row is still an estimate - a better one - and
-            # clearing `est` here would claim a per-prompt measurement the CLI
-            # never made. Only the session sum is exact.
-            g["est"] = True
-        repriced += len(group)
+    repriced = reprice_from_run_cost(con, emitted)
     REPRICED["rows"] = repriced
 
-    # Subagent identity: `agents.agent_id` is what api_requests.agent_name and
-    # tool_calls.agent_name carry, so the opaque id a row collected can be
-    # traded for the type that was launched and the model it actually ran on.
-    agent_meta = {}
-    for aid, kind, resolved, requested in con.execute(
-            "SELECT agent_id, subagent_type, resolved_model, requested_model "
-            "FROM agents"):
-        agent_meta[aid] = (kind, resolved or requested)
+    agent_meta = agent_identity(con)
 
     per_prompt_cache, per_session_cache, ctx_series = cache_scan(con, since,
                                                                  canon)
@@ -1055,13 +1104,7 @@ def collect(con, since=None):
     PROVIDERS.update(providers)
 
     blocks, burn = compute_blocks(con)
-    subagent_ttl = {}
-    for sid, c5, c1 in con.execute(
-            "SELECT session_id, SUM(COALESCE(cache_5m_tokens, 0)), "
-            "SUM(COALESCE(cache_1h_tokens, 0)) FROM api_requests "
-            "WHERE " + SUBAGENT_QS_SQL + " GROUP BY session_id"):
-        if (c5 or 0) or (c1 or 0):
-            subagent_ttl[sid] = "5m" if (c5 or 0) >= (c1 or 0) else "1h"
+    subagent_ttl = subagent_cache_ttl(con)
     EXTRAS.update({
         "ctx": ctx_series,
         "agent_spans": agent_spans(con, since),
@@ -1451,10 +1494,7 @@ def insights_report():
     Windows' drive-letter form), so this is encoded with pathname2url the
     same way report_index.py's _file_url does it.
     """
-    path = os.path.join(
-        os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR")
-                           or os.path.join("~", ".claude")),
-        "usage-data", "report.html")
+    path = os.path.join(sources.primary_dir(), "usage-data", "report.html")
     if not os.path.exists(path):
         return None
     return "file:" + pathname2url(os.path.abspath(path))
