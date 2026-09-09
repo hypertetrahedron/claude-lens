@@ -63,6 +63,24 @@ OTHER_TTL_MIN = 5
 # checked; "compact" is the only one that is not also visible on the requests.
 MISS_EVENT_KINDS = ("compact", "model_switch", "effort_switch", "speed_switch")
 
+# What the main conversation calls itself. A transcript writes "main"; the
+# CLI's own telemetry writes "repl_main_thread" for exactly the same requests,
+# and an OTel row wins every conflict, so a request both sources saw ends up
+# labelled the telemetry way. Filtering on "main" alone therefore kept only
+# the requests OTel never saw - on a live-monitored machine under a tenth of
+# the conversation - and the context curve drawn from what was left jumped
+# days at a time and invented idle-gap cache misses across the holes.
+# Anything not named here (subagent, agent:*, sdk, away_summary,
+# prompt_suggestion, the search and title-generation helpers) is a genuine
+# side thread against its own context and stays out.
+MAIN_QUERY_SOURCES = ("main", "repl_main_thread")
+# A sentinel for "no prompt seen yet in this session" that no prompt id can
+# equal - None cannot be used, because a request with a NULL prompt_id is a
+# real case and must not read as the start of a turn.
+_NO_PROMPT = object()
+MAIN_QS_SQL = ("(query_source IS NULL OR query_source IN ("
+               + ", ".join("'%s'" % q for q in MAIN_QUERY_SOURCES) + "))")
+
 # The context series carries one point per main-conversation request, so a
 # long history is a lot of points. Past the cap whole sessions are dropped,
 # oldest first, and the page says so.
@@ -218,8 +236,18 @@ def cache_scan(con, since=None, canon=None):
     Returns (per_prompt, per_session, ctx) where per_prompt maps a *canonical*
     prompt id (per `canon`, folding injected turns onto their parent - see
     resolve_map()) to [misses, miss_cost] and ctx maps a session id to a list
-    of [t, ctx, cr, cw, model, miss, cause, event] points. `canon` defaults to
-    resolve_map(con) when not passed by a caller that already has it.
+    of [t, ctx, cr, cw, model, miss, cause, event, turn, tools, terr] points.
+
+    `turn` is 1 on the first request of each prompt, which is what lets the
+    session timeline show where one turn ends and the next begins; it is the
+    *canonical* prompt that counts, so an injected turn does not read as a
+    new one. `tools` and `terr` are the tool calls, and the failed ones, that
+    landed between the previous request and this one - which is exactly the
+    set whose results this request is carrying, so the density lane and the
+    context curve are measuring the same thing at the same x.
+
+    `canon` defaults to resolve_map(con) when not passed by a caller that
+    already has it.
 
     Subagent requests are excluded: they run against their own context, so
     mixing them into the session's series would draw a sawtooth that never
@@ -234,6 +262,17 @@ def cache_scan(con, since=None, canon=None):
         if sid:
             events[sid].append((ts or "", kind))
 
+    # The main conversation's own tool calls. A subagent's are its own work
+    # and belong to its bar on the timeline, not to the turn that launched it,
+    # so agent_name has to be NULL here for the same reason subagent requests
+    # are left out of the series.
+    tools = defaultdict(list)
+    tsql, targs = _since_clause(
+        "SELECT session_id, ts, COALESCE(is_error, 0) FROM tool_calls "
+        "WHERE session_id IS NOT NULL AND agent_name IS NULL", since)
+    for sid, ts, bad in con.execute(tsql + " ORDER BY session_id, ts", targs):
+        tools[sid].append((ts or "", bad))
+
     sql, args = _since_clause(
         """SELECT session_id, prompt_id, ts, model, provider, effort, speed,
                   inference_geo, COALESCE(cache_read_tokens, 0),
@@ -242,7 +281,7 @@ def cache_scan(con, since=None, canon=None):
                   COALESCE(context_tokens, 0)
              FROM api_requests
             WHERE session_id IS NOT NULL
-              AND (query_source IS NULL OR query_source = 'main')""", since)
+              AND """ + MAIN_QS_SQL, since)
     sql += " ORDER BY session_id, ts"
 
     resolve = pricing.resolve
@@ -250,13 +289,16 @@ def cache_scan(con, since=None, canon=None):
     per_session = {}
     ctx = {}
     cur = prev = None
+    last_pid = _NO_PROMPT
     evs, ei, points, stats = [], 0, [], None
+    tls, ti = [], 0
 
     for (sid, pid, ts, model, provider, effort, speed, geo, cr, cw, c5, c1,
          ctx_tokens) in con.execute(sql, args):
         if sid != cur:
-            cur, prev = sid, None
+            cur, prev, last_pid = sid, None, _NO_PROMPT
             evs, ei = events.get(sid) or [], 0
+            tls, ti = tools.get(sid) or [], 0
             points = ctx.setdefault(sid, [])
             stats = per_session.setdefault(sid, {
                 "misses": 0, "miss_cost": 0.0, "peak_ctx": 0,
@@ -268,6 +310,11 @@ def cache_scan(con, since=None, canon=None):
         while ei < len(evs) and evs[ei][0] <= (ts or ""):
             seen.append(evs[ei][1])
             ei += 1
+        n_tools = n_terr = 0
+        while ti < len(tls) and tls[ti][0] <= (ts or ""):
+            n_tools += 1
+            n_terr += 1 if tls[ti][1] else 0
+            ti += 1
         dt = parse_ts(ts)
         # "normal" and "standard" both mean the request was not fast mode;
         # without this a standard->NULL pair (or vice versa) reads as a
@@ -304,10 +351,118 @@ def cache_scan(con, since=None, canon=None):
             stats["misses"] += 1
             if pid:
                 per_prompt[canon.get(pid, pid)][0] += 1
+        # A request with no prompt id at all cannot start a turn - saying it
+        # did would put a boundary on every such request in a row.
+        cpid = canon.get(pid, pid) if pid else None
+        turn = 1 if (cpid is not None and cpid != last_pid) else 0
+        if cpid is not None:
+            last_pid = cpid
         points.append([int(dt.timestamp()) if dt else None, ctx_tokens, cr, cw,
-                       model, miss, cause, seen[0] if seen else None])
+                       model, miss, cause, seen[0] if seen else None, turn,
+                       n_tools, n_terr])
         prev = (cr, model, effort, speed_n, dt)
     return per_prompt, per_session, ctx
+
+
+def agent_spans(con, since=None):
+    """When each subagent ran, per session: {session_id: [span, ...]}.
+
+    A subagent's requests carry the CLI's agentId in `api_requests.agent_name`,
+    so the launch-to-last-request span is a group-by on that column - the
+    `agents` table is joined only for the things a request does not know (what
+    type of agent it was, what the user asked it for). The span *starts* at
+    the agents row's own timestamp where there is one, because that is the
+    moment the Agent tool was called; the first request is a second or two
+    later and, for an agent whose requests were never ingested, is not there
+    at all.
+
+    There is no end timestamp anywhere - a subagent stops when it stops - so
+    the last request is the end, and a one-request agent gets a zero-length
+    span the timeline widens to a visible minimum rather than a bar of the
+    wrong length.
+
+    Cost is priced here rather than read off the rows: transcript-sourced
+    subagent requests carry no cost_usd at all, so summing that column
+    reported every jsonl-only subagent as free.
+    """
+    meta = {}
+    for aid, sid, ts, typ, model, desc in con.execute(
+            "SELECT agent_id, session_id, ts, subagent_type, "
+            "COALESCE(resolved_model, requested_model), description "
+            "FROM agents"):
+        meta[aid] = (sid, ts, typ, model, desc)
+
+    sql, args = _since_clause(
+        """SELECT session_id, agent_name, model, provider, speed,
+                  inference_geo, cost_usd IS NULL, COUNT(*),
+                  SUM(COALESCE(input_tokens, 0)),
+                  SUM(COALESCE(output_tokens, 0)),
+                  SUM(COALESCE(cache_read_tokens, 0)),
+                  SUM(COALESCE(cache_create_tokens, 0)),
+                  SUM(COALESCE(cache_5m_tokens, 0)),
+                  SUM(COALESCE(cache_1h_tokens, 0)),
+                  SUM(MAX(COALESCE(cache_create_tokens, 0)
+                          - COALESCE(cache_5m_tokens, 0)
+                          - COALESCE(cache_1h_tokens, 0), 0)),
+                  SUM(cost_usd), MIN(ts), MAX(ts)
+             FROM api_requests
+            WHERE agent_name IS NOT NULL AND session_id IS NOT NULL""", since)
+    acc = {}
+    for (sid, aid, model, provider, speed, geo, nocost, calls, inp, out, cr,
+         cw, c5, c1, unsplit, cost, ts_min, ts_max) in con.execute(
+            sql + """ GROUP BY session_id, agent_name, model, provider, speed,
+                               inference_geo, cost_usd IS NULL,
+                               substr(ts, 1, 10)""", args):
+        rate = pricing.resolve(model, ts_min, provider, speed, geo)
+        if nocost:
+            cost = 0.0 if rate is None else pricing.cost_at(
+                rate, inp, out, cr, c5, c1, unsplit, provider)
+        a = acc.get((sid, aid))
+        if a is None:
+            a = acc[(sid, aid)] = {"agent": aid, "t0": ts_min, "t1": ts_max,
+                                   "calls": 0, "out": 0, "cost": 0.0,
+                                   "model": model, "est": bool(nocost)}
+        a["calls"] += calls
+        a["out"] += out or 0
+        a["cost"] += cost or 0.0
+        a["est"] = a["est"] or bool(nocost)
+        if ts_min and ts_min < a["t0"]:
+            a["t0"] = ts_min
+        if ts_max and ts_max > a["t1"]:
+            a["t1"] = ts_max
+
+    # Agents the requests never mentioned: launched, but their transcript was
+    # not ingested (or never written). They still belong on the timeline -
+    # leaving them off would say the turn ran nothing.
+    for aid, (sid, ts, typ, model, desc) in meta.items():
+        if sid and ts and (sid, aid) not in acc:
+            acc[(sid, aid)] = {"agent": aid, "t0": ts, "t1": ts, "calls": 0,
+                               "out": 0, "cost": 0.0, "model": model,
+                               "est": False}
+
+    out_by_session = defaultdict(list)
+    for (sid, aid), a in acc.items():
+        sid_m, ts_m, typ, model_m, desc = meta.get(aid, (None,) * 5)
+        if ts_m and (a["t0"] is None or ts_m < a["t0"]):
+            a["t0"] = ts_m
+        t0, t1 = parse_ts(a["t0"]), parse_ts(a["t1"])
+        if not t0:
+            continue
+        out_by_session[sid].append({
+            "session": sid,
+            "t0": int(t0.timestamp()),
+            "t1": int((t1 or t0).timestamp()),
+            "type": typ,
+            "desc": desc,
+            "model": model_m or a["model"],
+            "calls": a["calls"],
+            "out": a["out"],
+            "cost": round(a["cost"], 4),
+            "est": 1 if a["est"] else 0,
+        })
+    for spans in out_by_session.values():
+        spans.sort(key=lambda s: (s["t0"], s["t1"]))
+    return dict(out_by_session)
 
 
 def compute_blocks(con, now=None, days=BLOCK_DAYS):
@@ -865,6 +1020,7 @@ def collect(con, since=None):
             subagent_ttl[sid] = "5m" if (c5 or 0) >= (c1 or 0) else "1h"
     EXTRAS.update({
         "ctx": ctx_series,
+        "agent_spans": agent_spans(con, since),
         "session_cache": per_session_cache,
         "session_meta": session_meta,
         "session_title": session_title,
@@ -1024,7 +1180,12 @@ SESSION_COLUMNS = ("id", "title", "project", "kind", "start", "end",
 # What one point of the context series means once rehydrated. The wire form
 # is smaller than this (see compact_ctx); the template puts it back.
 CTX_COLUMNS = ("session", "t", "ctx", "cr", "cw", "model", "miss", "cause",
-               "event")
+               "event", "turn", "tools", "terr")
+
+# One subagent run: when it started, when its last request landed, and what it
+# was. See agent_spans().
+AGENT_SPAN_COLUMNS = ("session", "t0", "t1", "type", "desc", "model", "calls",
+                      "out", "cost", "est")
 
 BLOCK_COLUMNS = ("start", "end", "calls", "cost", "out", "inp", "cr", "cw",
                  "models", "active")
@@ -1132,21 +1293,29 @@ def compact_ctx(points, strings):
     - `session` and `model` are run-length encoded as [first index, string]
       pairs: the series is ordered by session and a session rarely changes
       model, so a few hundred pairs replace a value on every point.
-    - `miss`, `cause` and `event` are sparse: a list of indices, and of
-      [index, string] pairs. They are empty on well over 90% of points.
+    - `miss`, `cause`, `event`, `turn` and `terr` are sparse: a list of
+      indices, and of [index, string] pairs. They are empty on well over 90%
+      of points - `turn` marks one request per prompt out of the dozens a
+      prompt makes, and a failed tool call is rarer still. `terr` carries its
+      count, so it goes out as [index, n] pairs rather than bare indices.
+
+    `tools` is the one new dense column: most requests carry one or two tool
+    results and the run lengths are short, so a plain array of small integers
+    beats every encoding worth the code.
 
     The result is a fifth of the size and rehydrates to exactly the same
     array of objects it would have without any of this.
     """
     n = len(points)
     t0 = next((p[1] for p in points if p[1] is not None), 0)
-    cols = {"t": [], "ctx": [], "cr": [], "cw": []}
+    cols = {"t": [], "ctx": [], "cr": [], "cw": [], "tools": []}
     runs = {"session": [], "model": []}
-    sparse = {"miss": [], "cause": [], "event": []}
+    sparse = {"miss": [], "cause": [], "event": [], "turn": [], "terr": []}
     prev_t = t0
     last = object()
     last_session, last_model = last, last
-    for i, (sid_, t, ctx, cr, cw, model, miss, cause, event) in enumerate(points):
+    for i, (sid_, t, ctx, cr, cw, model, miss, cause, event, turn, n_tools,
+            n_terr) in enumerate(points):
         # A request whose timestamp would not parse keeps the previous point's
         # time rather than inventing one; the series is a curve, not a clock.
         t = prev_t if t is None else t
@@ -1155,6 +1324,7 @@ def compact_ctx(points, strings):
         cols["ctx"].append(ctx)
         cols["cr"].append(cr)
         cols["cw"].append(cw)
+        cols["tools"].append(n_tools)
         if sid_ != last_session:
             runs["session"].append([i, strings(sid_)])
             last_session = sid_
@@ -1167,6 +1337,10 @@ def compact_ctx(points, strings):
             sparse["cause"].append([i, strings(cause)])
         if event:
             sparse["event"].append([i, strings(event)])
+        if turn:
+            sparse["turn"].append(i)
+        if n_terr:
+            sparse["terr"].append([i, n_terr])
     return {"n": n, "t0": t0, "cols": cols, "runs": runs, "sparse": sparse}
 
 
@@ -1242,6 +1416,28 @@ def insights_report():
     return "file:" + pathname2url(os.path.abspath(path))
 
 
+def embed_json(payload):
+    """Serialise `payload` for pasting inside an HTML <script> element.
+
+    The HTML tokenizer looks for the literal `</script` before any JavaScript
+    parsing happens, so a prompt that merely mentions one closes the real
+    script element early: the rest of the payload lands on the page as text,
+    `DATA` is never assigned, the table renders nothing, and anything after
+    the sequence is parsed as markup and runs. Escaping `<` is enough to stop
+    it; `>` and `&` go too so no other tokenizer state (`<!--`, an entity)
+    can be entered either.
+
+    A bare `<`, `>` or `&` can only ever occur inside a JSON string literal -
+    JSON's own grammar has no use for them - so replacing every one with its
+    \\uXXXX form is safe wholesale and parses back to exactly the same value.
+    U+2028 and U+2029 are already handled by ensure_ascii.
+    """
+    text = json.dumps(payload, separators=(",", ":"))
+    return (text.replace("<", "\\u003c")
+                .replace(">", "\\u003e")
+                .replace("&", "\\u0026"))
+
+
 def build(con=None, max_rows=DEFAULT_MAX_ROWS, redact=False, cfg=None,
           conversations_n=DEFAULT_CONVERSATIONS, check_receiver=True,
           db_path=None):
@@ -1286,9 +1482,21 @@ def build(con=None, max_rows=DEFAULT_MAX_ROWS, redact=False, cfg=None,
         notices.append(
             f"{conv['skipped_missing']} conversation page(s) were not written: "
             "their transcript is no longer on disk.")
+    if conv.get("capped"):
+        notices.append(
+            f"Conversation pages cover the newest {conversations_n:,} "
+            f"prompt(s); the other {conv['capped']:,} have no page. Rebuild "
+            "with --conversations to change that.")
 
     sessions = session_rows(out_rows, redact)
     points, ctx_dropped = ctx_points([s["id"] for s in sessions])
+    # Subagent spans ride along with the sessions the page actually lists;
+    # spans for a session that is not in the payload have nothing to draw on.
+    # Descriptions are prompt text the user typed, so --no-prompt-text drops
+    # them for the same reason it drops everything else a prompt said.
+    by_session = EXTRAS.get("agent_spans") or {}
+    spans = [dict(sp, desc=None) if redact else sp
+             for s in sessions for sp in by_session.get(s["id"], ())]
     if ctx_dropped:
         notices.append(
             f"The context series is capped at {CTX_CAP:,} points; the "
@@ -1314,6 +1522,9 @@ def build(con=None, max_rows=DEFAULT_MAX_ROWS, redact=False, cfg=None,
             list_str_cols=("models",)),
         "ctx": compact_ctx(points, strings),
         "ctx_truncated": bool(ctx_dropped),
+        "agent_spans": compact_table(
+            spans, AGENT_SPAN_COLUMNS, strings,
+            str_cols=("session", "type", "desc", "model")),
         "blocks": compact_table(
             [dict(b, start=b["start"].isoformat(timespec="seconds"),
                   end=b["end"].isoformat(timespec="seconds"),
@@ -1326,22 +1537,30 @@ def build(con=None, max_rows=DEFAULT_MAX_ROWS, redact=False, cfg=None,
         "baseline": dict(BASELINE),
         "overhead": EXTRAS.get("overhead") or {"by_model": [], "tokens": 0,
                                                "usd": 0.0},
-        "insights_report": insights_report(),
+        # A file: URL under the home directory, so it carries the account
+        # name. --no-prompt-text exists to make the page safe to hand to
+        # someone else, and a username is exactly the kind of thing that
+        # build is supposed to withhold. The template hides the link when
+        # this is null.
+        "insights_report": None if redact else insights_report(),
         "cost_basis": EXTRAS.get("cost_basis"),
         "conversations": conv.get("count", 0),
         "notices": notices,
         "strings": string_table,
+        # Every unpriced model, not a slice of them: the notice bar derives
+        # both its count and its list from this array, so dropping the tail
+        # made the page understate how many models it was costing at $0.00
+        # and leave the rest unnamed anywhere. Dearest first.
         "unpriced": [
             {"model": m, "rows": e["rows"], "tokens": e["tokens"],
              "provider": e.get("provider")}
             for m, e in sorted(unpriced_models().items(),
-                               key=lambda kv: -kv[1]["tokens"])[:6]
+                               key=lambda kv: -kv[1]["tokens"])
         ],
     }
     with open(TEMPLATE, encoding="utf-8") as f:
         html = f.read()
-    html = html.replace("/*__DATA__*/null",
-                        json.dumps(payload, separators=(",", ":")))
+    html = html.replace("/*__DATA__*/null", embed_json(payload))
     tmp = OUTPUT + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(html)

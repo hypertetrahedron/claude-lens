@@ -37,7 +37,9 @@ import difflib
 import glob
 import hashlib
 import json
+import ntpath
 import os
+import posixpath
 import re
 import time
 
@@ -600,9 +602,15 @@ class SwitchTracker:
         self.seeded = True
         if not (self.con and self.session_id and ts):
             return
+        # "repl_main_thread" is the same conversation under the name the
+        # CLI's telemetry gives it, and an OTel row overwrites the transcript
+        # label - so a session the receiver watched has almost no rows left
+        # that say "main", and seeding on that alone found nothing and
+        # reported the session's first model as a switch.
         row = self.con.execute(
             """SELECT model, effort, speed FROM api_requests
-               WHERE session_id=? AND query_source='main' AND ts < ?
+               WHERE session_id=? AND query_source IN ('main',
+                     'repl_main_thread') AND ts < ?
                ORDER BY ts DESC LIMIT 1""",
             (self.session_id, ts)).fetchone()
         if row:
@@ -866,6 +874,29 @@ def record_injected_prompt(rows, entry, session, project, last_human):
     return kind
 
 
+def join_tracked(parent, tracked_path):
+    """Absolute path for a tracked file, in the flavour it was recorded in.
+
+    os.path.join is the wrong tool here twice over. The transcript records
+    these strings in the path flavour of the machine that wrote them, so on
+    Windows join splices a backslash into a POSIX path and the result matches
+    nothing; and `tracked_path` keeps its intermediate directories
+    (`pipeline/src/app.py`), so reducing it to a basename throws away most of
+    the path. Both mattered: the hash is taken over the exact string, so
+    either mistake makes every lookup miss.
+    """
+    tracked_path = tracked_path.replace("\\", "/").lstrip("/")
+    if not parent:
+        return tracked_path
+    mod = ntpath if _looks_windows(parent) else posixpath
+    return mod.join(parent, *tracked_path.split("/"))
+
+
+def _looks_windows(path):
+    """Whether a recorded path uses Windows conventions."""
+    return bool(re.match(r"^[A-Za-z]:[\\/]", path)) or path.startswith("\\\\")
+
+
 def note_file_history(fh, entry):
     """Collect the file-version bookkeeping a transcript records.
 
@@ -873,8 +904,13 @@ def note_file_history(fh, entry):
       file-history-delta    -> {trackingPath, backup:{backupFileName, version,
                                 backupTime, realParentDir}}
       file-history-snapshot -> {snapshot:{trackedFileBackups: {path: backup}}}
-    `backupFileName` is frequently null on a delta and present in the
-    snapshot, so both are read and the answer is keyed by absolute path.
+
+    Keyed by the tracked path as recorded, which on real transcripts is
+    RELATIVE to the session's cwd and keeps its subdirectories. Per version
+    we keep the timestamp and, when the transcript gives one, `backupFileName`
+    - the literal name of the file on disk. Preferring that name is what makes
+    recovery independent of guessing the string the CLI hashed: on the
+    transcripts checked, `realParentDir` is null and the name is present.
     """
     if entry.get("type") == "file-history-delta":
         items = [(entry.get("trackingPath"), entry.get("backup"))]
@@ -887,13 +923,17 @@ def note_file_history(fh, entry):
     for tracked_path, backup in items:
         if not (tracked_path and isinstance(backup, dict)):
             continue
-        parent = backup.get("realParentDir")
-        full = (os.path.join(parent, os.path.basename(tracked_path))
-                if parent else tracked_path)
-        record = fh.setdefault(full, {})
+        record = fh.setdefault(tracked_path, {"times": {}, "names": {},
+                                              "parent": None})
+        if backup.get("realParentDir"):
+            record["parent"] = backup["realParentDir"]
         version = backup.get("version")
-        if isinstance(version, int) and backup.get("backupTime"):
-            record[version] = backup["backupTime"]
+        if not isinstance(version, int):
+            continue
+        if backup.get("backupTime"):
+            record["times"][version] = backup["backupTime"]
+        if backup.get("backupFileName"):
+            record["names"][version] = backup["backupFileName"]
 
 
 def ingest_main_file(con, path, label="", project_override=None, fh_maps=None):
@@ -1166,6 +1206,25 @@ def _read_lines(path):
         return None
 
 
+def _path_key(path):
+    """Comparable form of a recorded file path, for "already measured?".
+
+    One file reaches `edits` under several spellings: a tool call reports the
+    working-copy path (`y:\\repo\\x.py`), while a file-history snapshot's
+    `realParentDir` can be the UNC target of that same mapped drive
+    (`\\\\host\\share\\repo\\x.py`), and drive-letter case varies between
+    rows. The guard against counting one edit twice has to see through all of
+    it, and comparing the strings does not.
+
+    realpath is no help - it resolves against the process cwd and turned a
+    UNC path into a doubled nonsense path when tried. The basename is the one
+    component every spelling agrees on, so that is the key. Matching too
+    broadly can only skip a recovery, which is already a documented limit of
+    this pass; a double count would be a wrong number, which is not.
+    """
+    return os.path.basename(path.replace("\\", "/").rstrip("/")).lower()
+
+
 def recover_file_history(con, claude_dir, fh_maps):
     """Recover subagent edits from the file-version snapshots on disk.
 
@@ -1205,15 +1264,37 @@ def recover_file_history(con, claude_dir, fh_maps):
             """SELECT ts, prompt_id FROM prompts
                WHERE session_id=? AND ts IS NOT NULL ORDER BY ts""",
             (session,)).fetchall()
-        for file_path, versions in tracked.items():
+        # The tracked keys are relative to the session's cwd, which is the
+        # only place the absolute path can come from when the transcript's
+        # realParentDir is null - as it is on every snapshot checked.
+        row = con.execute("SELECT cwd FROM sessions WHERE session_id=?",
+                          (session,)).fetchone()
+        cwd = row[0] if row else None
+        # Files this session already has a measured edit for, keyed so that a
+        # mapped drive and its UNC target compare equal. Our own rows are
+        # excluded: a later checkpoint of a file recovered last run still has
+        # a new diff to contribute, and the tool_use_id conflict is what
+        # keeps that idempotent.
+        measured = {_path_key(p) for (p,) in con.execute(
+            "SELECT DISTINCT file_path FROM edits WHERE session_id=? "
+            "AND file_path IS NOT NULL AND source<>'file-history'",
+            (session,))}
+        for tracked_path, record in tracked.items():
+            versions = record["times"]
+            file_path = join_tracked(record["parent"] or cwd, tracked_path)
+            # The transcript's own backupFileName beats deriving the name from
+            # a hash: it is the name on disk, and needs nothing guessed about
+            # which string the CLI hashed. Falling back to the hash keeps
+            # older transcripts, which record no name, working.
+            available = sorted(
+                (v, n) for v, n in record["names"].items()
+                if os.path.exists(os.path.join(session_dir, n)))
             digest = backup_hash(file_path)
-            available = sorted(by_hash.get(digest, []))
+            if len(available) < 2:
+                available = sorted(by_hash.get(digest, []))
             if len(available) < 2:
                 continue        # only one checkpoint: nothing to diff against
-            have = con.execute(
-                "SELECT 1 FROM edits WHERE session_id=? AND file_path=? LIMIT 1",
-                (session, file_path)).fetchone()
-            if have:
+            if _path_key(file_path) in measured:
                 continue        # already measured from a tool result
             prev = _read_lines(os.path.join(session_dir, available[0][1]))
             for number, name in available[1:]:
@@ -1240,8 +1321,11 @@ def recover_file_history(con, claude_dir, fh_maps):
                         prompt_id = p_id
                     else:
                         break
+                # Keyed by the backup's own filename, which is unique within
+                # the session and stable across re-runs, so a second pass
+                # collides with itself instead of inserting a duplicate.
                 db.insert_edit(
-                    con, "fh:%s:%s@v%d" % (session, digest, number), prompt_id,
+                    con, "fh:%s:%s" % (session, name), prompt_id,
                     session, ts, file_path, "update", added, removed, chars,
                     None, "file-history")
                 written += 1

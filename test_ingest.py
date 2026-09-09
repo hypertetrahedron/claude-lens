@@ -608,6 +608,160 @@ class FileHistoryRecovery(TranscriptCase):
             self.one("SELECT COUNT(*) FROM edits WHERE source='file-history'"), 1)
 
 
+class FileHistoryPathShapes(unittest.TestCase):
+    """join_tracked keeps a recorded path in the flavour it was recorded in.
+
+    The hash is taken over the exact string the CLI used, so a separator
+    spliced in by the local os.path flavour makes every lookup miss. These ran
+    red on Windows before join_tracked existed.
+    """
+
+    def test_posix_parent_stays_posix(self):
+        self.assertEqual(
+            ji.join_tracked("/home/someone/repo", "module.py"),
+            "/home/someone/repo/module.py")
+
+    def test_windows_parent_stays_windows(self):
+        self.assertEqual(
+            ji.join_tracked(r"Y:\projects\app", r"src\main.py"),
+            r"Y:\projects\app\src\main.py")
+
+    def test_subdirectories_are_kept_not_reduced_to_a_basename(self):
+        self.assertEqual(
+            ji.join_tracked("/repo", "pipeline/src/app/load.py"),
+            "/repo/pipeline/src/app/load.py")
+        self.assertEqual(
+            ji.join_tracked(r"C:\repo", r"pipeline\src\load.py"),
+            r"C:\repo\pipeline\src\load.py")
+
+    def test_no_parent_leaves_the_relative_path(self):
+        self.assertEqual(ji.join_tracked(None, "a/b.py"), "a/b.py")
+
+    def test_hash_matches_the_cli_for_a_windows_path(self):
+        """Reproduces a real backup name seen on disk."""
+        full = ji.join_tracked(r"Y:\projects-software\academic-analysis",
+                               r"pipeline\src\aa_pipeline\load_gsu.py")
+        self.assertEqual(ji.backup_hash(full), "0aff3496a3a682c2")
+
+
+class FileHistoryRealShape(TranscriptCase):
+    """The shape real transcripts use, which is not the one above.
+
+    On every snapshot checked: `realParentDir` is null, the tracked key is
+    RELATIVE to the session cwd and keeps its subdirectories, and
+    `backupFileName` is present and is the literal name on disk. Recovery has
+    to work from the name rather than from a hash it derived itself, so these
+    backups are deliberately named nothing like a hash of anything.
+    """
+
+    REL = "pipeline/src/load.py"
+    ABS = "/home/someone/repo/pipeline/src/load.py"   # cwd from entry()
+
+    def build(self, versions):
+        folder = os.path.join(self.claude_dir, "file-history", SESSION)
+        os.makedirs(folder, exist_ok=True)
+        for name, body in versions.items():
+            with open(os.path.join(folder, name), "w", encoding="utf-8") as f:
+                f.write(body)
+        self.write([
+            human("p1", "refactor it", "2026-09-01T10:00:00.000Z"),
+            assistant("req_A", "2026-09-01T10:00:01.000Z", blocks=[
+                tool_use("toolu_agent", "Agent",
+                         {"subagent_type": "general-purpose",
+                          "description": "edit"})]),
+            tool_result("toolu_agent", "2026-09-01T10:00:02.000Z", "done",
+                        tool_use_result={"agentId": "cc33", "status": "done",
+                                         "resolvedModel": "claude-opus-5"}),
+            {"type": "file-history-snapshot", "messageId": "m1",
+             "snapshot": {"messageId": "m1",
+                          "timestamp": "2026-09-01T10:10:00.000Z",
+                          "trackedFileBackups": {
+                              self.REL: {"backupFileName": "notahash@v1",
+                                         "version": 1,
+                                         "backupTime": "2026-09-01T10:04:00.000Z",
+                                         "realParentDir": None}}}},
+            {"type": "file-history-snapshot", "messageId": "m2",
+             "snapshot": {"messageId": "m2",
+                          "timestamp": "2026-09-01T10:11:00.000Z",
+                          "trackedFileBackups": {
+                              self.REL: {"backupFileName": "notahash@v2",
+                                         "version": 2,
+                                         "backupTime": "2026-09-01T10:06:00.000Z",
+                                         "realParentDir": None}}}},
+        ])
+        self.write_subagent("cc33", [
+            entry(type="user", promptId="p1", agentId="cc33", isSidechain=True,
+                  timestamp="2026-09-01T10:05:00.000Z",
+                  message={"role": "user", "content": "go"}),
+            assistant("req_S", "2026-09-01T10:05:01.000Z", agent="cc33", blocks=[
+                tool_use("toolu_edit", "Edit", {"file_path": self.ABS,
+                                                "old_string": "a",
+                                                "new_string": "b"})]),
+            entry(type="user", promptId="p1", agentId="cc33", isSidechain=True,
+                  timestamp="2026-09-01T10:05:02.000Z",
+                  message={"role": "user",
+                           "content": [{"type": "tool_result",
+                                        "tool_use_id": "toolu_edit",
+                                        "content": "ok"}]}),
+        ])
+        self.ingest()
+
+    def test_recovers_from_the_recorded_backup_name(self):
+        self.build({"notahash@v1": "one\ntwo\nthree\n",
+                    "notahash@v2": "one\nTWO\nthree\nfour\n"})
+        row = self.rows(
+            """SELECT prompt_id, session_id, file_path, kind, lines_added,
+                      lines_removed FROM edits WHERE source='file-history'""")
+        self.assertEqual(len(row), 1)
+        self.assertEqual(row[0], ("p1", SESSION, self.ABS, "update", 2, 1))
+
+    def test_the_stored_path_is_absolute_via_the_session_cwd(self):
+        """A relative key must not be stored as the file's identity."""
+        self.build({"notahash@v1": "a\n", "notahash@v2": "a\nb\n"})
+        self.assertEqual(
+            self.one("SELECT file_path FROM edits WHERE source='file-history'"),
+            self.ABS)
+
+    def test_recovery_is_idempotent(self):
+        self.build({"notahash@v1": "a\n", "notahash@v2": "a\nb\n"})
+        self.ingest()
+        self.assertEqual(
+            self.one("SELECT COUNT(*) FROM edits WHERE source='file-history'"), 1)
+
+    def test_a_missing_backup_file_is_not_trusted(self):
+        """A name the transcript records but disk does not have is skipped."""
+        self.build({"notahash@v1": "a\n"})      # v2 named but never written
+        self.assertEqual(
+            self.one("SELECT COUNT(*) FROM edits WHERE source='file-history'"), 0)
+
+    def test_another_spelling_of_the_same_path_is_still_measured(self):
+        """The double count this pass produced against real data.
+
+        A tool call reports the working-copy path while the snapshot's
+        realParentDir can be the UNC target of the same mapped drive, so the
+        strings differ and the "already measured" guard sailed straight past
+        an edit that had been counted exactly once already.
+        """
+        db.insert_edit(self.con, "toolu_real", "p1", SESSION,
+                       "2026-09-01T10:04:30.000Z",
+                       r"y:\repo\pipeline\src\LOAD.py", "update",
+                       2, 1, 9, None, "jsonl")
+        self.build({"notahash@v1": "one\ntwo\nthree\n",
+                    "notahash@v2": "one\nTWO\nthree\nfour\n"})
+        self.assertEqual(
+            self.one("SELECT COUNT(*) FROM edits WHERE source='file-history'"),
+            0, "the same file was counted twice under two spellings")
+
+    def test_path_key_sees_through_drive_unc_and_case(self):
+        self.assertEqual(
+            ji._path_key(r"y:\repo\src\x.py"),
+            ji._path_key(r"\\HOST\Share\repo\src\X.PY"))
+        self.assertEqual(ji._path_key("/home/a/b/x.py"),
+                         ji._path_key(r"C:\other\x.py"))
+        self.assertNotEqual(ji._path_key("/repo/x.py"),
+                            ji._path_key("/repo/y.py"))
+
+
 class SingleFileEntryPoint(TranscriptCase):
     """What the SessionEnd hook calls."""
 
@@ -918,6 +1072,77 @@ class OtelUpsertFillsOnly(unittest.TestCase):
         got = self.con.execute(
             "SELECT source, output_tokens FROM api_requests").fetchone()
         self.assertEqual(tuple(got), ("otel", 100))
+
+    def test_effort_and_speed_survive_an_otel_row_that_lacks_them(self):
+        """The receiver reads both from attributes some events simply omit.
+
+        A transcript records them per request, so replacing rather than
+        filling turned a measured "high"/"fast" into NULL the moment live
+        telemetry caught up - the same trap as the cache TTL split.
+        """
+        db.upsert_request(self.con, self.row(effort="high", speed="fast"),
+                          "jsonl")
+        db.upsert_request(self.con, self.row(cost_usd=0.5), "otel")
+        self.assertEqual(
+            tuple(self.con.execute("SELECT source, effort, speed FROM "
+                                   "api_requests").fetchone()),
+            ("otel", "high", "fast"))
+
+    def test_an_otel_row_that_carries_them_still_wins(self):
+        db.upsert_request(self.con, self.row(effort="high", speed="fast"),
+                          "jsonl")
+        db.upsert_request(self.con, self.row(effort="low", speed="slow"),
+                          "otel")
+        self.assertEqual(
+            tuple(self.con.execute("SELECT effort, speed FROM "
+                                   "api_requests").fetchone()),
+            ("low", "slow"))
+
+    def test_a_transcript_fills_a_hole_an_otel_row_left(self):
+        """Live mode writes the OTel row first, so this is the usual order.
+
+        Making OTel fill rather than replace only helps when the transcript
+        was read first; a request the receiver claimed before the transcript
+        was parsed had a hole nothing could ever fill.
+        """
+        db.upsert_request(self.con, self.row(effort=None, speed=None,
+                                             thinking_tokens=None,
+                                             cost_usd=0.5), "otel")
+        db.upsert_request(self.con, self.row(effort="high", speed="fast",
+                                             thinking_tokens=40), "jsonl")
+        self.assertEqual(
+            tuple(self.con.execute(
+                "SELECT source, effort, speed, thinking_tokens, cost_usd "
+                "FROM api_requests").fetchone()),
+            ("otel", "high", "fast", 40, 0.5))
+
+    def test_filling_a_hole_moves_no_measurement(self):
+        """Only the transcript-only columns, and only where they are NULL."""
+        db.upsert_request(self.con, self.row(cost_usd=0.5, duration_ms=99),
+                          "otel")
+        db.upsert_request(self.con, self.row(output_tokens=999, cost_usd=9.9,
+                                             duration_ms=1), "jsonl")
+        self.assertEqual(
+            tuple(self.con.execute("SELECT source, output_tokens, cost_usd, "
+                                   "duration_ms FROM api_requests").fetchone()),
+            ("otel", 100, 0.5, 99))
+
+    def test_a_transcript_cannot_overwrite_a_value_it_filled(self):
+        db.upsert_request(self.con, self.row(effort=None), "otel")
+        db.upsert_request(self.con, self.row(effort="high"), "jsonl")
+        db.upsert_request(self.con, self.row(effort="low"), "jsonl")
+        self.assertEqual(
+            self.con.execute("SELECT effort FROM api_requests").fetchone()[0],
+            "high")
+
+    def test_the_batch_path_fills_holes_too(self):
+        """insert_requests_jsonl is what the ingester actually calls."""
+        db.upsert_request(self.con, self.row(effort=None), "otel")
+        db.insert_requests_jsonl(self.con, [self.row(effort="high")])
+        self.assertEqual(
+            tuple(self.con.execute("SELECT source, effort FROM "
+                                   "api_requests").fetchone()),
+            ("otel", "high"))
 
     def test_transcript_reparse_corrects_a_partial_first_chunk(self):
         db.upsert_request(self.con, self.row(output_tokens=1), "jsonl")

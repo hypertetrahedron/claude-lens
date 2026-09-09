@@ -1134,6 +1134,211 @@ class TemplateWiring(unittest.TestCase):
         self.assertIn('el("button", "btn", "Show prompts")', self.html)
         self.assertIn('id="session-chip"', self.html)
 
+    def test_timeline_is_sized_from_what_is_actually_on_screen(self):
+        """The chart's viewBox has to match the box it is rendered into.
+
+        .ctx-svg is width:100%, so any viewBox narrower than the container
+        gets centred by preserveAspectRatio and sits behind a gap. The width
+        comes from the .tl-plot the SVG is appended to, capped at the visible
+        width of the .tbl-scroll it lives inside - the detail cell is as wide
+        as the fixed-width sessions table, which is wider than the card.
+        """
+        self.assertIn('const scroller = plot.closest(".tbl-scroll");',
+                      self.html)
+        self.assertIn("const w = Math.min(plot.clientWidth,", self.html)
+        self.assertIn("sessionTimelineSvg(points, spans, s.id, w, "
+                      "state.ctxAxis, readout)", self.html)
+        # the readout and the legend are capped to the same width, or they
+        # wrap against the table and run off the right of the card
+        self.assertIn('plot.style.maxWidth = w + "px";', self.html)
+        # and the draw has to happen after the row is actually inserted, or
+        # the plot has no width to be measured from
+        body = self.html[self.html.index("function toggleSessionDetail"):]
+        body = body[:body.index("\n}\n")]
+        # rindex: drawTimeline is also *called* by the axis toggle's handler,
+        # which is defined well before the row is inserted and runs long after.
+        self.assertLess(body.index("tr.after(dtr)"),
+                        body.rindex("drawTimeline()"))
+
+    def test_open_session_row_keeps_its_name_clamped(self):
+        """Only a prompt row un-clamps when it opens.
+
+        The sessions table's first column is the session *name*; letting it
+        grow to the full 400 characters put a 1,200px void between the row
+        and the panel it had just opened.
+        """
+        self.assertIn("tr.data-row:not(.sess-row).open td.prompt .txt "
+                      "{ -webkit-line-clamp: unset; }", self.html)
+
+    def test_flex_column_is_left_room_by_the_table_min_width(self):
+        """table-layout: fixed hands the undeclared column zero px otherwise.
+
+        The fixed sessions widths add up to the table's own width, so without
+        a min-width past their total the session-name column gets nothing and
+        its text wraps one character per line.
+        """
+        self.assertIn("const FLEX_MIN_W = 260;", self.html)
+        self.assertIn('table.style.minWidth = (fixed + flex * FLEX_MIN_W) '
+                      '+ "px"', self.html)
+
+    def test_timeline_draws_every_lane_it_promises(self):
+        """Turn ruler, cost, context stack, tools, subagents, idle gaps."""
+        for bit in ('class: "turn-band"', 'class: "turn-tick"',
+                    'class: "turn-num"', 'class: "turn-cost"',
+                    'class: "tool-bar"', 'class: "tool-bar-err"',
+                    'class: "tool-bar-over"', 'class: "agent-bar"',
+                    'class: "gap-band"', 'class: "gap-label"',
+                    'class: "lane-label"'):
+            self.assertIn(bit, self.html)
+        for css in (".turn-band {", ".turn-strip-a {", ".turn-strip-b {",
+                    ".turn-cost {", ".tool-bar {", ".tool-bar-err {",
+                    ".tool-bar-over {", ".agent-bar {", ".gap-band {",
+                    ".gap-label {", ".lane-label {"):
+            self.assertIn(css, self.html)
+        self.assertIn("function sessionTimelineSvg", self.html)
+        self.assertIn("function turnsFor", self.html)
+        self.assertIn("function agentsFor", self.html)
+        self.assertIn("function packAgents", self.html)
+
+    def test_every_turn_gets_a_ruler_strip_of_its_own(self):
+        """Both tones are drawn, not just the even one.
+
+        Filling only the even turns left the odd ones as bare page, which read
+        as the gaps between bands rather than as bands - and so gave no hint
+        that they could be hovered like their neighbours.
+        """
+        self.assertIn('class: t.n % 2 ? "turn-strip-a"', self.html)
+        self.assertIn('"turn-strip-b"', self.html)
+        # two distinct opacities, or there is no contrast to see
+        a = re.search(r"\.turn-strip-a \{[^}]*opacity: ([\d.]+)", self.html)
+        b = re.search(r"\.turn-strip-b \{[^}]*opacity: ([\d.]+)", self.html)
+        self.assertTrue(a and b, "both strip tones need a declared opacity")
+        self.assertGreater(abs(float(a.group(1)) - float(b.group(1))), 0.05,
+                           "the two tones have to be told apart")
+
+    def test_tool_lane_is_scaled_by_percentile_not_maximum(self):
+        """One request that unpacked forty results must not flatten the rest."""
+        self.assertIn("function toolCeiling", self.html)
+        self.assertIn("const toolCap = toolCeiling(points, toolMax);", self.html)
+        self.assertIn("Math.min(n, toolCap) / toolCap", self.html)
+        # and anything over the ceiling is marked, not silently drawn tall
+        self.assertIn("if (n > toolCap)", self.html)
+
+    def test_pointer_tracking_uses_the_svg_transform(self):
+        """A bounding-box ratio lands the crosshair hundreds of pixels out.
+
+        .ctx-svg is width:100% over a viewBox sized to the *visible* width, so
+        preserveAspectRatio can letterbox the drawing inside its own element.
+        """
+        self.assertIn("function addTracking", self.html)
+        self.assertIn("const m = svg.getScreenCTM();", self.html)
+        self.assertIn("new DOMPoint(e.clientX, e.clientY)"
+                      ".matrixTransform(m.inverse())", self.html)
+        # no hit rectangle: it would take the hovers of every mark under it
+        self.assertNotIn('class: "xh-hit"', self.html)
+        for css in (".xh {", ".xh-line {", ".xh-dot {", ".turn-hot {"):
+            self.assertIn(css, self.html)
+
+    def test_readout_replaced_the_pointer_following_panel(self):
+        """A panel at the pointer covers the marks it is describing.
+
+        Nothing floats any more: the strip lives under the chart, and the
+        daily bars' own #tooltip is the only floating panel left on the page.
+        """
+        self.assertNotIn("tl-tip", self.html)
+        self.assertNotIn("function showTip", self.html)
+        self.assertNotIn("hideTip", self.html)
+        self.assertIn('const readout = el("div", "tl-readout");', self.html)
+        self.assertIn(".tl-readout {", self.html)
+        # reserved height, or the two halves shuffle the page as you cross
+        self.assertRegex(self.html, r"\.tl-readout \{[^}]*min-height:")
+        # and one line of prompt text cannot resize it either
+        self.assertRegex(self.html, r"\.ro-line \{[^}]*white-space: nowrap")
+
+    def test_readout_reports_the_half_the_pointer_is_in(self):
+        """Above the split a whole prompt; below it one request."""
+        self.assertIn("const zoneSplit = costH ?", self.html)
+        self.assertIn("split: zoneSplit", self.html)
+        self.assertIn("if (pt.y < geo.split) {", self.html)
+        self.assertIn("function restReadout", self.html)
+        self.assertIn('"ro-overall"', self.html)
+        self.assertIn('"ro-intra"', self.html)
+        # keyboard reaches both states through the objects on the nodes
+        self.assertIn("hit.__turn = t;", self.html)
+        self.assertIn("g.__span = sp;", self.html)
+        self.assertIn('svg.addEventListener("focusin"', self.html)
+
+    def test_lanes_are_separated(self):
+        """A gap and a hairline, or four lanes read as one striped block."""
+        self.assertIn("const LANE_GAP = ", self.html)
+        self.assertIn('class: "lane-rule"', self.html)
+        self.assertIn(".lane-rule {", self.html)
+        self.assertIn("const ctxY = costY + costH + (costH ? LANE_GAP : 0);",
+                      self.html)
+        self.assertIn("const toolY = ctxY + ctxH + LANE_GAP;", self.html)
+        self.assertIn("const agentY = toolY + toolH + LANE_GAP;", self.html)
+
+    def test_full_height_marks_are_drawn_per_lane(self):
+        """The gaps between the lanes have to stay empty to be gaps.
+
+        A turn wash, an idle hatch, a turn tick or the hover highlight drawn
+        as one rect down the whole chart paints the clear space back in with
+        the same colour as the lanes - which is what made the separation
+        invisible even though the layout had put it there.
+        """
+        self.assertIn("const perLane = (make) =>", self.html)
+        # every full-height mark goes through it
+        for mark in ('class: "turn-band"', 'class: "gap-band"',
+                     'class: "turn-tick"'):
+            i = self.html.index(mark)
+            # perLane opens within the few lines before the mark is built
+            self.assertIn("perLane(", self.html[max(0, i - 420):i],
+                          mark + " is not drawn per lane")
+        self.assertIn("for (const l of geo.lanes)", self.html)
+        self.assertIn(".turn-hot rect {", self.html)
+
+    def test_bands_stop_at_the_last_lane(self):
+        """bandBot is the bottom of what is drawn, not of the space reserved.
+
+        Taking it from agentY + agentH left every full-height mark hanging
+        LANE_GAP below the last lane and into the axis, on any session with no
+        subagents at all - and agentH's own trailing padding did the same on
+        the sessions that had them.
+        """
+        self.assertIn("bandBot = lanes[lanes.length - 1][1];", self.html)
+        self.assertIn("const H = bandBot + axisH;", self.html)
+        self.assertIn("pack.rows * (AGENT_LANE_H + AGENT_LANE_GAP) "
+                      "- AGENT_LANE_GAP : 0;", self.html)
+
+    def test_areas_are_split_at_idle_runs(self):
+        """An area drawn across a gap ramps through time that never happened."""
+        self.assertIn("function runsOf", self.html)
+        self.assertIn("for (const run of runsOf(points))", self.html)
+
+    def test_axis_toggle_is_wired_and_persisted(self):
+        """Both modes reachable, and the choice survives a reload."""
+        self.assertIn('const AXIS_MODES = [["activity", "activity"], '
+                      '["elapsed", "elapsed"]];', self.html)
+        self.assertIn("ctxAxis: AXIS_MODES.some(m => m[0] === saved.ctxAxis)",
+                      self.html)
+        self.assertIn("ctxAxis: state.ctxAxis", self.html)
+        # declared before `state` is built, or it is read in its dead zone
+        self.assertLess(self.html.index("const AXIS_MODES"),
+                        self.html.index("const state = {"))
+
+    def test_ctx_series_carries_turn_and_agent_spans(self):
+        """The payload contract the timeline reads: turn flags, agent spans."""
+        self.assertIn("for (const i of sp.turn || []) out[i].turn = 1;",
+                      self.html)
+        self.assertIn('agent_spans: ["session", "type", "desc", "model"]',
+                      self.html)
+        self.assertIn('DATA.agent_spans = rehydrateTable(DATA, "agent_spans");',
+                      self.html)
+
+    def test_context_chart_anchors_top_left(self):
+        """A resize under an open panel must not re-centre the drawing."""
+        self.assertIn('preserveAspectRatio: "xMinYMin meet"', self.html)
+
     def test_new_chart_keys_are_registered(self):
         """blocks/heat use their own draw(); ctx/miss ride the day-bucket path."""
         for key in ("blocks", "heat", "ctx", "miss"):
@@ -1366,6 +1571,66 @@ class TemplateWiring(unittest.TestCase):
             self.assertTrue(guard_open < idx < guard_close,
                             "a transition: outside the reduced-motion guard "
                             "reaches a viewer who asked for less motion")
+
+    def test_tile_hints_are_out_of_the_flow_but_still_written(self):
+        """The half-height tiles depend on the hint being styled away, not
+        deleted: the popup reads its text back out of the tile."""
+        css = self.html[self.html.index("<style>"):self.html.index("</style>")]
+        self.assertIn(".tile .hint { display: none; }", css)
+        # renderTiles() and its siblings must still be reaching for them:
+        # a hint nobody writes is a popup with nothing to say
+        for hid in ("t-prompts-h", "t-lines-h", "t-cost-h", "t-cache-h",
+                    "t-window-h", "t-errors-h", "t-baseline-h"):
+            self.assertIn('id="%s"' % hid, self.html)
+            self.assertIn('$("%s")' % hid, self.html)
+
+    def test_tile_popup_is_wired(self):
+        self.assertIn('id="tile-pop"', self.html)
+        for cls in ("tp-label", "tp-value", "tp-hint", "tp-detail"):
+            self.assertIn('class="%s"' % cls, self.html)
+        self.assertIn("function initTilePop", self.html)
+        self.assertIn("initTilePop();", self.html)
+        # opened by hover *and* by keyboard, which is why tiles are tabbable
+        self.assertIn('tile.addEventListener("mouseenter"', self.html)
+        self.assertIn('tile.addEventListener("focus"', self.html)
+        self.assertIn("tile.tabIndex = 0;", self.html)
+        # the popup must never eat the hover that opened it
+        css = self.html[self.html.index("<style>"):self.html.index("</style>")]
+        pop = css[css.index("#tile-pop {"):]
+        self.assertIn("pointer-events: none", pop[:pop.index("}")])
+
+    def test_remove_all_filters_button(self):
+        """Next to More filters, and resetting every filter there is."""
+        more = self.html.index('id="more-filters-btn"')
+        reset = self.html.index('id="reset-filters-btn"')
+        chip = self.html.index('id="session-chip"')
+        self.assertLess(more, reset, "reset button comes after More filters")
+        self.assertLess(reset, chip, "reset button comes before the chip")
+        self.assertIn("function resetFilters", self.html)
+        self.assertIn('$("reset-filters-btn").addEventListener("click", resetFilters)',
+                      self.html)
+        # every piece of filter state has to be in the reset
+        for line in ("state.range = DEFAULT_RANGE;", "state.kind = baseKind;",
+                     'state.project = "all";', 'state.model = "all";',
+                     'state.q = "";', "state.session = null;",
+                     "state.rf = { ...RF_DEFAULTS };"):
+            self.assertIn(line, self.html)
+        # ... and the controls have to be pushed back to match it
+        self.assertIn("function syncFilterControls", self.html)
+        self.assertIn("syncFilterControls();", self.html)
+        # enabled state is recomputed wherever a filter change lands
+        self.assertIn("function updateResetBtn", self.html)
+        self.assertIn("updateResetBtn();", self.html)
+        self.assertIn("function filtersAreDefault", self.html)
+
+    def test_sort_chart_and_view_survive_a_filter_reset(self):
+        """They are not filters; clearing filters must not touch them."""
+        body = self.html[self.html.index("function resetFilters"):]
+        body = body[:body.index(chr(10) + "}")]
+        for key in ("state.sort", "state.dir", "state.view", "state.chart",
+                    "state.cols", "state.group", "state.ssort", "state.sdir"):
+            self.assertNotIn(key, body,
+                             key + " is not a filter and must survive a reset")
 
 
 class SshConfig(unittest.TestCase):
