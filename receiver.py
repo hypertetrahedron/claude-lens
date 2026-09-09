@@ -8,19 +8,22 @@ Also acts as the system's scheduler:
   (heals any gaps from receiver downtime; supplies session->project mapping).
 - Every REBUILD_CHECK seconds: regenerates dashboard.html if new data arrived.
 
-Single-instance safety: binding port 4318 fails if a receiver already runs.
+Single-instance safety: binding port 4318 fails if a receiver already runs
+(see Server below - the platforms need different socket options to make that
+true).
 
 Attribute names follow https://code.claude.com/docs/en/monitoring-usage
 (verified 2026-09-03); anything not in that reference is not read here.
 """
 import argparse
-import gzip
 import inspect
 import json
 import logging
 import os
+import socket
 import threading
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 
@@ -34,6 +37,39 @@ HOST, PORT = "127.0.0.1", 4318
 REBUILD_CHECK = 60          # seconds between dirty-checks for dashboard rebuild
 RECONCILE_EVERY = 3600  # seconds between JSONL reconciliation passes
                         # (hourly: file-edit stats only arrive via JSONL)
+
+
+# ---------------------------------------------------------------------------
+# Single-instance guard
+#
+# ThreadingHTTPServer inherits allow_reuse_address = 1 (SO_REUSEADDR) from
+# socketserver.TCPServer. On Linux/macOS that only lets a new socket bind a
+# port stuck in TIME_WAIT from a *previous* listener of the same process
+# restarting - harmless, and needed so a restart does not have to wait out
+# the TIME_WAIT timer. On Windows, SO_REUSEADDR means something different:
+# it lets a new socket bind a port a *live* socket already owns, silently
+# splitting traffic between two listeners instead of refusing the second one.
+# This was reproduced directly - two ThreadingHTTPServer instances bound the
+# same 127.0.0.1 port in the same process - which is exactly the scenario the
+# module docstring above claims cannot happen: two scheduled-task receivers
+# both ingesting and both rebuilding the dashboard.
+#
+# The fix is platform-specific because the two platforms need different
+# things. Windows gets allow_reuse_address = False (so SO_REUSEADDR is never
+# set) plus SO_EXCLUSIVEADDRUSE, which is the option that actually means
+# "refuse to bind if anything, live or dead, already owns this port" and is
+# only defined on Windows. Linux/macOS keep SO_REUSEADDR, because there
+# TIME_WAIT was the only thing it ever bypassed.
+# ---------------------------------------------------------------------------
+class Server(ThreadingHTTPServer):
+    allow_reuse_address = (os.name != "nt")
+
+    def server_bind(self):
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET,
+                                   socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 LOG_PATH = os.path.join(BASE, "receiver.log")
@@ -475,12 +511,83 @@ def handle_record(con, rec):
     # other event types (assistant_response, tool_decision, ...) are ignored
 
 
+# Real OTel batches from a single Claude Code process are kilobytes; this is
+# headroom for a busy machine's reconcile-sized burst, not an expectation of
+# ever being reached. It bounds both the declared Content-Length (rejected
+# before we read a byte of it) and the decompressed size of a gzip body, so
+# neither a huge declared length nor a small body that expands hugely can
+# pin memory or a thread.
+MAX_BODY_BYTES = 32 * 1024 * 1024
+
+
+def _content_media_type(headers):
+    """Content-Type with any ';charset=...' parameter stripped, lowercased."""
+    return headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+
+
 class Handler(BaseHTTPRequestHandler):
+    # StreamRequestHandler.setup() applies this to the socket. Without it, a
+    # client that sends a Content-Length and then never sends the body (or
+    # trickles it in a byte at a time) pins this thread in rfile.read()
+    # forever; ThreadingHTTPServer spawns a new thread per connection with no
+    # cap, so enough such clients is an unbounded thread leak.
+    timeout = 30
+
     def do_POST(self):
         try:
-            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            # A real OTLP/HTTP exporter is not a browser and never sends an
+            # Origin header at all. A page the user merely has open can POST
+            # here with fetch() - 127.0.0.1 is reachable from any origin, and
+            # a plain-text content type keeps the browser from preflighting
+            # it - so an Origin header present on this request, of any value,
+            # means it did not come from the exporter.
+            if self.headers.get("Origin") is not None:
+                # Logged, not dropped quietly: every rejection here is either
+                # an attempt worth knowing about or this check misreading a
+                # real exporter, and silence would make the second one look
+                # like telemetry that simply stopped arriving.
+                log.warning("rejected POST %s carrying Origin %r",
+                            self.path, self.headers.get("Origin"))
+                self.send_response(403)
+                self.end_headers()
+                return
+            # The exporter always sends "application/json" (Claude Code speaks
+            # OTLP/HTTP JSON encoding only), sometimes with a charset
+            # parameter - hence comparing the media type rather than the raw
+            # header. A cross-origin fetch() restricted to CORS "simple"
+            # content types (text/plain, form types) to dodge a preflight
+            # cannot produce this value, so requiring it closes that route
+            # even for a request that somehow carries no Origin.
+            if _content_media_type(self.headers) != "application/json":
+                log.warning("rejected POST %s with content type %r (OTLP/HTTP "
+                            "JSON is application/json)", self.path,
+                            self.headers.get("Content-Type"))
+                self.send_response(415)
+                self.end_headers()
+                return
+            length = as_int(self.headers.get("Content-Length"), 0)
+            if length < 0 or length > MAX_BODY_BYTES:
+                log.warning("rejected POST %s declaring %d bytes (cap %d)",
+                            self.path, length, MAX_BODY_BYTES)
+                self.send_response(413)
+                self.end_headers()
+                return
+            body = self.rfile.read(length)
             if self.headers.get("Content-Encoding") == "gzip":
-                body = gzip.decompress(body)
+                # 16 + MAX_WBITS tells zlib to parse a gzip header/trailer (a
+                # bare zlib stream uses MAX_WBITS alone). Decompressing via an
+                # incremental decompressobj with a max_length caps the output
+                # size directly; gzip.decompress has no such limit and would
+                # happily expand a small request into as much memory as the
+                # payload was crafted to demand.
+                dobj = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                body = dobj.decompress(body, MAX_BODY_BYTES)
+                if dobj.unconsumed_tail:
+                    log.warning("rejected POST %s: gzip body expands past "
+                                "the %d byte cap", self.path, MAX_BODY_BYTES)
+                    self.send_response(413)
+                    self.end_headers()
+                    return
             if self.path.rstrip("/") == "/v1/logs":
                 payload = json.loads(body)
                 with _db_lock:
@@ -649,7 +756,7 @@ def main(argv=None):
     args = parse_args(argv)
     path = resolve_db(args.db)
     _con = db.connect(path, cross_thread=True)
-    server = ThreadingHTTPServer((HOST, args.port), Handler)  # fails if already running
+    server = Server((HOST, args.port), Handler)  # fails if already running
     threading.Thread(target=maintenance_loop, args=(path,), daemon=True).start()
     log.info("receiver listening on %s:%s (db %s)", HOST, args.port, path)
     server.serve_forever()
