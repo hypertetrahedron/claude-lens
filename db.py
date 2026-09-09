@@ -99,8 +99,19 @@ def resolve_path(explicit=None):
 #       rows captured mid-stream. Clears ingest_state to force that re-parse,
 #       and strips the `agent-` filename prefix from agent_name so subagent
 #       rows join the new agents table on agentId.
+#   9 - repairs two columns that live telemetry had been overwriting, and
+#       indexes the two lookups that were still full scans. OTel wrote the
+#       subagent *type* into agent_name where a transcript writes the CLI's
+#       agentId, so a live machine lost the only value that joins the agents
+#       table; agent_name now fills rather than replaces, the receiver stops
+#       writing the type (query_source already carries it), and OTel rows
+#       holding a type are cleared so a re-parse can put the id back. OTel
+#       rows written before the cache-TTL fix stored 0/0 for the 5m/1h split,
+#       which COALESCE reads as a value rather than a hole and so no re-parse
+#       could ever correct; those are reset to NULL and refilled. Adds
+#       idx_tool_session and idx_prompts_session. Clears ingest_state.
 # ---------------------------------------------------------------------------
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS prompts (
@@ -251,6 +262,13 @@ CREATE INDEX IF NOT EXISTS idx_tool_prompt ON tool_calls(prompt_id);
 CREATE INDEX IF NOT EXISTS idx_prompt_ts ON prompts(ts);
 CREATE INDEX IF NOT EXISTS idx_req_session ON api_requests(session_id);
 CREATE INDEX IF NOT EXISTS idx_req_ts ON api_requests(ts);
+-- Both of these cover a (session_id, ts) walk that was reaching the table
+-- through a scan and a temp B-tree sort. cache_scan() takes tool_calls in
+-- session/ts order on every rebuild, and tool_calls grows faster than any
+-- other table here; the receiver's canonical_for_session() takes prompts the
+-- same way once per injected event, on the live path, inside the write lock.
+CREATE INDEX IF NOT EXISTS idx_tool_session ON tool_calls(session_id, ts);
+CREATE INDEX IF NOT EXISTS idx_prompts_session ON prompts(session_id, ts);
 """
 
 
@@ -375,9 +393,38 @@ def _migrate_to_8(con):
     con.execute("DELETE FROM ingest_state")
 
 
+def _migrate_to_9(con):
+    """Undo two things live telemetry wrote over, and index two hot walks.
+
+    Both repairs have to happen here rather than by re-parsing, for the same
+    reason: the damage is a value, and every rule in this file that lets a
+    transcript correct an OTel row only fills a NULL. Clearing the bad values
+    is what turns them back into holes the next parse can fill.
+    """
+    con.executescript(SCHEMA)               # new indexes
+    # OTel stored 0/0 for the cache-TTL split before it learned to leave the
+    # split alone. Zero is a measurement - COALESCE keeps it - so these rows
+    # would have been billed at the unsplit 1h multiplier forever.
+    con.execute("""UPDATE api_requests SET cache_5m_tokens = NULL,
+                                           cache_1h_tokens = NULL
+                   WHERE source = 'otel' AND cache_create_tokens > 0
+                     AND COALESCE(cache_5m_tokens, 0) = 0
+                     AND COALESCE(cache_1h_tokens, 0) = 0""")
+    # An agent_name that does not join the agents table is a subagent type
+    # written by OTel over the transcript's agentId. Clearing it lets the
+    # re-parse below put the id back; the type is not lost, query_source
+    # carries it. Rows whose transcript is gone keep a NULL, which is honest -
+    # the type they held was never the thing this column means.
+    for table in ("api_requests", "tool_calls", "edits"):
+        con.execute(f"""UPDATE {table} SET agent_name = NULL
+                        WHERE source = 'otel' AND agent_name IS NOT NULL
+                          AND agent_name NOT IN (SELECT agent_id FROM agents)""")
+    con.execute("DELETE FROM ingest_state")
+
+
 MIGRATIONS = {2: _migrate_to_2, 3: _migrate_to_3, 4: _migrate_to_4,
               5: _migrate_to_5, 6: _migrate_to_6, 7: _migrate_to_7,
-              8: _migrate_to_8}
+              8: _migrate_to_8, 9: _migrate_to_9}
 
 
 def connect(path=DB_PATH, cross_thread=False):
@@ -497,10 +544,18 @@ _TOKEN_IDX = (REQUEST_COLS.index("input_tokens"),
 # some events, and `attrs.get` then hands over None. A transcript records
 # them for every request, so replacing rather than filling turned a measured
 # "high"/"fast" into an unknown as soon as live telemetry caught up with it.
+# agent_name is the same bargain read from the other side. Both sources write
+# it, but they write different things: a transcript writes the CLI's agentId,
+# which is what joins the agents table, and OTel's `agent.name` is the subagent
+# *type*. Replacing therefore turned 36 distinct ids into 3 type names and cost
+# every span, model and description the join would have supplied. The receiver
+# no longer sends the type at all - query_source already carries it as
+# `agent:builtin:<type>` - and filling rather than replacing means that even if
+# it did, the id would survive it.
 OTEL_FILLS_ONLY = frozenset({
     "cache_5m_tokens", "cache_1h_tokens", "thinking_tokens", "stop_reason",
     "server_tool_requests", "service_tier", "inference_geo",
-    "effort", "speed"})
+    "effort", "speed", "agent_name"})
 
 
 def _otel_assignment(col):
@@ -540,13 +595,21 @@ REQUEST_SQL_JSONL = (
 # making OTel fill rather than replace only helps when the transcript is read
 # first. This fills the holes and nothing else - COALESCE keeps every value
 # already there, so no measurement can move, and `source` stays 'otel'.
+#
+# It carries the same "raise, never lower" guard as REQUEST_SQL_JSONL, and for
+# a sharper reason: COALESCE cements the first non-NULL value it is given, so a
+# hole filled from a half-streamed content block stays filled with that value
+# forever. Re-parsing - the repair this project relies on everywhere else -
+# cannot move it afterwards. Only the block carrying the complete usage should
+# be allowed to fill the hole.
 REQUEST_SQL_JSONL_FILL = (
     f"INSERT INTO api_requests ({_REQ_NAMES}, source)\n"
     f"VALUES ({_REQ_PLACEHOLDERS}, 'jsonl')\n"
     "ON CONFLICT(request_id) DO UPDATE SET "
     + ",".join(f"{c}=COALESCE(api_requests.{c},excluded.{c})"
                for c in sorted(OTEL_FILLS_ONLY))
-    + "\nWHERE api_requests.source='otel'")
+    + "\nWHERE api_requests.source='otel'"
+      " AND excluded.output_tokens >= api_requests.output_tokens")
 
 
 def _with_context(vals):

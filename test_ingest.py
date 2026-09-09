@@ -867,7 +867,7 @@ class MigrationToV8(unittest.TestCase):
 
     def test_version_is_stamped(self):
         self.assertEqual(self.migrate().execute(
-            "PRAGMA user_version").fetchone()[0], 8)
+            "PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
 
     def test_new_columns_exist(self):
         con = self.migrate()
@@ -911,7 +911,8 @@ class MigrationToV8(unittest.TestCase):
         self.migrate()
         con = db.connect(self.path)
         self.addCleanup(con.close)
-        self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 8)
+        self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0],
+                         db.SCHEMA_VERSION)
 
     def test_a_newer_database_refuses_to_open(self):
         con = sqlite3.connect(self.path)
