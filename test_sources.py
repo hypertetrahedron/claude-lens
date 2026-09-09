@@ -1003,8 +1003,17 @@ class ReceiverStaleness(unittest.TestCase):
         self.assertIn("build_dashboard.py", before)
 
     def test_stale_is_latched_and_reported_once(self):
+        import logging
         import receiver
         saved_started, saved_stale = receiver._started_with, receiver._stale
+        # Tripping the guard logs "no longer rebuilding dashboard.html" at
+        # ERROR, and receiver.log belongs to the *running* service. Left
+        # unmuted, a test run plants that line in the live log, where it reads
+        # as the receiver having stopped rebuilding - and someone would go
+        # restart a service that was working perfectly.
+        saved_level = receiver.log.level
+        receiver.log.setLevel(logging.CRITICAL)
+        self.addCleanup(receiver.log.setLevel, saved_level)
         try:
             receiver._stale = False
             receiver._started_with = dict(receiver.code_fingerprint())
