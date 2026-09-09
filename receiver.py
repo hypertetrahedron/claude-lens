@@ -688,25 +688,39 @@ def reconcile(db_path=None):
                 con.close()
         except Exception:
             log.exception("remote fetch failed; continuing with local sources")
-    # Only the ingest itself holds the lock. Everything that does not write -
-    # loading sources.json, the remote fetch above, and the logging around the
-    # call - now sits outside it.
-    # TODO(Agent A): jsonl_ingest.run() also discovers source directories and
-    # stats every transcript while holding this lock. Once it commits per
-    # transcript, the lock can go entirely: run() writes on its own connection,
-    # so SQLite's own writer serialisation is enough.
+    # The ingest runs outside _db_lock. It writes on its own connection, so
+    # what serialises it against live telemetry is SQLite's own one-writer
+    # rule plus the 30s busy timeout both connections carry - not this lock.
+    # Holding the lock here meant the whole pass, including directory
+    # discovery and an os.stat per transcript, blocked every incoming request:
+    # measured against a copy of the real database, one live write waited
+    # 1,252ms for a 1.3s pass, where without it the worst wait was 48ms.
+    # Sustained contention was checked too - three writers flat out against
+    # ten back-to-back ingest passes committed 416,978 rows with no
+    # SQLITE_BUSY and no failed ingest. It is also the arrangement that
+    # already exists whenever someone runs jsonl_ingest.py by hand while the
+    # receiver is up: two processes, one file, no shared lock.
+    #
+    # The lock does NOT go away, and the TODO that used to say it could was
+    # wrong. It guards `_con`, which is one connection shared by every
+    # ThreadingHTTPServer handler thread (check_same_thread=False). Without
+    # it, four threads driving that connection raised "bad parameter or other
+    # API misuse" and, worse, committed each other's half-written
+    # transactions: a two-statement unit of work came out as 1,084 of one row
+    # against 1,041 of the other. SQLite being compiled serialized
+    # (sqlite3.threadsafety == 3) makes the calls safe, not the transactions.
+    stats = jsonl_ingest.run(config=cfg, skip_remote_fetch=True,
+                             **ingest_kwargs(db_path))
+    # jsonl_ingest.run() opens its own connection, so it is the thing most
+    # likely to have just migrated the file - and this process's cached PRAGMA
+    # results still describe the schema from before. Every write here is
+    # filtered to the columns those caches list, so a receiver that missed a
+    # migration silently drops the new ones until someone restarts it.
+    # code_is_stale() catches an edited *file*; this catches a changed
+    # *database*. It reads _con, so it takes the lock.
     with _db_lock:
-        stats = jsonl_ingest.run(config=cfg, skip_remote_fetch=True,
-                                 **ingest_kwargs(db_path))
-        # jsonl_ingest.run() opens its own connection, so it is the thing most
-        # likely to have just migrated the file - and this process's cached
-        # PRAGMA results still describe the schema from before. Every write
-        # here is filtered to the columns those caches list, so a receiver
-        # that missed a migration silently drops the new ones until someone
-        # restarts it. code_is_stale() catches an edited *file*; this catches
-        # a changed *database*.
         _note_schema_version()
-        return stats
+    return stats
 
 
 def build_kwargs(db_path=None):
