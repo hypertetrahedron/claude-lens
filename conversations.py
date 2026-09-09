@@ -29,6 +29,7 @@ import html
 import json
 import os
 import re
+import tempfile
 from datetime import datetime, timezone
 
 import pricing
@@ -567,6 +568,41 @@ def _prune_stale(folder, keep):
             pass
 
 
+def _atomic_write(path, text):
+    """Write `text` to `path` without ever exposing a partial or torn file.
+
+    The receiver rebuilds these pages on its own minute-by-minute schedule
+    while the user can run a build by hand at any time, so two processes can
+    be writing the *same* page concurrently. A fixed "<path>.tmp" name is a
+    shared name: one process's in-progress write can land inside the other's
+    `os.replace`, publishing interleaved bytes as a valid-looking but corrupt
+    page, and on Windows a second process opening that same name while the
+    first still holds it raises PermissionError outright. `mkstemp` hands
+    back a name nothing else can collide with, in the same directory as the
+    target so the final `os.replace` stays on one filesystem (and therefore
+    atomic).
+    """
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".",
+                               suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        # mkstemp creates the file mode 0600 (owner-only) for security in the
+        # general case; these pages are meant to be as readable as any other
+        # file `open(path, "w")` would have produced (rw-r--r-- under a
+        # typical umask), and os.replace carries the temp file's mode onto
+        # the published name, so it is set explicitly rather than inherited.
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _write_one(page_path, row, entries, costs, agents, base_dir):
     page = Page()
     _render_entries(page, entries, costs, agents, base_dir, row["session"])
@@ -591,10 +627,7 @@ def _write_one(page_path, row, entries, costs, agents, base_dir):
            "&middot; <a href='index.html'>all conversations</a> &middot; "
            "<a href='../dashboard.html'>dashboard</a>")
     doc = _document(title, sub, meta, page.html())
-    tmp = page_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(doc)
-    os.replace(tmp, page_path)
+    _atomic_write(page_path, doc)
 
 
 def _write_index(folder, listed):
@@ -618,7 +651,4 @@ def _write_index(folder, listed):
         "",
         "<table><tr><th>When</th><th>Project</th><th>Prompt</th>"
         f"<th class='n'>Cost</th><th class='n'>Output</th></tr>{rows}</table>")
-    tmp = os.path.join(folder, "index.html.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(doc)
-    os.replace(tmp, os.path.join(folder, "index.html"))
+    _atomic_write(os.path.join(folder, "index.html"), doc)

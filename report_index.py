@@ -17,6 +17,7 @@ Also owns the shared stylesheet for the static reports (digest.py imports it).
 import html
 import os
 import re
+import tempfile
 from datetime import datetime
 from urllib.request import pathname2url
 
@@ -171,6 +172,39 @@ def entries():
     return out + archived
 
 
+def _atomic_write(path, text):
+    """Write `text` to `path` without a window where a second writer collides.
+
+    build() runs from a digest, from the receiver's own minute-by-minute
+    rebuild, and from a hand-run `python report_index.py`, any of which can
+    overlap another. A fixed "<path>.tmp" name is shared between them, so one
+    process's partial write can be renamed over by another mid-write,
+    publishing a corrupt page, and on Windows a second writer opening that
+    same name while the first still holds it raises PermissionError outright.
+    `mkstemp` gives each writer a name nothing else can collide with, in the
+    same directory as the target so the final `os.replace` stays on one
+    filesystem.
+    """
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".",
+                               suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        # mkstemp creates the file mode 0600 (owner-only); index.html is meant
+        # to be as readable as any other file `open(path, "w")` would have
+        # produced, and os.replace carries the temp file's mode onto the
+        # published name, so it is set explicitly rather than inherited.
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def build(output=None):
     """(Re)write index.html. Returns the path written.
 
@@ -201,10 +235,7 @@ def build(output=None):
 <div class="sub">{len(items)} report(s) &middot; index rebuilt {now}</div>
 <table><tr><th>Report</th><th>Kind</th><th class="n">Generated</th></tr>{rows}</table>
 </div></body></html>"""
-    tmp = output + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(doc)
-    os.replace(tmp, output)
+    _atomic_write(output, doc)
     return output
 
 

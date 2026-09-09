@@ -21,12 +21,16 @@ FILL_COLUMNS = {
 }
 
 
-def resolve_db(explicit=None):
-    fn = getattr(db, "resolve_path", None)
-    if fn is not None:
-        return fn(explicit)
-    import os
-    return explicit or os.environ.get("CLAUDE_LENS_DB") or db.DB_PATH
+def ascii_only(value):
+    """Anything derived from user data, made safe for a Windows console.
+
+    This tool prints prompt text, tool names and agent names, none of which
+    are ours to constrain. A cp1252 console - or any redirected stdout on
+    Windows - raises UnicodeEncodeError on the first smart quote or em dash,
+    which killed the report halfway through exactly when someone was using it
+    to work out why telemetry looked wrong.
+    """
+    return str(value).encode("ascii", "replace").decode("ascii")
 
 
 def columns(con, table):
@@ -65,8 +69,15 @@ def main(argv=None):
                          "(default 200)")
     args = ap.parse_args(argv)
 
-    path = resolve_db(args.db)
+    path = db.resolve_path(args.db)
     con = db.connect(path)
+    try:
+        _report(con, path, args)
+    finally:
+        con.close()
+
+
+def _report(con, path, args):
     print("db:", path)
     for table in ("prompts", "api_requests", "tool_calls"):
         n = con.execute("SELECT COUNT(*) FROM %s WHERE source='otel'"
@@ -103,17 +114,16 @@ def main(argv=None):
                       agent_name
                FROM api_requests WHERE source='otel'
                ORDER BY ts DESC LIMIT ?""", (args.limit,)):
-        print("REQ:", r)
+        print("REQ:", ascii_only(r))
     for r in con.execute(
             """SELECT substr(prompt_id,1,8), injected, substr(canonical_id,1,8),
                       substr(text,1,60) FROM prompts WHERE source='otel'
                ORDER BY ts DESC LIMIT ?""", (args.limit,)):
-        print("PROMPT:", r)
+        print("PROMPT:", ascii_only(r))
     for r in con.execute(
             """SELECT tool_use_id, tool_name, source FROM tool_calls
                WHERE source='otel' ORDER BY ts DESC LIMIT ?""", (args.limit,)):
-        print("TOOL:", r)
-    con.close()
+        print("TOOL:", ascii_only(r))
 
 
 if __name__ == "__main__":
