@@ -1662,10 +1662,11 @@ def build(con=None, max_rows=DEFAULT_MAX_ROWS, redact=False, cfg=None,
         with open(TEMPLATE, encoding="utf-8") as f:
             html = f.read()
         html = html.replace("/*__DATA__*/null", embed_json(payload))
-        tmp = OUTPUT + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(html)
-        os.replace(tmp, OUTPUT)
+        # dashboard.html is the file with the worst version of this race: the
+        # receiver rewrites it about once a minute, and the documented setup
+        # has the user running a build by hand at the same time. A fixed
+        # "<path>.tmp" is a name both processes open.
+        conversations.atomic_write(OUTPUT, html)
     finally:
         if own:
             con.close()

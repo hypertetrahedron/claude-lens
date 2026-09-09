@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import socket
+import sqlite3
 import threading
 import time
 import zlib
@@ -720,6 +721,17 @@ def reconcile(db_path=None):
     # *database*. It reads _con, so it takes the lock.
     with _db_lock:
         _note_schema_version()
+        # Opportunistic housekeeping, on the hourly pass rather than the
+        # minute one. SQLite's auto-checkpoint keeps the WAL near its 1000-page
+        # threshold but never shrinks the file, so metrics.db-wal parks at a
+        # few megabytes for the life of the service. TRUNCATE reclaims it -
+        # and only when nothing else is mid-read, which is why the result is
+        # ignored: a busy return means some other connection was working, and
+        # the next pass an hour from now will do just as well.
+        try:
+            _con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
     return stats
 
 
