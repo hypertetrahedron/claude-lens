@@ -463,16 +463,21 @@ def write_pages(con, out_dir, rows, limit=300, redact=False):
 
     `rows` are collect() rows, newest first; the ones that got a page have
     their `conv` field set to the relative href the dashboard links. Returns
-    {"count", "dir", "written", "skipped_missing"}.
+    {"count", "dir", "written", "skipped_missing", "capped"}.
 
     A prompt whose transcript has been deleted is skipped silently in the
     sense that it is not an error - it is counted, and build() turns the count
-    into a line in the notice bar.
+    into a line in the notice bar. `capped` is the same bargain for prompts
+    left out by `limit` itself: without it an older prompt simply had no link
+    and the page never said why, which reads as a missing transcript rather
+    than a deliberate cap.
     """
-    result = {"count": 0, "written": 0, "skipped_missing": 0, "dir": None}
+    result = {"count": 0, "written": 0, "skipped_missing": 0, "capped": 0,
+              "dir": None}
     if redact or not limit:
         return result
     targets = [r for r in rows[:limit] if r.get("session")]
+    result["capped"] = sum(1 for r in rows[limit:] if r.get("session"))
     if not targets:
         return result
     folder = os.path.join(out_dir, "conversations")

@@ -484,16 +484,23 @@ _TOKEN_IDX = (REQUEST_COLS.index("input_tokens"),
               REQUEST_COLS.index("cache_read_tokens"),
               REQUEST_COLS.index("cache_create_tokens"))
 
-# Columns an OTel event does not carry. It has one cache-write total and no
+# Columns an OTel event may not carry. It has one cache-write total and no
 # TTL split, and it knows nothing of thinking tokens, stop reasons, server
 # tool use, service tier or inference geo - all of which only the transcript
 # records. Overwriting them with NULL when a live row lands on top of a
 # transcript row would, for the cache split, silently bill the whole write at
 # the 1h rate; so these fill rather than replace, and everything else still
 # takes the OTel value (it carries the CLI's own cost).
+#
+# effort and speed are here for the same reason even though the receiver does
+# read both: it reads them from event attributes that are simply absent on
+# some events, and `attrs.get` then hands over None. A transcript records
+# them for every request, so replacing rather than filling turned a measured
+# "high"/"fast" into an unknown as soon as live telemetry caught up with it.
 OTEL_FILLS_ONLY = frozenset({
     "cache_5m_tokens", "cache_1h_tokens", "thinking_tokens", "stop_reason",
-    "server_tool_requests", "service_tier", "inference_geo"})
+    "server_tool_requests", "service_tier", "inference_geo",
+    "effort", "speed"})
 
 
 def _otel_assignment(col):
@@ -522,6 +529,25 @@ REQUEST_SQL_JSONL = (
     + "\nWHERE api_requests.source='jsonl'"
       " AND excluded.output_tokens >= api_requests.output_tokens")
 
+# The mirror of OTEL_FILLS_ONLY, and the second half of the same bargain. An
+# OTel row wins every conflict because it carries the CLI's own cost - but a
+# NULL is not a conflict. For the columns only a transcript records, an OTel
+# row that arrived without them left a hole nothing could ever fill, because
+# the guard above stops a transcript write at any row marked 'otel'.
+#
+# That is the ordinary order in live mode: the receiver writes a request
+# seconds after it happens and the ingest reads the transcript later, so
+# making OTel fill rather than replace only helps when the transcript is read
+# first. This fills the holes and nothing else - COALESCE keeps every value
+# already there, so no measurement can move, and `source` stays 'otel'.
+REQUEST_SQL_JSONL_FILL = (
+    f"INSERT INTO api_requests ({_REQ_NAMES}, source)\n"
+    f"VALUES ({_REQ_PLACEHOLDERS}, 'jsonl')\n"
+    "ON CONFLICT(request_id) DO UPDATE SET "
+    + ",".join(f"{c}=COALESCE(api_requests.{c},excluded.{c})"
+               for c in sorted(OTEL_FILLS_ONLY))
+    + "\nWHERE api_requests.source='otel'")
+
 
 def _with_context(vals):
     """context_tokens, computed at insert when the caller did not supply it."""
@@ -537,8 +563,11 @@ def upsert_request(con, row, source):
     against an older schema keeps working.
     """
     vals = _with_context([row.get(c) for c in REQUEST_COLS])
-    con.execute(REQUEST_SQL_OTEL if source == "otel" else REQUEST_SQL_JSONL,
-                vals)
+    if source == "otel":
+        con.execute(REQUEST_SQL_OTEL, vals)
+        return
+    con.execute(REQUEST_SQL_JSONL, vals)
+    con.execute(REQUEST_SQL_JSONL_FILL, vals)
 
 
 def insert_requests_jsonl(con, rows):
@@ -561,6 +590,10 @@ def insert_requests_jsonl(con, rows):
                 yield _with_context(list(_pad(row, width)))
 
     con.executemany(REQUEST_SQL_JSONL, prepared())
+    # Second pass so an OTel row missing a transcript-only column can still
+    # be completed; it touches only rows already marked 'otel'. prepared() is
+    # a generator, so it has to be rebuilt rather than reused.
+    con.executemany(REQUEST_SQL_JSONL_FILL, prepared())
 
 
 TOOL_CALL_COLS = ("tool_use_id", "prompt_id", "session_id", "ts", "tool_name",

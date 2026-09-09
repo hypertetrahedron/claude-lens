@@ -52,8 +52,18 @@ Neither is a substitute for restarting it. On this machine that is the
   only when `api_requests.source='jsonl'` and `excluded.output_tokens >=
   api_requests.output_tokens`. That is what makes clearing `ingest_state` a
   real repair: a row captured mid-stream is corrected by re-reading the file.
-  A transcript still never touches an OTel row, and a row whose transcript has
-  been deleted can only be corrected by an in-place `UPDATE` in a migration.
+  A row whose transcript has been deleted can only be corrected by an
+  in-place `UPDATE` in a migration.
+- **A transcript may fill a hole in an OTel row, and nothing more.** An OTel
+  row wins every conflict, but a NULL is not a conflict: the columns in
+  `OTEL_FILLS_ONLY` are ones only a transcript records, so
+  `REQUEST_SQL_JSONL_FILL` COALESCEs them onto rows marked `otel` and touches
+  nothing else. Without it, live mode lost them for good - the receiver writes
+  a request seconds after it happens and the ingest reads the transcript
+  later, so the row is already `otel` by the time the only source for
+  `effort`/`speed`/`thinking_tokens` arrives. Adding a transcript-only column
+  means adding it to that frozenset too, or live sessions will simply not
+  have it.
 - `tool_calls`, `agents` and `sessions` merge rather than replace: each write
   fills what is NULL and leaves what is known alone, because the transcript
   and OTel each know a different half (sizes vs durations, requested vs
@@ -73,6 +83,15 @@ Neither is a substitute for restarting it. On this machine that is the
   data: prompts in older files carry no `origin` marker (so a whole session's
   usage was dropped), and `audit.jsonl` only records runs that finished (so
   trusting it hid two thirds of Cowork spend).
+- **The same fact has two spellings, one per source.** A column filled by
+  both the transcript and OTel can hold either vocabulary, and since an OTel
+  row wins every conflict, the *telemetry* spelling is what a live machine
+  ends up with. `query_source` is the one that has bitten: the transcript
+  says `main`, the CLI's telemetry says `repl_main_thread`, and filtering on
+  `main` alone quietly kept only the requests OTel never saw — 30 of 344 on
+  one real session. `MAIN_QUERY_SOURCES` in `build_dashboard.py` is the list;
+  check both spellings before writing `WHERE <column> = '<literal>'` against
+  a merged column, and prefer a named constant to a literal.
 - **Never present a guess as a measurement.** Unknown cost is not zero cost —
   an unpriced model is named on the page and counted as $0.00 deliberately,
   and authoritative figures are only spent where they provably cover
@@ -80,6 +99,10 @@ Neither is a substitute for restarting it. On this machine that is the
 - **Say when data is partial.** Truncated row sets, redacted prompt text and
   unpriced models all surface in the dashboard's notice bar rather than
   silently changing the numbers.
+- **A line between two samples claims the time between them.** The session
+  timeline splits its areas at every idle run and hatches the gap, because an
+  area drawn straight across a night reads as context climbing steadily
+  through it. Any new series over session time owes the same split.
 
 ## The payload is a contract
 

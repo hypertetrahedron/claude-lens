@@ -156,14 +156,45 @@
      six columns at the page's 1280px max width without ever leaving a single
      tile alone on its own row - the wrap count that minmax(160px, ...) used
      to hit as soon as the errors/baseline tiles were added. */
-  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  /* Half the height the tiles used to be (~100px -> ~50px): the hint line is
+     out of the flow entirely and the label, value and padding are all a step
+     smaller. Everything that used to be on the tile is still one hover (or
+     one Tab) away in #tile-pop, which reads its text back out of these very
+     elements - so the hint keeps being written by renderTiles(), it is just
+     never laid out here. Line heights are stated rather than inherited so
+     the row height is a fixed 50px and does not drift with the base font. */
   .tile {
     background: var(--surface-1); border: 1px solid var(--border);
-    border-radius: 10px; padding: 12px 14px;
+    border-radius: 10px; padding: 6px 10px;
   }
-  .tile .label { color: var(--text-muted); font-size: 12px; }
-  .tile .value { font-size: 26px; font-weight: 600; margin-top: 2px; }
-  .tile .hint { color: var(--text-muted); font-size: 11px; margin-top: 2px; }
+  .tile:hover { border-color: var(--text-muted); }
+  .tile:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; }
+  .tile .label { color: var(--text-muted); font-size: 11px; line-height: 1.2;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tile .value { font-size: 19px; font-weight: 600; line-height: 1.25; margin-top: 1px; }
+  .tile .hint { display: none; }
+  /* The cost tile's pricing-basis pill is the one thing in a label that is
+     not text; at its usual size it made that one tile a row taller than the
+     rest, since a grid row stretches to its tallest cell. */
+  .tile .label .pill { padding: 0 5px; margin: 0 0 0 4px; font-size: 10px; line-height: 1.1; }
+
+  /* One shared popup for all the tiles, filled from the hovered tile at hover
+     time - so it cannot fall out of step with renderTiles(), and a tile added
+     later needs nothing here. Fixed position (the tiles scroll away),
+     pointer-events none (it must never steal the hover that opened it). */
+  #tile-pop {
+    position: fixed; z-index: 60; max-width: 300px; pointer-events: none;
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 10px; box-shadow: 0 6px 22px rgba(0,0,0,0.25);
+    padding: 10px 12px;
+  }
+  #tile-pop[hidden] { display: none; }
+  #tile-pop .tp-label { color: var(--text-muted); font-size: 12px; }
+  #tile-pop .tp-value { font-size: 24px; font-weight: 600; margin-top: 2px; }
+  #tile-pop .tp-hint { color: var(--text-secondary); font-size: 12px; margin-top: 5px; }
+  #tile-pop .tp-detail { color: var(--text-muted); font-size: 11px; margin-top: 3px; }
+  #tile-pop .tp-hint:empty, #tile-pop .tp-detail:empty { display: none; }
   /* An error count in the table is the one place this page uses red - see
      --danger. */
   .err-count { color: var(--danger); font-weight: 600; }
@@ -198,13 +229,112 @@
   .sw-c1 { background: var(--series-1); } .sw-c2 { background: var(--series-2); }
   .sw-c3 { background: var(--series-3); } .sw-c4 { background: var(--series-4); }
   .sw-c5 { background: var(--series-5); } .sw-c0 { background: var(--text-muted); }
-  /* Context-growth chart. The stacked area sums to the context total, so the
-     line on top is the context curve itself rather than a fourth series. */
+  /* Session timeline. The stacked area sums to the context total, so the line
+     on top is the context curve itself rather than a fourth series; the turn
+     ruler, the subagent lane and the time axis sit under it on the same x. */
   .ctx-svg { display: block; width: 100%; }
   .ctx-line { fill: none; stroke: var(--text-primary); stroke-width: 1.2; }
   .ctx-miss { stroke: var(--surface-1); stroke-width: 1; }
   .ev-line { stroke: var(--text-secondary); stroke-width: 1; stroke-dasharray: 3 2; }
   .ev-hit { stroke: transparent; stroke-width: 7; cursor: pointer; }
+  /* Every other turn gets a wash, which is what makes the boundaries legible
+     without a line per prompt. It sits behind the areas, so it has to be
+     faint enough not to shift the colour of the stack above it. */
+  .turn-band { fill: var(--text-primary); opacity: 0.045; }
+  /* Both tones are drawn. Filling only the even turns left the odd ones as
+     bare page, which read as the gaps between bands rather than as bands -
+     and gave no hint that they could be hovered like their neighbours. */
+  .turn-strip-a { fill: var(--text-primary); opacity: 0.08; }
+  .turn-strip-b { fill: var(--text-primary); opacity: 0.2; }
+  .turn-tick { stroke: var(--text-muted); stroke-width: 1; opacity: 0.5; }
+  /* Cost per turn and tool results per request: both neutral on purpose.
+     Height carries the magnitude, and every colour in this drawing already
+     means a category - miss cause, stack layer, subagent - so a bar in one of
+     them would read as membership. Red is the exception the whole page makes
+     for errors. */
+  /* --text-secondary, not --text-primary: turn costs cluster on most
+     sessions, so the lane is often a near-flat slab - which is the truth, and
+     is fine as long as the slab is not the heaviest ink on the page. In the
+     light theme --text-primary at this size was exactly that. */
+  .turn-cost { fill: var(--text-secondary); opacity: 0.6; }
+  .tool-bar { fill: var(--text-secondary); opacity: 0.8; }
+  .tool-bar-err { fill: var(--danger); }
+  /* A bar that ran off the top of its lane, capped so it does not read as
+     merely the tallest one drawn. */
+  .tool-bar-over { fill: var(--text-primary); }
+  .sw-tool { background: var(--text-secondary); }
+  .sw-toolerr { background: var(--danger); }
+  /* The hairline between two lanes. Same colour as the context plot's zero
+     line, because it is the same thing - the floor of a lane - and a second
+     grey would only ask the reader what the difference was. */
+  /* The floor of a lane, and so the boundary with the lane below it. Exactly
+     the weight of .base-line, which is the context plot's own floor: they are
+     the same kind of line and a second grey would only ask why. What makes
+     the lanes read apart is the clear space under each rule - see perLane()
+     for what used to fill it back in. */
+  .lane-rule { stroke: var(--baseline); stroke-width: 1; }
+  .xh { pointer-events: none; }
+  .xh-line { stroke: var(--text-primary); stroke-width: 1; opacity: 0.45; }
+  .xh-dot { fill: var(--text-primary); stroke: var(--surface-1); stroke-width: 1.5; }
+  /* The whole column of the turn under the pointer, lit through every lane:
+     in the top half of the chart the unit being read is a prompt, and this is
+     what a prompt looks like from the ruler down to the subagents it ran. */
+  .turn-hot { pointer-events: none; }
+  .turn-hot rect {
+    fill: var(--text-primary); fill-opacity: 0.07;
+    stroke: var(--text-primary); stroke-opacity: 0.35; stroke-width: 1;
+  }
+  /* The readout. It sits under the chart instead of following the pointer,
+     because a panel at the pointer covers the marks it is describing - the
+     crosshair included. Its height is reserved so that moving between the
+     chart's two halves, which have different numbers of lines to say, does
+     not shuffle the panel below it up and down. */
+  .tl-readout {
+    margin: 6px 0 0; padding: 6px 9px; min-height: 46px; box-sizing: border-box;
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 6px; border-left-width: 3px; font-size: 12px;
+  }
+  /* Which half is being reported, said in the one place a colour is free. */
+  .tl-readout { border-left-color: var(--border); }
+  .tl-readout.ro-overall { border-left-color: var(--text-secondary); }
+  .tl-readout.ro-intra { border-left-color: var(--series-1); }
+  .ro-head { color: var(--text-primary); font-weight: 600; margin-bottom: 2px; }
+  .ro-fields { display: flex; flex-wrap: wrap; gap: 3px 14px; }
+  .ro-f .k { color: var(--text-muted); margin-right: 4px; }
+  .ro-f .v { color: var(--text-primary); font-variant-numeric: tabular-nums; }
+  /* One line, always: a 400-character prompt must not resize the strip. */
+  .ro-line {
+    color: var(--text-secondary); margin-top: 2px; min-height: 15px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .turn-num { fill: var(--text-muted); font-size: 10px;
+              font-variant-numeric: tabular-nums; }
+  .turn-hit { fill: transparent; cursor: default; }
+  .turn-hit:focus { outline: 1px solid var(--text-primary); outline-offset: -1px; }
+  /* Subagent runs. One colour for all of them on purpose: the categorical
+     palette is already spoken for by cache-miss cause in this same drawing,
+     and a second meaning for the same five colours would read as the first.
+     Which agent a bar is belongs on the bar, in words. */
+  .agent-bar { fill: var(--series-5); opacity: 0.8; }
+  .agent-run:hover .agent-bar, .agent-run:focus .agent-bar { opacity: 1; }
+  .agent-run { cursor: pointer; }
+  .agent-run:focus { outline: 1px solid var(--text-primary); outline-offset: 1px; }
+  .agent-label { fill: var(--surface-1); font-size: 9px; pointer-events: none; }
+  .lane-label { fill: var(--text-muted); font-size: 10px; }
+  /* Compressed idle time. Hatched rather than blank: a blank column reads as
+     "nothing was measured here", and what is true is "hours passed here and
+     the axis is not showing them to scale". */
+  .gap-bg { fill: var(--surface-1); }
+  .gap-hatch { stroke: var(--grid); stroke-width: 2; }
+  .gap-band { cursor: help; }
+  .gap-label { fill: var(--text-muted); font-size: 9.5px; pointer-events: none; }
+  .sw-agent { background: var(--series-5); }
+  /* Left-aligned, not spread: a .wide section is as wide as the sessions
+     table, so space-between put the axis toggle a few hundred pixels off the
+     right of the card and nobody ever saw it. */
+  .sec-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  .mini-seg button { padding: 2px 9px; font-size: 11px; }
+  .tl-plot { min-height: 4px; }
   .mini-legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 11px;
     color: var(--text-secondary); margin: 6px 0 0; }
   .mini-legend .sw { display: inline-block; width: 9px; height: 9px;
@@ -231,6 +361,10 @@
   }
   .btn:hover { background: var(--hover-wash); }
   .btn[aria-pressed="true"] { color: var(--text-primary); font-weight: 600; }
+  /* "Remove all filters" is disabled, not hidden, when there is nothing to
+     remove: a button that comes and goes moves everything beside it. */
+  .btn:disabled { opacity: 0.45; cursor: default; }
+  .btn:disabled:hover { background: var(--surface-1); }
   .head-right { position: relative; display: inline-flex; gap: 8px; }
   #col-panel {
     position: absolute; right: 0; top: calc(100% + 6px); z-index: 30;
@@ -304,7 +438,12 @@
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
     overflow: hidden; color: var(--text-primary);
   }
-  tr.open td.prompt .txt { -webkit-line-clamp: unset; }
+  /* Only a prompt row grows to show its whole text when it opens. A session
+     row's first column is the session *name* and its detail panel is a chart:
+     un-clamping there pushed 400 characters of first prompt down a narrow
+     column and left a 1,200px void between the row and the panel it opened.
+     The full name is on the cell's tooltip instead. */
+  tr.data-row:not(.sess-row).open td.prompt .txt { -webkit-line-clamp: unset; }
   /* First row of each project when the table is sorted by project: a rule
      above it and its name un-muted, so runs of one project are separable at a
      glance. No rule on the very first body row - the header already draws
@@ -418,6 +557,7 @@
     <select id="f-model" aria-label="Model"></select>
     <input id="f-search" type="search" placeholder="Search prompts and sessions…" aria-label="Search prompts and sessions">
     <button class="btn" id="more-filters-btn" type="button" aria-expanded="false" aria-controls="more-filters">More filters</button>
+    <button class="btn" id="reset-filters-btn" type="button" title="Reset every filter to the default view" disabled>Remove all filters</button>
     <span class="chip" id="session-chip" hidden></span>
   </div>
 
@@ -464,6 +604,15 @@
     <div class="tile" id="tile-errors"><div class="label">Errors</div><div class="value" id="t-errors">–</div><div class="hint" id="t-errors-h"></div></div>
     <div class="tile" id="tile-baseline"><div class="label">Per-day vs baseline</div><div class="value" id="t-baseline">–</div><div class="hint" id="t-baseline-h"></div></div>
     <div class="tile" id="tile-overhead" hidden><div class="label">Fixed overhead</div><div class="value" id="t-overhead">–</div><div class="hint" id="t-overhead-h"></div></div>
+  </div>
+
+  <!-- Filled and positioned by initTilePop() from whichever tile is hovered
+       or focused; empty and hidden until then. -->
+  <div id="tile-pop" role="tooltip" aria-hidden="true" hidden>
+    <div class="tp-label"></div>
+    <div class="tp-value"></div>
+    <div class="tp-hint"></div>
+    <div class="tp-detail"></div>
   </div>
 
   <div class="card">
@@ -595,6 +744,7 @@ function rehydrate(d) {
 const TABLE_STRINGS = {
   sessions: ["id", "title", "project", "kind", "effort", "subagent_ttl"],
   blocks: [],
+  agent_spans: ["session", "type", "desc", "model"],
 };
 const TABLE_STRING_LISTS = { sessions: ["models"], blocks: ["models"] };
 
@@ -623,7 +773,10 @@ function rehydrateTable(d, key) {
    pairs [first index, string], and miss/cause/event are sparse because they
    are empty on almost every point. This undoes all three, and everything
    downstream sees a plain array of {session, t, ctx, cr, cw, model, miss,
-   cause, event} objects. */
+   cause, event, turn, tools, terr} objects. `turn` is 1 on the first request
+   of a prompt, which is what the session timeline rules its turn bands off;
+   `tools`/`terr` are the tool calls, and the failed ones, whose results that
+   request is carrying. */
 function rehydrateCtx(d) {
   const t = d.ctx;
   if (!t || !t.cols) return Array.isArray(t) ? t : [];
@@ -632,7 +785,8 @@ function rehydrateCtx(d) {
   for (let i = 0; i < n; i++) {
     acc += C.t[i];
     out[i] = { session: null, t: acc, ctx: C.ctx[i], cr: C.cr[i], cw: C.cw[i],
-               model: null, miss: 0, cause: null, event: null };
+               model: null, miss: 0, cause: null, event: null, turn: 0,
+               tools: (C.tools && C.tools[i]) || 0, terr: 0 };
   }
   for (const key of ["session", "model"]) {
     const runs = (t.runs && t.runs[key]) || [];
@@ -646,12 +800,15 @@ function rehydrateCtx(d) {
   for (const i of sp.miss || []) out[i].miss = 1;
   for (const p of sp.cause || []) out[p[0]].cause = S[p[1]];
   for (const p of sp.event || []) out[p[0]].event = S[p[1]];
+  for (const i of sp.turn || []) out[i].turn = 1;
+  for (const p of sp.terr || []) out[p[0]].terr = p[1];
   return out;
 }
 DATA.rows = rehydrate(DATA);
 DATA.sessions = rehydrateTable(DATA, "sessions");
 DATA.ctx = rehydrateCtx(DATA);
 DATA.blocks = rehydrateTable(DATA, "blocks");
+DATA.agent_spans = rehydrateTable(DATA, "agent_spans");
 
 /* ---------- utilities ---------- */
 const $ = (id) => document.getElementById(id);
@@ -726,6 +883,11 @@ const PRODUCT_META = {
 };
 const ALL_KINDS = "all";
 const DEFAULT_KIND = "code";
+/* The view a first visit gets, and what "Remove all filters" returns to.
+   `baseKind` is the product this particular payload defaults to: initFilters()
+   settles it once the data says which products are present. */
+const DEFAULT_RANGE = 30;
+let baseKind = DEFAULT_KIND;
 const kindOf = r => r.kind || DEFAULT_KIND;
 const kindLabel = id =>
   id === ALL_KINDS ? "All products" : (PRODUCT_META[id] || {}).label || id;
@@ -747,6 +909,11 @@ const kindPrefix = id => (PRODUCT_META[id] || {}).prefix || "";
    worried about - a genuinely stale payload - still falls back to "no
    filter" instead of an empty table with no explanation. */
 const VIEWS = ["prompts", "sessions"];
+/* The session timeline's two axes. Declared up here with the other state
+   vocabularies rather than beside the chart that draws them, because `state`
+   is built at the top of the file and a const is not readable before its own
+   declaration runs. See timeScale() for what each one does. */
+const AXIS_MODES = [["activity", "activity"], ["elapsed", "elapsed"]];
 /* Range/flag filters live under their own state.rf. `sanitizeRf` is what
    both the initial restore and the persisted-corruption case go through:
    anything that is not a finite number is null, anything that is not a
@@ -769,7 +936,7 @@ function sanitizeRf(v) {
   }
   return out;
 }
-const state = { range: saved.range ?? 30, project: saved.project || "all",
+const state = { range: saved.range ?? DEFAULT_RANGE, project: saved.project || "all",
                 kind: saved.kind || DEFAULT_KIND,
                 model: saved.model || "all",
                 q: typeof saved.q === "string" ? saved.q : "",
@@ -781,6 +948,8 @@ const state = { range: saved.range ?? 30, project: saved.project || "all",
                 session: typeof saved.session === "string" ? saved.session : null,
                 ssort: typeof saved.ssort === "string" ? saved.ssort : "start",
                 sdir: saved.sdir === 1 ? 1 : -1,
+                ctxAxis: AXIS_MODES.some(m => m[0] === saved.ctxAxis)
+                  ? saved.ctxAxis : "activity",
                 rf: sanitizeRf(saved.rf) };
 /* Everything a reload must not lose: filters, sort (both tables), the range
    filters and the view. Written on every change that affects what is on
@@ -791,7 +960,8 @@ const persist = () => localStorage.setItem("ccu-state", JSON.stringify(
     model: state.model, q: state.q, sort: state.sort, dir: state.dir,
     chart: state.chart, group: state.group, cols: state.cols,
     view: state.view, session: state.session,
-    ssort: state.ssort, sdir: state.sdir, rf: state.rf }));
+    ssort: state.ssort, sdir: state.sdir, ctxAxis: state.ctxAxis,
+    rf: state.rf }));
 const rows = DATA.rows;
 
 /* Project name as shown: the active product's label prefix carries no
@@ -847,9 +1017,12 @@ function initFilters() {
   // data; on the overwhelmingly common Code-only install it stays hidden.
   const present = [...new Set(rows.map(kindOf))].sort();
   const choices = present.length > 1 ? [ALL_KINDS, ...present] : present;
-  if (!choices.includes(state.kind))
-    state.kind = present.includes(DEFAULT_KIND) ? DEFAULT_KIND
-                                                : (present[0] || DEFAULT_KIND);
+  // The product this payload defaults to - Claude Code unless the database
+  // has no Code rows at all. Kept for resetFilters(), which has to know what
+  // "no product filter" means here, not just what it usually means.
+  baseKind = present.includes(DEFAULT_KIND) ? DEFAULT_KIND
+                                            : (present[0] || DEFAULT_KIND);
+  if (!choices.includes(state.kind)) state.kind = baseKind;
   const kindSel = $("f-kind");
   kindSel.hidden = present.length <= 1;   // set outright, not left to the markup
   if (present.length > 1) {
@@ -903,9 +1076,134 @@ function initFilters() {
     persist(); renderTable(filtered());
   });
   $("csv-btn").addEventListener("click", exportCsv);
+  $("reset-filters-btn").addEventListener("click", resetFilters);
   initColPanel();
   initTableEvents();
   initMoreFilters();
+  initTilePop();
+}
+
+/* ---------- "Remove all filters" ---------- */
+/* The default view is 30 days of everything, which is a lot of controls to
+   put back by hand once a viewer has been down a rabbit hole: a range, three
+   selects, the search box, up to ten range/flag filters and the session chip.
+   Sort order, the chosen chart and column visibility are not filters and are
+   deliberately left alone - and neither is the prompts/sessions view: someone
+   reading sessions should not be thrown back to prompts for clearing a
+   filter, so only the session *filter* goes. */
+function filtersAreDefault() {
+  return String(state.range) === String(DEFAULT_RANGE) &&
+    state.kind === baseKind && state.project === "all" &&
+    state.model === "all" && !state.q && !state.session &&
+    rfActiveCount() === 0;
+}
+
+/* state -> controls, for the one direction the page normally never needs:
+   every other filter change comes *from* its control, so only a reset has to
+   push values back into them. */
+function syncFilterControls() {
+  for (const x of $("range-seg").children)
+    x.setAttribute("aria-pressed", String(x.dataset.range) === String(state.range));
+  const kindSel = $("f-kind");
+  if (!kindSel.hidden) kindSel.value = state.kind;
+  refreshProjects();               // options depend on the product, so rebuild
+  $("f-model").value = state.model;
+  $("f-search").value = state.q;
+  for (const k in RF_NUM_INPUTS)
+    $(RF_NUM_INPUTS[k]).value = state.rf[k] == null ? "" : String(state.rf[k]);
+  $("rf-misses").checked = state.rf.missesOnly;
+  $("rf-errors").checked = state.rf.errorsOnly;
+}
+
+function resetFilters() {
+  state.range = DEFAULT_RANGE;
+  state.kind = baseKind;
+  state.project = "all";
+  state.model = "all";
+  state.q = "";
+  state.session = null;
+  state.rf = { ...RF_DEFAULTS };
+  /* A debounced search or range-filter keystroke can still be in flight; both
+     handlers read their input's *current* value when they fire, which
+     syncFilterControls() has just blanked, so a pending one settles on the
+     same empty state rather than undoing this. */
+  syncFilterControls();
+  updateMoreFiltersBtn();
+  persist();
+  render();
+}
+
+/* Disabled rather than hidden when there is nothing to remove; render() is
+   the one place every filter change passes through. */
+function updateResetBtn() {
+  $("reset-filters-btn").disabled = filtersAreDefault();
+}
+
+/* ---------- tile hover popup ---------- */
+/* The tiles are half height and no longer lay out their hint line, so the
+   whole of one - label, value, the explanatory hint and whatever precise
+   figure the value carries in its title - lives in a popup instead. It reads
+   that back out of the tile's own elements on hover, so renderTiles() and
+   friends keep writing exactly what they always wrote and a tile added later
+   is picked up for free. Keyboard users get the same thing on focus, which is
+   why the tiles are tabbable. */
+function initTilePop() {
+  const pop = $("tile-pop");
+  const parts = {
+    label: pop.querySelector(".tp-label"),
+    value: pop.querySelector(".tp-value"),
+    hint: pop.querySelector(".tp-hint"),
+    detail: pop.querySelector(".tp-detail"),
+  };
+  let open = null;
+  const text = (tile, sel) => {
+    const e = tile.querySelector(sel);
+    return e ? e.textContent.trim() : "";
+  };
+  function show(tile) {
+    // The label is copied node for node rather than as text: the cost tile's
+    // label carries a pill, and "Cost list prices" run together reads worse
+    // than the badge the tile itself shows.
+    const l = tile.querySelector(".label");
+    parts.label.replaceChildren(
+      ...(l ? [...l.childNodes].map(n => n.cloneNode(true)) : []));
+    parts.value.textContent = text(tile, ".value");
+    parts.hint.textContent = text(tile, ".hint");
+    // Several values abbreviate ("1.2M") and keep the exact figure in a
+    // title; the popup is where there is room for it.
+    const v = tile.querySelector(".value");
+    parts.detail.textContent = (v && v.title) || "";
+    open = tile;
+    pop.hidden = false;                    // must be laid out before measuring
+    pop.setAttribute("aria-hidden", "false");
+    const r = tile.getBoundingClientRect();
+    const w = pop.offsetWidth, h = pop.offsetHeight, pad = 8;
+    const left = Math.max(pad,
+      Math.min(r.left + r.width / 2 - w / 2, innerWidth - w - pad));
+    // Below the tile, unless that would run off the bottom - then above it,
+    // and clamped into the viewport either way (a one-tile-wide phone layout
+    // puts the lower tiles far enough down that "above" overshoots too).
+    const below = r.bottom + pad;
+    const want = below + h > innerHeight - pad ? r.top - h - pad : below;
+    const top = Math.max(pad, Math.min(want, innerHeight - h - pad));
+    pop.style.left = left + "px";
+    pop.style.top = top + "px";
+  }
+  function hide() {
+    open = null;
+    pop.hidden = true;
+    pop.setAttribute("aria-hidden", "true");
+  }
+  for (const tile of document.querySelectorAll(".tiles .tile")) {
+    tile.tabIndex = 0;
+    tile.addEventListener("mouseenter", () => show(tile));
+    tile.addEventListener("mouseleave", () => { if (open === tile) hide(); });
+    tile.addEventListener("focus", () => show(tile));
+    tile.addEventListener("blur", () => { if (open === tile) hide(); });
+  }
+  // A popup anchored to a tile that has scrolled is worse than no popup.
+  addEventListener("scroll", () => { if (open) hide(); }, { passive: true });
+  addEventListener("keydown", e => { if (e.key === "Escape" && open) hide(); });
 }
 
 /* ---------- range/flag filters ("More filters") ---------- */
@@ -1785,6 +2083,204 @@ function ctxFor(sid) {
   return ctxIndex.get(sid) || [];
 }
 
+/* DATA.agent_spans is one flat array of subagent runs ordered by session then
+   start; indexed on first use, exactly like the context series. */
+let agentIndex = null;
+function agentsFor(sid) {
+  if (!agentIndex) {
+    agentIndex = new Map();
+    for (const a of (DATA.agent_spans || [])) {
+      let list = agentIndex.get(a.session);
+      if (!list) agentIndex.set(a.session, list = []);
+      list.push(a);
+    }
+    for (const list of agentIndex.values()) list.sort((x, y) => x.t0 - y.t0);
+  }
+  return agentIndex.get(sid) || [];
+}
+
+/* Prompt rows indexed by session and ordered by time, so a turn boundary in
+   the context series can be matched to the prompt that opened it. The series
+   knows *when* a turn started; only the row knows what was asked and what it
+   cost. */
+let sessRowIndex = null;
+function rowsForSession(sid) {
+  if (!sessRowIndex) {
+    sessRowIndex = new Map();
+    for (const r of (DATA.rows || [])) {
+      if (!r.session) continue;
+      let list = sessRowIndex.get(r.session);
+      if (!list) sessRowIndex.set(r.session, list = []);
+      list.push(r);
+    }
+    for (const list of sessRowIndex.values())
+      list.sort((a, b) => tsMs(a.ts) - tsMs(b.ts));
+  }
+  return sessRowIndex.get(sid) || [];
+}
+
+/* The turns of one session: where each prompt's first request landed, which
+   stretch of the series belongs to it, and the prompt row behind it where
+   there is one. A prompt row's timestamp is when the user pressed enter,
+   which is a moment *before* its first request, so each boundary takes the
+   latest row at or before it and the pointer only moves forward. */
+function turnsFor(sid, points) {
+  const rows = rowsForSession(sid);
+  const out = [];
+  let ri = 0;
+  for (let i = 0; i < points.length; i++) {
+    if (!points[i].turn) continue;
+    const t = points[i].t;
+    while (ri + 1 < rows.length && tsMs(rows[ri + 1].ts) / 1000 <= t) ri++;
+    const row = rows.length && tsMs(rows[ri].ts) / 1000 <= t ? rows[ri] : null;
+    if (out.length) out[out.length - 1].end = i;
+    out.push({ n: out.length + 1, i: i, end: points.length, t: t, row: row });
+  }
+  return out;
+}
+
+/* ---------- the session's own clock ----------
+   A long session is mostly not happening. One in this database ran for 137
+   hours and worked for perhaps nine of them, so a linear axis drew every
+   burst of work as a sliver and the nights in between as most of the chart.
+   "activity" keeps time linear *inside* a working stretch and collapses any
+   idle run past IDLE_GAP_S into a fixed gutter, drawn as a hatched break and
+   labelled with what it swallowed - the compression is on the page rather
+   than hidden in the scale. "elapsed" is the plain linear axis, one button
+   away, because there are questions ("was this an evening or a fortnight?")
+   that only it answers. */
+const IDLE_GAP_S = 20 * 60;
+const IDLE_PX = 24;
+const LIVE_MIN_PX = 3;
+const RUN_MIN_W = 2;
+
+/* The series split at the same idle threshold the axis uses, so the areas and
+   the axis agree about where the session stopped happening. */
+function runsOf(points) {
+  const runs = [];
+  let cur = [];
+  for (const p of points) {
+    if (cur.length && p.t - cur[cur.length - 1].t > IDLE_GAP_S) {
+      runs.push(cur);
+      cur = [];
+    }
+    cur.push(p);
+  }
+  if (cur.length) runs.push(cur);
+  return runs;
+}
+
+function timeScale(times, x0, plotW, mode) {
+  const t0 = times[0], t1 = times[times.length - 1];
+  if (times.length < 2 || t1 <= t0) {
+    const mid = x0 + plotW / 2;
+    return { t0: t0, t1: t1, breaks: [], starts: [t0], px: () => mid };
+  }
+  /* Both modes split the session at its idle runs; what differs is what a
+     break is given. In "activity" it is a fixed gutter, in "elapsed" its true
+     share of the width. Either way the split exists, because the drawing has
+     to know where not to join one working stretch to the next. */
+  const segs = [];
+  let start = t0, prev = t0;
+  for (let i = 1; i < times.length; i++) {
+    if (times[i] - prev > IDLE_GAP_S) {
+      segs.push({ t0: start, t1: prev, idle: false });
+      segs.push({ t0: prev, t1: times[i], idle: true });
+      start = times[i];
+    }
+    prev = times[i];
+  }
+  segs.push({ t0: start, t1: prev, idle: false });
+  const live = segs.filter(s => !s.idle);
+  const idleN = segs.length - live.length;
+  /* A fortnight of nights would otherwise spend the whole chart on gutters,
+     so in activity mode the breaks never take more than a third of it
+     between them. A null idlePx is the linear axis: an idle run is scaled
+     like any other stretch of time. */
+  const idlePx = mode === "activity"
+    ? (idleN ? Math.min(IDLE_PX, plotW * 0.34 / idleN) : 0) : null;
+  const liveSecs = live.reduce((a, s) => a + (s.t1 - s.t0), 0);
+  const idleSecs = segs.reduce((a, s) => a + (s.idle ? s.t1 - s.t0 : 0), 0);
+  const scaled = liveSecs + (idlePx === null ? idleSecs : 0);
+  let avail = plotW - (idlePx === null ? 0 : idleN * idlePx);
+  const floor = Math.min(LIVE_MIN_PX, avail / live.length);
+  avail -= floor * live.length;
+  const width = (s) => scaled > 0 ? avail * (s.t1 - s.t0) / scaled
+                                  : avail / segs.length;
+  let x = x0;
+  const breaks = [], starts = [];
+  for (const s of segs) {
+    s.x0 = x;
+    if (s.idle) {
+      x += idlePx === null ? width(s) : idlePx;
+      breaks.push({ x0: s.x0, x1: x, secs: s.t1 - s.t0 });
+    } else {
+      starts.push(s.t0);
+      x += floor + width(s);
+    }
+    s.x1 = x;
+  }
+  const px = (t) => {
+    if (!(t > t0)) return x0;
+    if (t >= t1) return x0 + plotW;
+    for (const s of segs) {
+      if (t > s.t1) continue;
+      const d = s.t1 - s.t0;
+      return d > 0 ? s.x0 + (s.x1 - s.x0) * (t - s.t0) / d : s.x0;
+    }
+    return x0 + plotW;
+  };
+  return { t0: t0, t1: t1, breaks: breaks, starts: starts, px: px };
+}
+
+/* Subagents run concurrently far more often than not, so their bars are
+   packed into as few rows as will hold them without overlapping - first fit,
+   in start order, with a few pixels of clearance so two touching runs still
+   read as two. */
+/* Twice the 95th percentile of the requests that carried any tool results at
+   all, never above the real maximum and never below two - a session where
+   every request carried exactly one would otherwise divide by a ceiling of
+   two and draw every bar at half height, which says less than a full one. */
+function toolCeiling(points, toolMax) {
+  const nz = points.map(p => p.tools || 0).filter(n => n > 0).sort((a, b) => a - b);
+  if (!nz.length) return 1;
+  const p95 = nz[Math.min(nz.length - 1, Math.floor(0.95 * nz.length))];
+  return Math.max(1, Math.min(toolMax, Math.max(2, 2 * p95)));
+}
+
+const AGENT_LANE_H = 12, AGENT_LANE_GAP = 3, AGENT_LANE_MAX = 8;
+const AGENT_MIN_W = 6;
+const COST_LANE_H = 24, TOOL_LANE_H = 22;
+/* The clear space between one lane and the next. Small on purpose: with a
+   hairline in the middle of it, seven pixels is the difference between four
+   lanes and one block with stripes through it. */
+const LANE_GAP = 9;
+function packAgents(spans, px) {
+  const ends = [], bars = [];
+  for (const sp of spans) {
+    // A subagent that answered in ninety seconds of a nine-hour session is
+    // half a pixel wide honestly drawn. AGENT_MIN_W is the width below which
+    // a bar stops being a mark at all; it overstates a short run's duration
+    // and the tooltip carries the real one.
+    const x0 = px(sp.t0), x1 = Math.max(px(sp.t1), x0 + AGENT_MIN_W);
+    let row = 0;
+    while (row < ends.length && ends[row] > x0 - 4) row++;
+    if (row >= AGENT_LANE_MAX) row = AGENT_LANE_MAX - 1;
+    ends[row] = Math.max(ends[row] || 0, x1);
+    bars.push({ sp: sp, x0: x0, x1: x1, row: row });
+  }
+  return { bars: bars, rows: Math.min(ends.length, AGENT_LANE_MAX) };
+}
+
+const agentLabel = (sp) => sp.desc || sp.type || "subagent";
+const fmtGap = (s) => s >= 86400 ? Math.round(s / 86400) + "d"
+                    : s >= 3600 ? Math.round(s / 3600) + "h"
+                    : Math.round(s / 60) + "m";
+// Epoch seconds, not the ISO day string dayOf() takes.
+const calDay = (t) => new Date(t * 1000).toDateString();
+const dayTime = (t) => new Date(t * 1000).toLocaleString([],
+  { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+
 /* The three parts of a request's context - what was read from cache, what was
    uncached input, and what was written to cache - add up to the context total
    exactly, so the stack's own outline is the context curve and no fourth
@@ -1796,21 +2292,133 @@ const CTX_LAYERS = [
   ["cache write", 3, p => p.cw || 0],
 ];
 
-function ctxChartSvg(points, W, H) {
-  W = Math.max(W || 860, 320); H = H || 200;
-  const padL = 52, padR = 12, padT = 10, padB = 22;
-  const plotW = W - padL - padR, plotH = H - padT - padB;
-  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H,
-                             class: "ctx-svg" });
-  if (!points.length) return svg;
-  const t0 = points[0].t, t1 = points[points.length - 1].t;
-  const span = Math.max(1, t1 - t0);
-  // A single-point session has no span to spread across, so it sits centred.
-  const px = (p) => points.length < 2 ? padL + plotW / 2
-                                      : padL + plotW * (p.t - t0) / span;
-  const top = niceTop(Math.max(...points.map(p => p.ctx || 0), 1));
-  const py = (v) => padT + plotH - plotH * Math.min(v, top) / top;
+/* One drawing, four lanes over a single time axis: the turn ruler (which
+   prompt is this?), the context stack, the subagent runs, and the axis. They
+   share an x, which is the whole reason they are one chart rather than four -
+   a spike in context can be read off against the turn that caused it and
+   against whatever was running underneath at the time.
 
+   `mode` is "activity" or "elapsed"; see timeScale. */
+function sessionTimelineSvg(points, spans, sid, W, mode, readout) {
+  W = Math.max(W || 860, 320);
+  const padL = 52, padR = 12, padT = 6, axisH = 20;
+  const rulerH = 16, ctxH = 176;
+  const turns = turnsFor(sid, points);
+  const times = [];
+  for (const p of points) times.push(p.t);
+  for (const sp of spans) { times.push(sp.t0); times.push(sp.t1); }
+  times.sort((a, b) => a - b);
+  const plotW = W - padL - padR;
+  const sc = timeScale(times, padL, plotW, mode);
+  const pack = packAgents(spans, sc.px);
+  // Exactly the packed rows: a trailing AGENT_LANE_GAP would put the lane's
+  // bottom - and so the bottom of every full-height mark - below the last bar.
+  const agentH = pack.rows
+    ? pack.rows * (AGENT_LANE_H + AGENT_LANE_GAP) - AGENT_LANE_GAP : 0;
+  /* A lane that would be empty is not drawn at all, rather than drawn blank:
+     a session whose prompts are all outside the payload's row cap has no
+     costs to show, and one that called no tools has no density to show. */
+  const costMax = Math.max(...turns.map(t => (t.row && t.row.cost) || 0), 0);
+  const costH = costMax > 0 ? COST_LANE_H : 0;
+  const toolMax = Math.max(...points.map(p => p.tools || 0), 0);
+  const toolH = toolMax > 0 ? TOOL_LANE_H : 0;
+  /* The tool lane is scaled to twice its 95th percentile, not to its maximum,
+     for the reason ironScale() gives about the calendar: one request that
+     unpacked forty tool results pushes every ordinary one - and ordinary is
+     one or two - onto a bar less than a pixel tall. Anything above the
+     ceiling is drawn at full height and capped, so it reads as off the scale
+     rather than as merely tall, and the crosshair still gives the number. */
+  const toolCap = toolCeiling(points, toolMax);
+  /* Lanes are separated by a gap and a rule rather than butted together. The
+     cost bars used to stand on the context plot's own ceiling line, which
+     saved a line and cost the reader the boundary: the two lanes read as one
+     block with a stripe through it. Small is enough - LANE_GAP plus a hairline
+     is all it takes for four lanes to read as four. */
+  const rulerY = padT;
+  const costY = rulerY + rulerH;
+  const ctxY = costY + costH + (costH ? LANE_GAP : 0);
+  const toolY = ctxY + ctxH + LANE_GAP;
+  const agentY = toolY + toolH + LANE_GAP;
+  /* The bands the whole drawing is ruled into, top to bottom, and *only*
+     where something is actually drawn. Anything that belongs to every lane -
+     a turn's wash, a compressed-idle hatch, a turn tick, the hover highlight
+     - is drawn once per entry rather than as one rect down the whole chart.
+     One rect was the obvious thing and it defeated the point of separating
+     the lanes at all: it painted the gaps back in with the same wash, so the
+     clear space between the lanes was never clear and four lanes went on
+     reading as one block with stripes through it.
+
+     The ruler and the cost bars are a single entry because they are a single
+     zone - the half of the chart that is about a whole prompt - and a gap
+     between them would say otherwise. */
+  const lanes = [[rulerY, rulerY + rulerH + costH], [ctxY, ctxY + ctxH]];
+  if (toolH) lanes.push([toolY, toolY + toolH]);
+  if (agentH) lanes.push([agentY, agentY + agentH]);
+  const bandTop = rulerY, bandBot = lanes[lanes.length - 1][1];
+  const H = bandBot + axisH;
+  // Draw `make(y, height)` once for every lane.
+  const perLane = (make) => { for (const l of lanes) make(l[0], l[1] - l[0]); };
+  // Where a turn column can be clicked or focused: the ruler and the cost
+  // bar under it are one target, so a turn too narrow to number is still a
+  // comfortable thing to hit.
+  const turnHitH = rulerH + costH;
+  /* The two halves of the drawing, and the y that divides them. Above it
+     everything is a property of a whole prompt (which turn, what it cost);
+     below it everything happened *inside* one (this request's context, these
+     tool results, that subagent). The readout under the chart follows the
+     pointer across this line and changes what it is reporting, which is why
+     the line has to be one number both it and the layout agree on. */
+  const zoneSplit = costH ? costY + costH + LANE_GAP / 2 : rulerY + rulerH;
+
+  const svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H, width: W, height: H,
+                             preserveAspectRatio: "xMinYMin meet",
+                             class: "ctx-svg", role: "img" });
+  const cap = svgEl("title", {});
+  cap.textContent = points.length + " requests, " + turns.length +
+    " turn(s), " + spans.length + " subagent run(s), " +
+    (mode === "activity" ? "idle time compressed" : "linear time");
+  svg.append(cap);
+  if (!points.length && !spans.length) return svg;
+
+  // The hatch the compressed-idle gutters are filled with. The id carries the
+  // session so two open detail panels cannot collide over it.
+  const hid = "hatch-" + sid;
+  const defs = svgEl("defs", {});
+  const pat = svgEl("pattern", { id: hid, width: 6, height: 6,
+                                 patternUnits: "userSpaceOnUse",
+                                 patternTransform: "rotate(45)" });
+  pat.append(svgEl("rect", { width: 6, height: 6, class: "gap-bg" }));
+  pat.append(svgEl("line", { x1: 0, y1: 0, x2: 0, y2: 6, class: "gap-hatch" }));
+  defs.append(pat);
+  svg.append(defs);
+
+  /* Turn bands run the full height of the drawing rather than just the
+     context lane, so a subagent bar can be read against the turn that
+     launched it without tracing a line up the chart. */
+  for (const t of turns) {
+    const x0 = sc.px(t.t);
+    const x1 = t.end < points.length ? sc.px(points[t.end].t) : padL + plotW;
+    const w = Math.max(x1 - x0, 1);
+    // The wash marks every other turn: through the plot it is a boundary
+    // marker, and two adjacent washes would not be one.
+    if (!(t.n % 2))
+      perLane((y, h) => svg.append(svgEl("rect", { x: x0, y: y, width: w,
+                                                   height: h,
+                                                   class: "turn-band" })));
+    /* The wash alone disappears under the filled area, which covers most of
+       the plot on any session that got anywhere. The ruler strip is the same
+       banding at a strength that survives, in the lanes nothing is drawn
+       over - and *every* turn gets one, in one of two tones. Filling only the
+       even turns left the odd ones as bare background, which read as gaps
+       between the bands rather than as bands, so nothing suggested they could
+       be hovered either. */
+    svg.append(svgEl("rect", { x: x0, y: rulerY, width: w, height: rulerH,
+                               class: t.n % 2 ? "turn-strip-a"
+                                              : "turn-strip-b" }));
+  }
+
+  const top = niceTop(Math.max(...points.map(p => p.ctx || 0), 1));
+  const py = (v) => ctxY + ctxH - ctxH * Math.min(v, top) / top;
   for (let i = 0; i <= 4; i++) {
     const v = top * i / 4, y = py(v);
     svg.append(svgEl("line", { x1: padL, x2: W - padR, y1: y, y2: y,
@@ -1820,28 +2428,68 @@ function ctxChartSvg(points, W, H) {
     t.textContent = v ? fmtC(v) : "0";
     svg.append(t);
   }
-  // stacked areas, bottom-up
-  let base = points.map(() => 0);
-  for (const [, slot, get] of CTX_LAYERS) {
-    const upper = points.map((p, i) => base[i] + get(p));
-    const fwd = points.map((p, i) => px(p) + "," + py(upper[i]));
-    const back = [];
-    for (let i = points.length - 1; i >= 0; i--)
-      back.push(px(points[i]) + "," + py(base[i]));
-    svg.append(svgEl("polygon", { points: fwd.concat(back).join(" "),
-                                  class: "fill-i" + slot, opacity: 0.85 }));
-    base = upper;
+
+  /* Stacked areas, bottom-up, one shape per working stretch rather than one
+     across the session. An area that spans an idle run draws a straight ramp
+     from the last request before a night to the first after it - a climb of
+     context that never happened, and on a linear axis it is most of the
+     chart. Splitting leaves the gap empty, which is what is true. */
+  for (const run of runsOf(points)) {
+    // A stretch of one request has no width to fill; RUN_MIN_W gives it just
+    // enough to be a mark rather than an invisible zero-area polygon.
+    const xs = run.map(p => sc.px(p.t));
+    if (run.length === 1) xs.push(xs[0] + RUN_MIN_W);
+    const rp = run.length === 1 ? [run[0], run[0]] : run;
+    let base = rp.map(() => 0);
+    for (const layer of CTX_LAYERS) {
+      const get = layer[2], slot = layer[1];
+      const upper = rp.map((p, i) => base[i] + get(p));
+      const fwd = rp.map((p, i) => xs[i] + "," + py(upper[i]));
+      const back = [];
+      for (let i = rp.length - 1; i >= 0; i--)
+        back.push(xs[i] + "," + py(base[i]));
+      svg.append(svgEl("polygon", { points: fwd.concat(back).join(" "),
+                                    class: "fill-i" + slot, opacity: 0.85 }));
+      base = upper;
+    }
+    svg.append(svgEl("polyline", { class: "ctx-line",
+      points: rp.map((p, i) => xs[i] + "," + py(p.ctx || 0)).join(" ") }));
   }
-  svg.append(svgEl("polyline", { class: "ctx-line",
-    points: points.map(p => px(p) + "," + py(p.ctx || 0)).join(" ") }));
+
+  /* Compressed idle runs, drawn over the areas so the curve cannot appear to
+     carry on through a night it did not. */
+  for (const b of sc.breaks) {
+    const w = b.x1 - b.x0;
+    if (w < 1) continue;
+    const tip = fmtGap(b.secs) + " idle" +
+                (mode === "activity" ? ", not drawn to scale" : "");
+    perLane((y, h) => {
+      const r = svgEl("rect", { x: b.x0, y: y, width: w, height: h,
+                                fill: "url(#" + hid + ")", class: "gap-band" });
+      svgTip(r, tip);
+      svg.append(r);
+    });
+    /* The duration is written down the gutter rather than under it: a 24px
+       column has no room for "23h idle" beside a clock time, and the axis row
+       is worth more to the working stretches either side of it than to the
+       thing that did not happen. A break wide enough to read across gets it
+       the right way up. */
+    const cx = (b.x0 + b.x1) / 2, cy = ctxY + ctxH / 2;
+    if (w >= 12 && ctxH >= 40) {
+      const at = { x: cx, y: cy, class: "gap-label", "text-anchor": "middle" };
+      if (w < 60) at.transform = "rotate(-90 " + cx + " " + cy + ")";
+      const lab = svgEl("text", at);
+      lab.textContent = fmtGap(b.secs) + " idle";
+      svg.append(lab);
+    }
+  }
 
   for (const p of points) {
     if (!p.event) continue;
-    const x = px(p);
-    const line = svgEl("line", { x1: x, x2: x, y1: padT, y2: padT + plotH,
-                                 class: "ev-line" });
-    svg.append(line);
-    const hit = svgEl("line", { x1: x, x2: x, y1: padT, y2: padT + plotH,
+    const x = sc.px(p.t);
+    svg.append(svgEl("line", { x1: x, x2: x, y1: ctxY, y2: ctxY + ctxH,
+                               class: "ev-line" }));
+    const hit = svgEl("line", { x1: x, x2: x, y1: ctxY, y2: ctxY + ctxH,
                                 class: "ev-hit", tabindex: 0 });
     svgTip(hit, hhmm(p.t * 1000) + " " + (EVENT_LABEL[p.event] || p.event) +
                 (p.model ? " · " + shortModel(p.model) : ""));
@@ -1850,29 +2498,432 @@ function ctxChartSvg(points, W, H) {
   for (const p of points) {
     if (!p.miss) continue;
     const m = causeMeta(p.cause);
-    const c = svgEl("circle", { cx: px(p), cy: py(p.ctx || 0), r: 4,
+    const c = svgEl("circle", { cx: sc.px(p.t), cy: py(p.ctx || 0), r: 4,
                                 class: "ctx-miss c-" + m[2], tabindex: 0 });
     svgTip(c, hhmm(p.t * 1000) + " cache miss · " + m[1] +
               " · " + fmtC(p.cw || 0) + " tokens re-written");
     svg.append(c);
   }
-  for (const [frac, anchor] of [[0, "start"], [1, "end"]]) {
-    const t = svgEl("text", { x: padL + plotW * frac, y: H - 6,
-                              "text-anchor": anchor, class: "tick-label" });
-    t.textContent = hhmm((frac ? t1 : t0) * 1000);
-    svg.append(t);
+
+  /* Tool-call density: one bar per request, as tall as the results that
+     request was carrying. It sits directly under the curve because the two
+     are the same measurement seen twice - a turn that reads twenty files is
+     a turn whose context climbs, and this is where you see which of the
+     climbs were reading and which were writing. Whatever failed is drawn in
+     the error colour over its share of the bar, so a run of red under a flat
+     stretch of curve explains the flatness. */
+  if (toolH) {
+    const cap = svgEl("text", { x: padL - 6, y: toolY + toolH - 1,
+                                "text-anchor": "end", class: "lane-label" });
+    cap.textContent = "tools";
+    svg.append(cap);
+    // The floor of this lane is drawn once, with the other lane rules.
+    // One request is two or three pixels on a long session, so the bars are
+    // butted together rather than gapped, and capped so a short session does
+    // not draw a row of slabs.
+    const bw = Math.max(1.5, Math.min(6, plotW / Math.max(points.length, 1)));
+    for (const p of points) {
+      const n = p.tools || 0;
+      if (!n) continue;
+      const h = Math.max(1.5, (toolH - 2) * Math.min(n, toolCap) / toolCap);
+      const x = sc.px(p.t) - bw / 2;
+      svg.append(svgEl("rect", { x: x, y: toolY + toolH - h, width: bw,
+                                 height: h, class: "tool-bar" }));
+      if (n > toolCap)
+        svg.append(svgEl("rect", { x: x, y: toolY + toolH - h, width: bw,
+                                   height: 2, class: "tool-bar-over" }));
+      if (p.terr) {
+        const eh = Math.max(1.5, h * Math.min(p.terr, n) / n);
+        svg.append(svgEl("rect", { x: x, y: toolY + toolH - eh, width: bw,
+                                   height: eh, class: "tool-bar-err" }));
+      }
+    }
   }
+
+  /* Cost per turn, in the strip under the ruler. Deliberately one flat
+     colour: height already carries the magnitude, and every colour in this
+     drawing is spoken for by a category (miss cause, stack layer, subagent
+     run), so a fourth palette would read as membership in one of them. */
+  if (costH) {
+    // At the top of its own lane, not the bottom: the bottom of the cost lane
+    // is the top of the context plot, where the y axis prints its ceiling, and
+    // the two captions landed on each other.
+    const cap = svgEl("text", { x: padL - 6, y: costY + 10,
+                                "text-anchor": "end", class: "lane-label" });
+    cap.textContent = "cost";
+    svg.append(cap);
+    for (const t of turns) {
+      const c = (t.row && t.row.cost) || 0;
+      if (!(c > 0)) continue;
+      const x0 = sc.px(t.t);
+      const x1 = t.end < points.length ? sc.px(points[t.end].t) : padL + plotW;
+      // Standing on the context plot's own ceiling line, which is at exactly
+      // this y and saves drawing a second baseline over it.
+      const h = Math.max(1.5, (costH - 3) * c / costMax);
+      svg.append(svgEl("rect", { x: x0 + 1,
+                                 width: Math.max(x1 - x0 - 2, 1),
+                                 y: costY + costH - h, height: h,
+                                 class: "turn-cost" }));
+    }
+  }
+
+  /* The turn ruler. Every boundary gets a tick; a number only where the last
+     one left room, because a two-hundred-prompt session would otherwise draw
+     a grey smear. The whole column - ruler plus the cost bar under it - is
+     the hit area, so a turn too narrow to number is still comfortable to
+     hover. */
+  let lastLabel = -1e9;
+  for (const t of turns) {
+    const x = sc.px(t.t);
+    const x1 = t.end < points.length ? sc.px(points[t.end].t) : padL + plotW;
+    perLane((y, h) => svg.append(svgEl("line", { x1: x, x2: x, y1: y,
+                                                 y2: y + h,
+                                                 class: "turn-tick" })));
+    if (x - lastLabel >= 20) {
+      const lab = svgEl("text", { x: x + 3, y: rulerY + 11, class: "turn-num" });
+      lab.textContent = t.n;
+      svg.append(lab);
+      lastLabel = x;
+    }
+    const hit = svgEl("rect", { x: x, y: rulerY, width: Math.max(x1 - x, 2),
+                                height: turnHitH, class: "turn-hit",
+                                tabindex: 0 });
+    /* The turn itself rides on the node, so focus can report it without
+       re-deriving anything. Its <title> is deliberately one short line: the
+       readout under the chart carries the detail now, and a four-line native
+       tooltip over the ruler would sit on top of exactly what moving the
+       readout out of the way was meant to stop covering. */
+    hit.__turn = t;
+    svgTip(hit, "Turn " + t.n + " · " + dayTime(t.t));
+    svg.append(hit);
+  }
+
+  /* Subagent runs: launch to last request, one bar each. Nothing anywhere
+     records that an agent *ended*, so the right edge is the last request it
+     made - the end of its work, if not quite the end of its life. */
+  if (pack.rows) {
+    const cap = svgEl("text", { x: padL - 6, y: agentY + AGENT_LANE_H - 2,
+                                "text-anchor": "end", class: "lane-label" });
+    cap.textContent = "agents";
+    svg.append(cap);
+  }
+  for (const bar of pack.bars) {
+    const y = agentY + bar.row * (AGENT_LANE_H + AGENT_LANE_GAP);
+    const w = Math.max(bar.x1 - bar.x0, AGENT_MIN_W);
+    const sp = bar.sp;
+    const g = svgEl("g", { class: "agent-run", tabindex: 0 });
+    g.append(svgEl("rect", { x: bar.x0, y: y, width: w, height: AGENT_LANE_H,
+                             rx: 3, class: "agent-bar" }));
+    if (w >= 46) {
+      const lab = svgEl("text", { x: bar.x0 + 4, y: y + AGENT_LANE_H - 3,
+                                  class: "agent-label" });
+      // Trimmed to what the bar can hold, at the ~5.4px a 9px character
+      // averages, rather than clipped - a clip path per bar would be a lot of
+      // defs for a label that is only ever a hint at the tooltip.
+      const room = Math.floor((w - 8) / 5.4);
+      const text = agentLabel(sp);
+      lab.textContent = text.length > room
+        ? text.slice(0, Math.max(room - 1, 1)) + "…" : text;
+      g.append(lab);
+    }
+    g.__span = sp;
+    const lab = agentLabel(sp);
+    svgTip(g, lab + (sp.type && sp.type !== lab ? " · " + sp.type : "") +
+              " · " + fmtDur(sp.t1 - sp.t0));
+    svg.append(g);
+  }
+
+  /* Time axis. In activity mode every working stretch is labelled where it
+     starts, because after the gutters those are the only x positions that
+     mean anything definite; in elapsed mode five even ticks do. Either way
+     the date is spelled out whenever it changes, which on a session that ran
+     over four days is most of them. */
+  /* Lane rules, drawn after everything they separate: the compressed-idle
+     hatch spans the full height and would otherwise cover them.
+
+     Each one is the floor of the lane above it *and* the boundary with the
+     lane below, which is why there are only two: the context plot's own zero
+     line already does the job between the curve and the tool lane, and a
+     second rule 9px under it would only be a second rule. */
+  for (const y of [costH ? costY + costH : null,
+                   toolH ? toolY + toolH : null]) {
+    if (y == null) continue;
+    svg.append(svgEl("line", { x1: padL, x2: W - padR, y1: y, y2: y,
+                               class: "lane-rule" }));
+  }
+
+  addTracking(svg, points, spans, sc, readout,
+              { W: W, py: py, top: bandTop, bot: bandBot, split: zoneSplit,
+                turns: turns, padL: padL, plotW: plotW, mode: mode,
+                lanes: lanes });
+
+  const axisY = H - 6;
+  /* Labels are placed by the box each one would occupy rather than by how
+     far apart their anchors are: a centred "Aug 24, 08:12 PM" is 90px wide
+     and two of them 64px apart still print on top of each other, which is
+     what the old spacing test let through. CHAR_W is the average advance of
+     the 11px tick font, near enough for a reservation. */
+  const CHAR_W = 5.6, placed = [];
+  const claim = (x0, x1) => {
+    for (const p of placed) if (x0 < p[1] + 7 && x1 > p[0] - 7) return false;
+    placed.push([x0, x1]);
+    return true;
+  };
+  const putLabel = (x, text, anchor) => {
+    const w = text.length * CHAR_W;
+    const x0 = anchor === "start" ? x : anchor === "end" ? x - w : x - w / 2;
+    if (!claim(x0, x0 + w)) return false;
+    const lab = svgEl("text", { x: x, y: axisY, class: "tick-label",
+                                "text-anchor": anchor });
+    lab.textContent = text;
+    svg.append(lab);
+    return true;
+  };
+  const cand = [];
+  if (mode === "activity") {
+    for (const t of sc.starts) cand.push(t);
+  } else {
+    for (let i = 0; i < 4; i++) cand.push(sc.t0 + (sc.t1 - sc.t0) * i / 4);
+  }
+  // Both ends first, so a session always says when it began and ended however
+  // crowded the middle gets; then the working stretches, left to right.
+  const shown = [];
+  const put = (t, anchor) => {
+    const day = calDay(t);
+    const long = dayTime(t);
+    // A time on the same day as a label already shown needs no date on it -
+    // but only once that neighbour is on the page, so the date is decided
+    // after placement rather than in candidate order.
+    const near = shown.some(s => s.day === day);
+    if (putLabel(sc.px(t), near ? hhmm(t * 1000) : long, anchor))
+      shown.push({ day: day, t: t });
+  };
+  put(sc.t0, "start");
+  if (sc.t1 > sc.t0) put(sc.t1, "end");
+  for (const t of cand) if (t > sc.t0) put(t, "middle");
   return svg;
 }
 
-/* The chart's own legend: the three stacked layers, plus one swatch per cause
-   that actually occurs in this session, plus the event mark. Built from the
-   points so it never names a colour that is not on screen. */
-function ctxLegend(points) {
+/* ---------- the readout ----------
+   What the pointer is over, written into a strip under the chart rather than
+   into a panel that follows the pointer. The panel was the obvious thing and
+   the wrong thing: on a drawing this dense it covered the marks it was
+   describing, the crosshair included, so reading a value meant losing sight
+   of where the value was. A fixed strip cannot occlude anything, and it has
+   room for a line of prompt text that a tooltip did not.
+
+   Its height is reserved rather than fitted, so moving between the two halves
+   of the chart does not shuffle everything below it up and down. */
+function roFields(pairs) {
+  const row = el("div", "ro-fields");
+  for (const [k, v] of pairs) {
+    if (v == null) continue;
+    const s = el("span", "ro-f");
+    s.append(el("span", "k", k), el("span", "v", v));
+    row.append(s);
+  }
+  return row;
+}
+
+function setReadout(box, head, pairs, line, cls) {
+  if (!box) return;
+  const h = el("div", "ro-head");
+  h.textContent = head;
+  const l = el("div", "ro-line");
+  l.textContent = line || "";
+  box.className = "tl-readout" + (cls ? " " + cls : "");
+  box.replaceChildren(h, roFields(pairs), l);
+}
+
+/* What the strip says with the pointer somewhere else: the session in one
+   line, and a note about the two halves - which is the only place the split
+   is explained, and it is worth explaining once. */
+function restReadout(box, points, spans, turns, mode) {
+  if (!box) return;
+  setReadout(box, "Session", [
+    ["requests", fmtFull(points.length)],
+    ["turns", turns.length ? fmtFull(turns.length) : null],
+    ["subagents", spans.length ? fmtFull(spans.length) : null],
+    ["axis", mode === "activity" ? "activity (idle compressed)" : "elapsed"],
+  ], "Point at the top band for a whole prompt; at the context, tool or " +
+     "subagent lanes for one request.");
+}
+
+/* Which subagents were running at an instant, and which were launched inside
+   a turn: the same list read two ways, one per half of the chart. */
+const spansAt = (spans, t) => spans.filter(s => s.t0 <= t && t <= s.t1);
+const spansIn = (spans, t0, t1) => spans.filter(s => s.t0 >= t0 && s.t0 < t1);
+
+/* ---------- pointer tracking ----------
+   One listener on the SVG root. A hit rectangle would be one element instead
+   of thousands, but it would also sit on top of every mark underneath it and
+   take their hovers away; a listener per point would be several thousand of
+   them on a panel the reader may have opened only to glance at.
+
+   Above geo.split the pointer is reading a *prompt* and the whole turn column
+   lights up; below it the pointer is reading a *request* and a crosshair
+   snaps to the nearest one. The readout changes with it. Keyboard reaches the
+   same two states through focusin, because every turn column and subagent run
+   is focusable and carries the object it stands for. */
+function addTracking(svg, points, spans, sc, readout, geo) {
+  if (!points.length && !spans.length) return;
+  const xs = points.map(p => sc.px(p.t));
+  const xh = svgEl("g", { class: "xh", visibility: "hidden" });
+  const line = svgEl("line", { y1: geo.top, y2: geo.bot, class: "xh-line" });
+  const dot = svgEl("circle", { r: 3.5, class: "xh-dot" });
+  xh.append(line, dot);
+  /* One highlight rect per lane, for the reason the turn bands are drawn
+     that way: a single rect over the whole column would fill the gaps that
+     separate the lanes, and the highlight would be the one thing on the chart
+     that put them back together. */
+  const hot = svgEl("g", { class: "turn-hot", visibility: "hidden" });
+  for (const l of geo.lanes)
+    hot.append(svgEl("rect", { y: l[0], height: l[1] - l[0] }));
+  svg.append(hot, xh);
+
+  /* Nearest by drawn x, not by index: the activity axis is piecewise, so
+     equal pixel steps are not equal steps in time and only a search over the
+     positions actually drawn agrees with what the reader is pointing at. */
+  const nearest = (x) => {
+    let lo = 0, hi = xs.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (xs[mid] < x) lo = mid + 1; else hi = mid;
+    }
+    if (lo > 0 && Math.abs(xs[lo - 1] - x) <= Math.abs(xs[lo] - x)) lo--;
+    return lo;
+  };
+  const turnAt = (i) => {
+    for (let k = geo.turns.length - 1; k >= 0; k--)
+      if (geo.turns[k].i <= i) return geo.turns[k];
+    return null;
+  };
+  const turnEndT = (t) =>
+    t.end < points.length ? points[t.end].t : Number.POSITIVE_INFINITY;
+
+  const clear = () => {
+    xh.setAttribute("visibility", "hidden");
+    hot.setAttribute("visibility", "hidden");
+    restReadout(readout, points, spans, geo.turns, geo.mode);
+  };
+
+  // ---- the overall half: one whole prompt
+  const showTurn = (t) => {
+    xh.setAttribute("visibility", "hidden");
+    const x0 = sc.px(t.t);
+    const x1 = t.end < points.length ? sc.px(points[t.end].t)
+                                     : geo.padL + geo.plotW;
+    for (const r of hot.children) {
+      r.setAttribute("x", x0);
+      r.setAttribute("width", Math.max(x1 - x0, 2));
+    }
+    hot.setAttribute("visibility", "visible");
+    let tools = 0, terr = 0, miss = 0;
+    for (let i = t.i; i < t.end; i++) {
+      tools += points[i].tools || 0;
+      terr += points[i].terr || 0;
+      miss += points[i].miss || 0;
+    }
+    const r = t.row;
+    const launched = spansIn(spans, t.t, turnEndT(t));
+    setReadout(readout, "Turn " + t.n + " · " + dayTime(t.t), [
+      ["cost", r ? fmtCost(r.cost, r.est) : null],
+      ["output", r ? fmtFull(r.out) : null],
+      ["wall", r ? fmtDur(r.wall_s || 0) : null],
+      ["API calls", fmtFull(t.end - t.i)],
+      ["tools", tools ? fmtFull(tools) + (terr ? " (" + terr + " failed)" : "")
+                      : null],
+      ["cache misses", miss ? fmtFull(miss) : null],
+      ["subagents", launched.length ? fmtFull(launched.length) : null],
+      ["context at end", points[t.end - 1]
+        ? fmtC(points[t.end - 1].ctx || 0) : null],
+    ], r && r.text ? r.text.replace(/\s+/g, " ")
+                   : "(this prompt's row is not in the payload)", "ro-overall");
+  };
+
+  // ---- the intra half: one request
+  const showPoint = (i) => {
+    hot.setAttribute("visibility", "hidden");
+    const p = points[i];
+    xh.setAttribute("visibility", "visible");
+    line.setAttribute("x1", xs[i]);
+    line.setAttribute("x2", xs[i]);
+    dot.setAttribute("cx", xs[i]);
+    dot.setAttribute("cy", geo.py(p.ctx || 0));
+    const t = turnAt(i);
+    const running = spansAt(spans, p.t);
+    const notes = [];
+    if (p.miss) notes.push("cache miss: " + causeMeta(p.cause)[1]);
+    if (p.event) notes.push(EVENT_LABEL[p.event] || p.event);
+    if (running.length)
+      notes.push("running: " + running.map(agentLabel).join(", "));
+    setReadout(readout, dayTime(p.t) + (t ? " · in turn " + t.n : ""), [
+      ["context", fmtFull(p.ctx || 0)],
+      ["cache read", fmtFull(p.cr || 0)],
+      ["cache write", fmtFull(p.cw || 0)],
+      ["uncached in",
+       fmtFull(Math.max((p.ctx || 0) - (p.cr || 0) - (p.cw || 0), 0))],
+      ["tool results", p.tools
+        ? fmtFull(p.tools) + (p.terr ? " (" + p.terr + " failed)" : "") : null],
+      ["model", p.model ? shortModel(p.model) : null],
+    ], notes.join(" · "), "ro-intra");
+  };
+
+  // ---- one subagent, when the pointer is actually on its bar
+  const showSpan = (sp) => {
+    xh.setAttribute("visibility", "hidden");
+    hot.setAttribute("visibility", "hidden");
+    // An agent whose `agents` row never arrived has neither a description
+    // nor a type, so agentLabel() falls back to the word "subagent" - and
+    // printing it again as the type would be the same word twice.
+    const label = agentLabel(sp);
+    setReadout(readout, label, [
+      ["type", sp.type && sp.type !== label ? sp.type : null],
+      ["model", sp.model ? shortModel(sp.model) : null],
+      ["ran", fmtDur(sp.t1 - sp.t0)],
+      ["API calls", sp.calls ? fmtFull(sp.calls) : "none recorded"],
+      ["output", sp.calls ? fmtFull(sp.out) : null],
+      ["cost", sp.calls ? fmtCost(sp.cost, sp.est) : null],
+    ], dayTime(sp.t0) + " → " + hhmm(sp.t1 * 1000), "ro-intra");
+  };
+
+  svg.addEventListener("mousemove", (e) => {
+    /* getScreenCTM rather than arithmetic on the bounding box. .ctx-svg is
+       width:100% over a viewBox that is usually narrower - the drawing is
+       sized to the visible width and the cell it sits in is as wide as the
+       sessions table - so preserveAspectRatio letterboxes it, and a plain
+       (client - left) * viewBox/box ratio lands the crosshair a few hundred
+       pixels from the pointer. The CTM knows the whole transform. */
+    const m = svg.getScreenCTM();
+    if (!m) return;
+    const pt = new DOMPoint(e.clientX, e.clientY).matrixTransform(m.inverse());
+    if (pt.y < geo.top || pt.y > geo.bot) { clear(); return; }
+    const run = e.target.closest && e.target.closest(".agent-run");
+    if (run && run.__span) { showSpan(run.__span); return; }
+    if (pt.y < geo.split) {
+      const t = turnAt(nearest(pt.x));
+      if (t) showTurn(t); else clear();
+      return;
+    }
+    if (points.length) showPoint(nearest(pt.x));
+  });
+  svg.addEventListener("mouseleave", clear);
+  // Keyboard reaches the same two states: a focused turn column reports its
+  // prompt, a focused subagent run reports itself.
+  svg.addEventListener("focusin", (e) => {
+    if (e.target.__turn) showTurn(e.target.__turn);
+    else if (e.target.__span) showSpan(e.target.__span);
+  });
+  clear();
+}
+/* The chart's own legend: the three stacked layers, then only the marks this
+   session actually put on the page - a cause swatch per miss that happened,
+   the event line, the subagent bar, the compressed-gap hatch. */
+function ctxLegend(points, spans, mode) {
   const box = el("div", "mini-legend");
-  for (const [name, slot] of CTX_LAYERS) {
+  for (const layer of CTX_LAYERS) {
     const s = el("span");
-    s.append(el("span", "sw sw-i" + slot), document.createTextNode(name));
+    s.append(el("span", "sw sw-i" + layer[1]), document.createTextNode(layer[0]));
     box.append(s);
   }
   const seen = [];
@@ -1888,9 +2939,28 @@ function ctxLegend(points) {
   }
   if (points.some(p => p.event))
     box.append(el("span", null, "dashed line: model switch / compaction"));
+  if (points.some(p => p.turn))
+    box.append(el("span", null, "numbered bands: prompts, in order"));
+  if (points.some(p => p.tools)) {
+    const s = el("span");
+    s.append(el("span", "sw sw-tool"), document.createTextNode("tool results"));
+    box.append(s);
+  }
+  if (points.some(p => p.terr)) {
+    const s = el("span");
+    s.append(el("span", "sw sw-toolerr"),
+             document.createTextNode("failed tool calls"));
+    box.append(s);
+  }
+  if (spans.length) {
+    const s = el("span");
+    s.append(el("span", "sw sw-agent"), document.createTextNode("subagent run"));
+    box.append(s);
+  }
+  if (mode === "activity" && points.length)
+    box.append(el("span", null, "hatched: idle time, compressed"));
   return box;
 }
-
 /* ---------- cache health ---------- */
 /* Misses are counted per point in the context series, which is the only place
    the cause lives. Indexing them by session and day once keeps the tile off
@@ -2033,7 +3103,10 @@ const SESSCOLS = [
   { k: "title", label: "Session", val: s => sessName(s).toLowerCase(),
     cell: s => { const td = el("td", "prompt");
                  td.append(el("div", "txt", sessName(s)));
-                 td.title = s.id; return td; } },
+                 // The name is clamped to two lines and does not un-clamp on
+                 // open (see the CSS), so the tooltip is where the whole of
+                 // it lives. The id is a row in the detail panel.
+                 td.title = sessName(s); return td; } },
   { k: "project", label: "Project", val: s => projLabel(s.project),
     cell: s => el("td", "muted proj", projLabel(s.project)) },
   { k: "start", label: "Start", val: s => tsMs(s.start),
@@ -2096,14 +3169,27 @@ const SESS_COL_WIDTH = { project: 130, start: 150, dur: 90, prompts: 90,
    silently stops at 500. */
 const SESS_ROW_CAP = 2000;
 
+/* The one column with no declared width is meant to absorb the slack - but
+   under table-layout: fixed the declared widths win outright, so as soon as
+   they add up to more than the container that column is handed *zero* pixels
+   and its text wraps one character per line. That is what made an opened
+   session row 1,240px tall: the fixed sessions columns come to exactly the
+   table's width, leaving the session-name column nothing. Reserving
+   FLEX_MIN_W past the fixed total in the table's own min-width keeps the
+   column real and lets .tbl-scroll scroll sideways instead. */
+const FLEX_MIN_W = 260;
 function buildColgroup(node, cols, widths) {
   node.replaceChildren();
+  let fixed = 0, flex = 0;
   for (const c of cols) {
     const col = el("col");
     const w = widths[c.k];
-    if (w) col.style.cssText = "width:" + w + "px";
+    if (w) { col.style.cssText = "width:" + w + "px"; fixed += w; }
+    else flex++;
     node.append(col);
   }
+  const table = node.parentNode;
+  if (table) table.style.minWidth = (fixed + flex * FLEX_MIN_W) + "px";
 }
 
 function renderSessHead() {
@@ -2216,19 +3302,71 @@ function toggleSessionDetail(tr, s) {
   td.colSpan = SESSCOLS.length;
   const box = el("div", "detail");
   const points = ctxFor(s.id);
+  const spans = agentsFor(s.id);
 
+  /* The chart itself is appended once the row is in the document - see the
+     note at the end of this function - because its width cannot be measured
+     until then. */
   const secC = el("div", "wide");
-  secC.append(el("h3", null, "Context growth"));
-  if (points.length) {
-    const wide = $("sessions-card");
-    secC.append(ctxChartSvg(points, (wide && wide.clientWidth ? wide.clientWidth - 60 : 860)),
-                ctxLegend(points));
-  } else {
+  const head = el("div", "sec-head");
+  head.append(el("h3", null, "Session timeline"));
+  /* The axis choice is a property of the reader, not of the session, so it
+     persists like a filter: whoever prefers to see the nights stays seeing
+     them across reloads and across every row they open. */
+  const seg = el("div", "seg mini-seg");
+  for (const [key, label] of AXIS_MODES) {
+    const b = el("button", "btn", label);
+    b.type = "button";
+    b.dataset.axis = key;
+    b.setAttribute("aria-pressed", String(state.ctxAxis === key));
+    b.title = key === "activity"
+      ? "Idle stretches collapsed to a hatched gutter, so the work fills the chart"
+      : "Real elapsed time, linear - idle stretches at their true width";
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (state.ctxAxis === key) return;
+      state.ctxAxis = key;
+      persist();
+      drawTimeline();
+      for (const x of seg.children)
+        x.setAttribute("aria-pressed", String(x.dataset.axis === key));
+    });
+    seg.append(b);
+  }
+  if (points.length || spans.length) head.append(seg);
+  secC.append(head);
+  const plot = el("div", "tl-plot");
+  secC.append(plot);
+  if (!points.length && !spans.length) {
     secC.append(el("div", "muted", DATA.ctx_truncated
       ? "No context series for this session: the payload's context cap was " +
         "reached and the oldest sessions were left out of it."
       : "No context series for this session."));
   }
+  /* Redrawn rather than rescaled: the axis mode changes where every mark
+     sits, and rebuilding one SVG for one session is cheaper than the code
+     that would animate it. */
+  const drawTimeline = () => {
+    if (!points.length && !spans.length) return;
+    /* The detail cell is as wide as the sessions table, which is wider than
+       the card it scrolls inside. Sizing the chart to the cell would put a
+       third of a session past the right edge until the reader scrolled after
+       it, so it is sized to the *visible* width instead and simply sits at
+       the left of a cell that is wider than it. */
+    const scroller = plot.closest(".tbl-scroll");
+    const w = Math.min(plot.clientWidth,
+                       scroller ? scroller.clientWidth - 30 : Infinity);
+    /* And the readout and legend are capped to the same width, or they wrap
+       against the table's width and run off the right of the card - which is
+       exactly the bug the chart itself was given this width to avoid. Capping
+       the container is idempotent: the next draw measures the cap and gets
+       the same answer. */
+    plot.style.maxWidth = w + "px";
+    const readout = el("div", "tl-readout");
+    plot.replaceChildren(
+      sessionTimelineSvg(points, spans, s.id, w, state.ctxAxis, readout),
+      readout, ctxLegend(points, spans, state.ctxAxis));
+  };
   box.append(secC);
 
   const misses = points.filter(p => p.miss);
@@ -2324,6 +3462,13 @@ function toggleSessionDetail(tr, s) {
   td.append(box);
   dtr.append(td);
   tr.after(dtr);
+  /* Sized from the element it actually lands in, and only once that element
+     is in the document and has a width. Measuring #sessions-card instead got
+     the viewBox wrong by however much the fixed-width table overflows the
+     card it scrolls inside: the drawing then sat centred in a box wider than
+     itself, behind a gap of ((table width) - (card width)) / 2 that grew as
+     the window narrowed - 137px at 1600, 285px at 1024. */
+  drawTimeline();
 }
 
 /* ---------- view switch ---------- */
@@ -3146,6 +4291,7 @@ function hideSubscriptionTiles() {
 /* ---------- render ---------- */
 function render() {
   const rs = filtered();
+  updateResetBtn();
   renderTiles(rs);
   renderCacheTile(rs);
   renderErrorsTile(rs);

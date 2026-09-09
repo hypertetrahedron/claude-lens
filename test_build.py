@@ -67,7 +67,8 @@ def decode_ctx(table, strings):
         acc += cols["t"][i]
         out.append({"session": None, "t": acc, "ctx": cols["ctx"][i],
                     "cr": cols["cr"][i], "cw": cols["cw"][i], "model": None,
-                    "miss": 0, "cause": None, "event": None})
+                    "miss": 0, "cause": None, "event": None, "turn": 0,
+                    "tools": cols["tools"][i], "terr": 0})
     for key in ("session", "model"):
         runs = table["runs"][key]
         for k, (start, idx) in enumerate(runs):
@@ -81,6 +82,10 @@ def decode_ctx(table, strings):
         out[i]["cause"] = strings[idx]
     for i, idx in table["sparse"]["event"]:
         out[i]["event"] = strings[idx]
+    for i in table["sparse"]["turn"]:
+        out[i]["turn"] = 1
+    for i, n in table["sparse"]["terr"]:
+        out[i]["terr"] = n
     return out
 
 
@@ -242,6 +247,57 @@ class Fixture(unittest.TestCase):
     def collect(self, **kw):
         rows, window = bd.collect(self.con, **kw)
         return {r["id"]: r for r in rows}, rows, window
+
+
+class MainQuerySource(unittest.TestCase):
+    """The main conversation answers to two names.
+
+    A transcript labels its requests "main"; the CLI's own telemetry labels
+    the same requests "repl_main_thread", and an OTel row wins every conflict,
+    so on a machine running the receiver almost every main request ends up
+    with the telemetry label. Filtering the context series on "main" alone
+    dropped them - one live session in the author's database kept 30 of 344
+    requests, and the curve drawn from the survivors jumped days at a time.
+    """
+
+    SIDE = ("subagent", "away_summary", "prompt_suggestion", "sdk",
+            "generate_session_title", "agent:builtin:general-purpose")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="claude-lens-qs-")
+        self.con = db.connect(os.path.join(self.tmp, "metrics.db"))
+        db.upsert_session(self.con, "s1", project="p", cwd="/w/p",
+                          first_ts=ts(0), last_ts=ts(9))
+        db.upsert_prompt(self.con, "q1", "s1", "p", ts(0), "hello", "jsonl",
+                         0, None, "human")
+        rows = [request("m1", "q1", "s1", ts(0), OPUS, output_tokens=10,
+                        cache_create_tokens=1000, cache_1h_tokens=1000),
+                request("m2", "q1", "s1", ts(1), OPUS, output_tokens=10,
+                        cache_read_tokens=1000,
+                        query_source="repl_main_thread")]
+        for i, qs in enumerate(self.SIDE):
+            rows.append(request("x%d" % i, "q1", "s1", ts(2 + i), OPUS,
+                                output_tokens=10, cache_read_tokens=1000,
+                                query_source=qs,
+                                agent_name="ag" if "agent" in qs else None))
+        db.insert_requests_jsonl(self.con, rows)
+        self.con.commit()
+
+    def tearDown(self):
+        self.con.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_telemetry_named_main_requests_are_in_the_series(self):
+        _, _, ctx = bd.cache_scan(self.con)
+        self.assertEqual(len(ctx["s1"]), 2,
+                         "repl_main_thread is the main conversation")
+
+    def test_side_threads_stay_out(self):
+        """Each runs against its own context; mixing them in draws a sawtooth."""
+        _, _, ctx = bd.cache_scan(self.con)
+        self.assertEqual(len(ctx["s1"]), len(bd.MAIN_QUERY_SOURCES),
+                         "one point per main-thread name, none per side thread")
+        self.assertNotIn("repl_main_thread", self.SIDE)
 
 
 class Rows(Fixture):
@@ -472,7 +528,8 @@ class Sessions(Fixture):
         self.assertEqual(len(points[0]), len(bd.CTX_COLUMNS))
         table = bd.compact_ctx(points, bd.Strings())
         self.assertEqual(table["n"], 10)
-        self.assertEqual(sorted(table["cols"]), ["cr", "ctx", "cw", "t"])
+        self.assertEqual(sorted(table["cols"]),
+                         ["cr", "ctx", "cw", "t", "tools"])
         self.assertTrue(all(len(v) == 10 for v in table["cols"].values()))
 
     def test_ctx_encoding_round_trips(self):
@@ -489,10 +546,73 @@ class Sessions(Fixture):
         decoded = decode_ctx(table, strings.out)
         self.assertEqual(len(decoded), len(points))
         for got, want in zip(decoded, points):
-            self.assertEqual(
-                [got[k] for k in bd.CTX_COLUMNS],
-                [want[0], want[1], want[2], want[3], want[4], want[5],
-                 want[6], want[7], want[8]])
+            self.assertEqual([got[k] for k in bd.CTX_COLUMNS], list(want))
+
+    def test_tool_calls_land_on_the_request_that_carried_their_results(self):
+        """Between the previous request and this one, main thread only.
+
+        The fixture's session A calls Bash at ts(0) and ts(1) and an Agent
+        tool at ts(1) on the main thread, plus a Read at ts(2) inside the
+        subagent - which belongs to the subagent's own bar, not to the turn
+        that launched it. Requests are at ts 0, 1, 2, 3, 75 and 76.
+        """
+        _, rows, _ = self.collect()
+        sess = bd.session_rows(rows)
+        points, _ = bd.ctx_points([s["id"] for s in sess])
+        ti = bd.CTX_COLUMNS.index("tools")
+        got = [p[ti] for p in points if p[0] == "sess-a"]
+        # ts(0): the Bash at ts(0). ts(1): the Bash and the Agent at ts(1).
+        # Nothing after that on the main thread.
+        self.assertEqual(got, [1, 2, 0, 0, 0, 0])
+        self.assertEqual(sum(p[ti] for p in points), 3,
+                         "the subagent's own Read is not the session's")
+
+    def test_failed_tool_calls_are_counted_separately(self):
+        _, rows, _ = self.collect()
+        sess = bd.session_rows(rows)
+        points, _ = bd.ctx_points([s["id"] for s in sess])
+        te = bd.CTX_COLUMNS.index("terr")
+        # toolu_2, the failing Bash, is at ts(1) and lands on that request.
+        self.assertEqual([p[te] for p in points if p[0] == "sess-a"],
+                         [0, 1, 0, 0, 0, 0])
+
+    def test_turn_flags_mark_the_first_request_of_each_prompt(self):
+        """One flag per prompt, on its first request, folded turns included.
+
+        Session A is six main requests across one canonical prompt (the
+        task-notification folds onto it), so exactly the first of them is a
+        turn - not one per request, and not a second one for the injected
+        prompt.
+        """
+        _, rows, _ = self.collect()
+        sess = bd.session_rows(rows)
+        points, _ = bd.ctx_points([s["id"] for s in sess])
+        turn = bd.CTX_COLUMNS.index("turn")
+        by_sess = {}
+        for p in points:
+            by_sess.setdefault(p[0], []).append(p[turn])
+        self.assertEqual(by_sess["sess-a"], [1, 0, 0, 0, 0, 0])
+        self.assertEqual(by_sess["sess-b"], [1, 0, 0])
+        self.assertEqual(by_sess["sess-c"], [1])
+
+    def test_agent_spans_run_from_launch_to_last_request(self):
+        """The launch is in `agents`; the end is only in the requests."""
+        bd.collect(self.con)
+        spans = bd.EXTRAS["agent_spans"]
+        self.assertEqual(list(spans), ["sess-a"])
+        (sp,) = spans["sess-a"]
+        self.assertEqual(sp["type"], "general-purpose")
+        self.assertEqual(sp["desc"], "check the parser")
+        self.assertEqual(sp["model"], HAIKU)
+        self.assertEqual(sp["calls"], 1)
+        self.assertEqual(sp["out"], 250)
+        # ts(1) is the agents row; the only request is at ts(4).
+        self.assertEqual(sp["t0"], int(bd.parse_ts(ts(1)).timestamp()))
+        self.assertEqual(sp["t1"], int(bd.parse_ts(ts(4)).timestamp()))
+        # cost_usd is NULL on every jsonl subagent request, so a span that
+        # summed the column would report the run as free.
+        self.assertGreater(sp["cost"], 0)
+        self.assertEqual(sp["est"], 1)
 
     def test_ctx_cap_drops_whole_sessions(self):
         _, rows, _ = self.collect()
@@ -579,7 +699,7 @@ class Payload(Fixture):
         p = self._payload()
         for key in ("sessions", "ctx", "blocks", "errors", "baseline",
                     "overhead", "insights_report", "cost_basis", "notices",
-                    "burn", "ctx_truncated"):
+                    "burn", "ctx_truncated", "agent_spans"):
             self.assertIn(key, p)
         for key in ("cols", "strings", "n_rows", "total_rows", "truncated",
                     "redacted", "plan", "providers", "subscription", "window",
@@ -592,6 +712,19 @@ class Payload(Fixture):
         self.assertEqual(p["errors"]["tools"][0][0], "Bash")
         self.assertEqual(p["errors"]["tools"][0][2], 1)
         self.assertGreater(p["overhead"]["tokens"], 0)
+
+    def test_agent_spans_reach_the_payload_and_redact(self):
+        """Descriptions are prompt text, so --no-prompt-text drops them."""
+        p = self._payload()
+        table = p["agent_spans"]
+        self.assertEqual(table["n"], 1)
+        self.assertEqual(sorted(table["cols"]),
+                         sorted(bd.AGENT_SPAN_COLUMNS))
+        S = p["strings"]
+        self.assertEqual(S[table["cols"]["desc"][0]], "check the parser")
+        self.assertEqual(S[table["cols"]["session"][0]], "sess-a")
+        red = self._payload(redact=True)
+        self.assertIsNone(red["agent_spans"]["cols"]["desc"][0])
 
     def test_every_column_has_one_value_per_row(self):
         p = self._payload()
@@ -618,11 +751,75 @@ class Payload(Fixture):
             os.path.join(self.tmp, "conversations")))
 
 
+class PayloadEmbedding(Fixture):
+    """A prompt that mentions a script tag must not close the real one.
+
+    The HTML tokenizer finds `</script` before any JavaScript runs, so the
+    raw sequence ended the page's only script element: the rest of the
+    payload rendered as text, DATA was never assigned, the table drew nothing
+    and whatever followed was parsed as markup and executed. SCRIPT_TEXT is
+    the fixture's p1 prompt, so every build here carries the hazard.
+    """
+
+    def test_embed_json_escapes_the_markup_characters(self):
+        out = bd.embed_json({"t": "a </script><b> & c"})
+        self.assertNotIn("<", out)
+        self.assertNotIn(">", out)
+        self.assertNotIn("&", out)
+        # and it still parses back to exactly the same string
+        self.assertEqual(json.loads(out)["t"], "a </script><b> & c")
+
+    def test_embed_json_leaves_the_structure_intact(self):
+        payload = {"a": [1, 2, None], "b": {"c": True}, "d": "x"}
+        self.assertEqual(json.loads(bd.embed_json(payload)), payload)
+
+    def test_built_page_has_exactly_one_script_element(self):
+        out = os.path.join(self.tmp, "dashboard.html")
+        saved = (bd.OUTPUT, report_index.OUTPUT)
+        bd.OUTPUT = out
+        report_index.OUTPUT = os.path.join(self.tmp, "index.html")
+        try:
+            bd.build(self.con, check_receiver=False, conversations_n=0)
+        finally:
+            bd.OUTPUT, report_index.OUTPUT = saved
+        with open(out, encoding="utf-8") as f:
+            html = f.read()
+        self.assertEqual(html.lower().count("<script"), 1)
+        self.assertEqual(html.lower().count("</script"), 1)
+
+    def test_the_prompt_text_still_reaches_the_payload(self):
+        """Escaped, not dropped - the row must still say what was typed."""
+        p = Payload._payload(self)
+        self.assertIn(SCRIPT_TEXT, p["cols"]["text"])
+
+
 class ConversationPages(Fixture):
     def _write(self, limit=10, redact=False):
         _, rows, _ = self.collect()
         return conversations.write_pages(self.con, self.tmp, rows,
                                          limit=limit, redact=redact), rows
+
+    def test_the_cap_is_counted_so_the_page_can_say_so(self):
+        """A row past the limit had no link and the page never said why.
+
+        Unlinked reads as "transcript gone", which is a different and worse
+        thing than "outside the configured window".
+        """
+        res, rows = self._write(limit=1)
+        self.assertEqual(res["capped"], 2)
+        res, _ = self._write(limit=10)
+        self.assertEqual(res["capped"], 0, "nothing was cut, so say nothing")
+
+    def test_the_cap_is_reported_in_the_notice_bar(self):
+        p = Payload._payload(self, conversations_n=1)
+        joined = " ".join(p["notices"])
+        self.assertIn("Conversation pages cover the newest", joined)
+        self.assertIn("--conversations", joined)
+
+    def test_no_cap_notice_when_nothing_was_cut(self):
+        p = Payload._payload(self, conversations_n=500)
+        self.assertNotIn("Conversation pages cover",
+                         " ".join(p["notices"]))
 
     def test_page_is_written_and_linked(self):
         res, rows = self._write()
@@ -783,6 +980,49 @@ class UnpricedCounts(unittest.TestCase):
     def test_default_calls_is_one(self):
         bd.note_unpriced("solo-model", tokens=10, uncosted=True)
         self.assertEqual(bd.UNPRICED["solo-model"]["rows"], 1)
+
+    def test_unpriced_models_are_all_returned(self):
+        """The payload's array is the notice bar's count AND its list.
+
+        Slicing it made the page claim six models when there were more, and
+        leave the rest unnamed anywhere - against the rule that an unpriced
+        model is named on the page rather than silently costed at $0.00.
+        """
+        for i in range(9):
+            bd.note_unpriced("mystery-%d" % i, tokens=100 * (i + 1),
+                             uncosted=True)
+        self.assertEqual(len(bd.unpriced_models()), 9)
+
+
+class UnpricedPayload(Fixture):
+    def test_every_unpriced_model_reaches_the_payload(self):
+        """collect() rebuilds UNPRICED, so the models have to be real rows."""
+        for i in range(9):
+            db.upsert_request(self.con, request(
+                "unp-%d" % i, "p1", "sess-a", ts(2), "mystery-model-%d" % i,
+                input_tokens=100 * (i + 1), output_tokens=10), "jsonl")
+        self.con.commit()
+        p = Payload._payload(self)
+        names = [u["model"] for u in p["unpriced"]]
+        self.assertEqual(len(names), 9, "the list was sliced again")
+        self.assertEqual(names[0], "mystery-model-8", "dearest first")
+        for i in range(9):
+            self.assertIn("mystery-model-%d" % i, names)
+
+
+class RedactedPayload(Fixture):
+    """--no-prompt-text makes the file safe to hand to someone else."""
+
+    def test_insights_link_is_withheld(self):
+        """It is a file: URL under the home directory, so it names the user."""
+        p = Payload._payload(self, redact=True)
+        self.assertIsNone(p["insights_report"])
+
+    def test_insights_link_is_present_without_redaction(self):
+        p = Payload._payload(self)
+        # None only when the CLI has written no report on this machine; the
+        # point is that redaction is what decides it, not chance.
+        self.assertEqual(p["insights_report"], bd.insights_report())
 
 
 class Digest(Fixture):

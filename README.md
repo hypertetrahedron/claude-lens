@@ -391,11 +391,33 @@ Three more tables ride along with the rows:
   subagents ran at, and the first prompt's text.
 - **`ctx`** -- the context series: one point per main-conversation request
   carrying the measured `context_tokens`, cache reads and writes, the model,
-  whether it missed the cache and why, and any compaction or switch that
-  landed since the previous request. Subagent requests are left out; they run
-  against their own context, so mixing them in would draw a sawtooth that
-  never happened. Capped at 200,000 points -- past that, whole sessions are
-  dropped oldest-first and the notice bar says how many.
+  whether it missed the cache and why, any compaction or switch that landed
+  since the previous request, a `turn` flag on the first request of each
+  prompt, and the tool calls (`tools`) and failed tool calls (`terr`) that
+  landed between the previous request and this one -- which is exactly the set
+  whose results this request is carrying, so the density lane and the context
+  curve measure the same thing at the same x. A subagent's own tool calls are
+  its own work and stay out, for the same reason its requests do.
+  Subagent requests are left out; they run against their own context,
+  so mixing them in would draw a sawtooth that never happened. Capped at
+  200,000 points -- past that, whole sessions are dropped oldest-first and the
+  notice bar says how many.
+
+  "Main conversation" means `query_source` in (`main`, `repl_main_thread`).
+  Those are the same requests under two names: a transcript writes the first,
+  the CLI's own telemetry writes the second, and an OTel row wins every
+  conflict -- so on a machine running the receiver almost every main request
+  ends up carrying the telemetry name. Matching only `main` kept the handful
+  of requests OTel never saw, and the curve drawn from them jumped days at a
+  time and invented `idle_gap` misses across the holes.
+- **`agent_spans`** -- one row per subagent run: the session it belongs to,
+  when it was launched, when its last request landed, its type, description,
+  model, calls, output tokens and cost. The launch time comes from the
+  `agents` table (the moment the Agent tool was called) and the end from the
+  agent's own requests, because nothing anywhere records that a subagent
+  *finished*. Cost is priced here rather than summed off `cost_usd`, which is
+  NULL on every transcript-sourced subagent request. `--no-prompt-text` blanks
+  the descriptions, which are the user's own words.
 - **`blocks`** -- ccusage-style 5-hour billing blocks over the last 30 days,
   and for the open one a burn rate (tokens and dollars per minute over the
   last half hour) with a projected cost at the block's end.
@@ -418,7 +440,7 @@ per model used, model switches, compactions, peak context, and a
 subagent-cache-TTL badge. Click a row (or focus it and press Enter/Space) to
 open its detail panel:
 
-- the **context-growth chart** for that session (see below);
+- the **session timeline** for that session (see below);
 - its cache misses, each with the time, cause, context size, tokens
   re-written and a cost (the session's exact `miss_cost` shared out across
   its misses in proportion to what each one re-wrote);
@@ -435,20 +457,116 @@ genuinely stale payload, not the ordinary case of the same page reloading
 itself) is dropped rather than left filtering every prompt away with no
 visible reason why.
 
-### Context-growth chart
+### Session timeline
 
-Per session, an SVG area chart of measured context over time: cache-read,
-uncached-input and cache-write stacked bottom-up so their sum traces the
-context curve itself (no separate line needed beyond the stack's own
-outline). Cache misses are marked as dots coloured by cause, from the same
-categorical palette and cause table as the backend classification above; a
-legend is built from whatever actually appears in that session, so it never
-names a colour that is not on screen. Compaction and model/effort/speed
-switches are dashed vertical marks with a tooltip. A session with no context
-series (dropped by the payload's 200,000-point cap) says so instead of
-drawing an empty chart. Two matching day charts live in the chart selector:
-**"Context: peak / day"** (the largest single request's context per day) and
-**"Cache misses: cost / day"** (the day's total miss cost).
+One drawing, four lanes over a single time axis, so the shape of a session
+can be read in one pass:
+
+1. **The turn ruler.** A tick and a number at each prompt, with *every* turn
+   given a band in one of two tones so the boundaries are visible without a
+   line per prompt. (Both tones are drawn deliberately: filling only the even
+   turns left the odd ones as bare page, which read as the gaps between bands
+   rather than as bands, and so gave no hint that they could be hovered like
+   their neighbours.) The whole column -- ruler plus the cost bar under it --
+   is one hit area: a turn's tooltip gives its time, the prompt text, its
+   cost, output tokens, wall time, API calls and tool calls. Numbers are
+   printed only where the last one left room, so a two-hundred-prompt session
+   rules itself rather than drawing a grey smear.
+2. **Cost per turn.** One bar per prompt, standing on the context plot's own
+   ceiling line, so "which turns were expensive?" is answerable without
+   opening anything. Deliberately one flat neutral colour: height already
+   carries the magnitude, and every colour in this drawing means a category,
+   so a bar in one of them would read as membership. On many sessions the
+   turns cost about the same and the lane is near flat -- which is the answer,
+   not a failure to draw one.
+3. **The context stack.** Cache-read, uncached-input and cache-write stacked
+   bottom-up so their sum traces the context curve itself (no separate line
+   needed beyond the stack's own outline). Cache misses are dots coloured by
+   cause, from the same categorical palette and cause table as the backend
+   classification above; compaction and model/effort/speed switches are
+   dashed vertical marks with a tooltip.
+4. **Tool-call density.** One bar per request, as tall as the tool results
+   that request was carrying, with whatever failed drawn over its share in the
+   error colour. It sits directly under the curve because the two are the same
+   measurement seen twice: a turn that reads twenty files is a turn whose
+   context climbs, and this is where reading is told from writing. The lane is
+   scaled to twice the 95th percentile rather than to the maximum -- for the
+   reason the calendar heatmap gives, one request that unpacked forty results
+   would otherwise push every ordinary one (one or two) below a pixel. A bar
+   over the ceiling is drawn full height and capped, so it reads as off the
+   scale rather than merely tall.
+5. **The subagent lane.** One bar per subagent run, from launch to its last
+   request, packed into as few rows as will hold them so concurrent runs are
+   visibly concurrent. Wide enough bars carry the agent's description; every
+   bar's tooltip carries its type, model, span, calls, output and cost. All
+   one colour on purpose -- the categorical palette is already spoken for by
+   cache-miss cause in the same drawing.
+6. **The time axis**, in one of two modes, toggled beside the heading and
+   persisted like any other filter:
+   - **activity** (the default) keeps time linear *inside* a working stretch
+     and collapses any idle run over 20 minutes into a fixed hatched gutter
+     labelled with what it swallowed ("16h idle"). A session that ran 137
+     hours and worked for nine of them draws its nine hours across the chart
+     instead of as slivers between nights.
+   - **elapsed** is the plain linear axis, for the times the question is
+     "was this an evening or a fortnight?".
+
+   Either way the areas are **split at every idle run**, in both modes. An
+   area drawn straight across a gap ramps from the last request before a
+   night to the first after it -- a climb of context that never happened.
+
+The lanes are separated by a gap and a hairline rather than butted together.
+It is a small distance on purpose: the cost bars used to stand on the context
+plot's own ceiling line, which saved a line and cost the reader the boundary,
+and nine pixels with a rule in them is the difference between four lanes and
+one block with stripes through it.
+
+**The gaps have to stay empty to be gaps.** Everything that belongs to every
+lane -- a turn's wash, a compressed-idle hatch, a turn tick, the hover
+highlight -- is drawn once per lane rather than as one shape down the whole
+chart, because one shape paints the clear space back in with the same colour
+as the lanes. Adding a mark that spans the drawing means adding it to
+`perLane()`; and the bottom of the drawing is the bottom of the last lane
+that has something in it, not the bottom of the space reserved for one, or
+every such mark hangs below the last lane and into the axis.
+
+### Reading the timeline
+
+The chart has two halves, and the strip under it reports whichever one the
+pointer is in:
+
+- **The top half** -- the turn ruler and the cost bars -- is about a *whole
+  prompt*. Point at it and that turn's column lights through every lane, and
+  the strip gives the prompt's text, cost, output, wall time, API calls, tool
+  calls, cache misses, subagents launched, and the context it left behind.
+- **The bottom half** -- the context stack, the tool lane, the subagent lane
+  -- is about what happened *inside* a prompt. Point at it and a crosshair
+  snaps to the nearest request, and the strip gives that request's context,
+  the three parts that make it up, its tool results, its model, and any cache
+  miss, event or subagent running at that moment. Point at a subagent's own
+  bar and the strip reports that run instead.
+- Point at neither and the strip gives the session: requests, turns,
+  subagents, and which axis is in use.
+
+**Nothing floats.** An earlier version put this in a panel that followed the
+pointer, which is the obvious design and the wrong one: on a drawing this
+dense the panel covered the marks it was describing, the crosshair included,
+so reading a value meant losing sight of where the value was. A strip under
+the chart cannot occlude anything, and it has room for a line of prompt text
+that a tooltip did not. Its height is reserved, so crossing between the two
+halves does not shuffle the page.
+
+Keyboard reaches both states: every turn column and subagent run is focusable
+and reports itself into the same strip. The marks keep short `<title>`
+tooltips as their accessible names -- short deliberately, because a four-line
+native tooltip over the ruler would occlude exactly what moving the readout
+out of the way was meant to stop covering.
+
+A session with no context series (dropped by the payload's 200,000-point
+cap) says so instead of drawing an empty chart. Two matching day charts live
+in the chart selector: **"Context: peak / day"** (the largest single
+request's context per day) and **"Cache misses: cost / day"** (the day's
+total miss cost).
 
 ### Cache-health tile
 
@@ -567,7 +685,10 @@ What follows from the provider:
   tiles are hidden rather than shown as zero.
 - **Unpriced models are named on the page**, not just on stderr — the failure
   that started all this was a confident, wrong $0.00 with nothing to explain
-  it. This applies to any unpriced model, not only Bedrock ones.
+  it. This applies to any unpriced model, not only Bedrock ones, and to every
+  one of them: the notice bar lists the whole set, dearest first. Its count is
+  that list's length, so a slice made the page understate how many models it
+  was costing at $0.00 and left the rest unnamed anywhere.
 
 Rows recorded before provider tracking carry no provider and are treated as
 first-party, so nothing changes for an existing install.
@@ -674,7 +795,7 @@ your machine or your history gets long:
 
 | Flag | Effect |
 |---|---|
-| `--no-prompt-text` | Blanks prompt text. Every number survives; nothing you typed is embedded. The page says it was redacted, and no conversation pages are written. |
+| `--no-prompt-text` | Blanks prompt text. Every number survives; nothing you typed is embedded. The page says it was redacted, no conversation pages are written, and the `/insights` link is withheld: it is a `file:` URL under your home directory, so it carries your account name. |
 | `--max-rows N` | Embeds only the newest N prompts (default 8000; `0` for no limit). |
 | `--conversations N` | Writes a conversation page for the newest N prompts (default 300; `0` for none). |
 | `--db PATH` | Reads a database somewhere other than beside the script. |
@@ -687,6 +808,13 @@ dashboard says so, so a shrinking "All" view is never a mystery.
 Prompt text is otherwise embedded verbatim (first 400 characters), which is
 worth remembering before sending `dashboard.html` to anyone.
 
+Verbatim in value, not in bytes: the payload is JSON inside a `<script>`
+element, and the HTML tokenizer looks for `</script` before any JavaScript
+runs, so a prompt that merely mentions one would have closed the page's only
+script element — no `DATA`, no table, and anything after the sequence parsed
+as markup and run. `<`, `>` and `&` are therefore written as `\uXXXX`
+escapes, which parse back to exactly the same characters.
+
 Both flags — and `--conversations N` and `--db PATH` — are accepted by
 `generate-dashboard.sh` / `.ps1` too, so a redacted build is one command:
 `./generate-dashboard.sh --no-prompt-text --no-open`.
@@ -698,8 +826,10 @@ question -- *what did it actually do* -- used to mean opening a 40 MB JSONL
 file and reading it with your eyes.
 
 Every build writes `conversations/<prompt id>.html` for the newest 300 prompts
-(`--conversations N`, `0` to turn it off). Each is a self-contained page in the
-dashboard's own theme, rendering that turn as it happened:
+(`--conversations N`, `0` to turn it off). Prompts older than that have no
+page, and the notice bar says how many, so an unlinked row reads as the cap it
+is rather than as a transcript that went missing. Each page is self-contained,
+in the dashboard's own theme, rendering that turn as it happened:
 
 - what you typed, and what came back (assistant text and thinking, cut at 4000
   characters per block);
@@ -866,6 +996,15 @@ Both sources write the same SQLite DB; dedupe on Anthropic request ids and
 tool-use ids makes their overlap harmless (live OTel rows win, since they
 carry the CLI's authoritative `cost_usd`).
 
+Winning a conflict is not the same as filling a hole. A few columns are
+recorded only in the transcript — `effort`, `speed`, `thinking_tokens`, the
+cache TTL split, `stop_reason`, `service_tier`, `inference_geo` — and an OTel
+event that arrives without them leaves them NULL. Because the receiver
+usually writes first, the ingest later fills exactly those columns where they
+are still empty, leaving every value already present alone. A re-parse
+(`jsonl_ingest.py --force`) therefore repairs rows that live mode claimed
+before their transcript was read.
+
 | File | Role |
 |---|---|
 | `generate-dashboard.ps1` / `.sh` | One-shot: ingest + build + open |
@@ -937,6 +1076,14 @@ counterfactual.
 
 ## Other dashboard features
 
+- **Compact tiles, with the detail on hover** — the summary tiles are about
+  50px tall, half what they were: label and value only, no explanatory line
+  under the number. Hovering a tile (or tabbing to it — they are focusable)
+  pops up the whole thing: the label, the value, the explanation that used to
+  sit under it, and the precise figure behind an abbreviated one ("26,023
+  added, 958 removed" under `26.0K`). One popup serves every tile and reads
+  its text back out of the tile at hover time, so a tile added later needs
+  nothing extra. Escape or a scroll dismisses it.
 - **Current 5h window tile** — ccusage-style rate-limit block (starts at the
   floored hour of the first request after the previous block ends): output
   tokens, cost, reset time. Global, not filter-scoped.
@@ -1019,6 +1166,14 @@ counterfactual.
   on the sessions table only cost, calls and misses apply, since duration,
   output tokens and errors have no per-session field to filter on. Persisted
   like every other filter.
+- **Remove all filters** — next to *More filters*: one click back to the
+  default view — 30 days, all products/projects/models, no search text, no
+  range filters, no session filter. Sort order, chart choice and column
+  layout are not filters and are left alone, and neither is the
+  Prompts/Sessions view: only the session *filter* is cleared, so reading
+  sessions does not throw you back to prompts. The button is disabled (not
+  hidden, which would shift everything beside it) whenever nothing is
+  filtered.
 - **Auto-refresh** — the page reloads every 5 minutes. Every filter (date
   range, product, project, model, search text, the range filters above),
   both tables' sort column and direction, the Prompts/Sessions view, column
@@ -1072,6 +1227,16 @@ versions of a file survive, Claude Lens diffs them and records the change with
 `edits.source = 'file-history'`. It only does so for sessions that actually
 have unmeasured subagent edits, and only for files that session has no `edits`
 row for at all, so nothing is counted twice.
+
+Which backup belongs to which file is read from the transcript's own
+`backupFileName` wherever it gives one, rather than re-derived by hashing:
+that is the name on disk, and it needs nothing guessed about the exact string
+the CLI hashed. The hash is the fallback for older transcripts that record no
+name. The tracked paths in a snapshot are relative to the session's `cwd` and
+keep their subdirectories, and they are stored in whichever path flavour the
+recording machine used, so they are joined without going through the local
+`os.path` — splicing a Windows separator into a POSIX path changes the string,
+and the hash is over the string.
 
 Recovery is best-effort by nature: only the newest version or two of a file is
 kept, so the earliest change to a file usually has no earlier version to diff
