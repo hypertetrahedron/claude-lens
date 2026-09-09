@@ -3,8 +3,8 @@
 Run with `python3 test_receiver.py`.
 
 Synthetic OTLP/HTTP JSON payloads go through `receiver.handle_record` into a
-temporary database, and the stored rows are checked. Columns that schema v8
-adds are asserted only when the database actually has them, so this file is
+temporary database, and the stored rows are checked. Columns that a newer
+schema adds are asserted only when the database actually has them, so this is
 green both before and after the schema lands; whatever was skipped is printed
 at the end rather than passing in silence.
 """

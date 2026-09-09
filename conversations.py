@@ -568,7 +568,7 @@ def _prune_stale(folder, keep):
             pass
 
 
-def _atomic_write(path, text):
+def atomic_write(path, text):
     """Write `text` to `path` without ever exposing a partial or torn file.
 
     The receiver rebuilds these pages on its own minute-by-minute schedule
@@ -627,7 +627,7 @@ def _write_one(page_path, row, entries, costs, agents, base_dir):
            "&middot; <a href='index.html'>all conversations</a> &middot; "
            "<a href='../dashboard.html'>dashboard</a>")
     doc = _document(title, sub, meta, page.html())
-    _atomic_write(page_path, doc)
+    atomic_write(page_path, doc)
 
 
 def _write_index(folder, listed):
@@ -651,4 +651,4 @@ def _write_index(folder, listed):
         "",
         "<table><tr><th>When</th><th>Project</th><th>Prompt</th>"
         f"<th class='n'>Cost</th><th class='n'>Output</th></tr>{rows}</table>")
-    _atomic_write(os.path.join(folder, "index.html"), doc)
+    atomic_write(os.path.join(folder, "index.html"), doc)
