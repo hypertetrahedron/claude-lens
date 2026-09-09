@@ -23,6 +23,8 @@ from http.server import HTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import db                                             # noqa: E402
+import jsonl_ingest
+import sources
 import receiver                                       # noqa: E402
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -362,6 +364,65 @@ class CostBasis(unittest.TestCase):
         os.remove(os.path.join(self.dir, "settings.json"))
         # No re-read inside the TTL, so the answer is unchanged.
         self.assertEqual(receiver.cost_basis(), "contracted")
+
+
+class ReconcileLocking(ReceiverCase):
+    """Where _db_lock is held, and where it deliberately is not.
+
+    The lock exists for `_con`, which every ThreadingHTTPServer handler thread
+    shares. It was also being held across the whole reconcile, so directory
+    discovery and an os.stat per transcript blocked incoming telemetry for the
+    length of a full ingest. The ingest writes on its own connection, so
+    SQLite's one-writer rule already serialises it.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._real_run = jsonl_ingest.run
+        self._real_load = sources.SourceConfig.load
+        self._real_con = receiver._con
+        receiver._con = self.con
+        def restore():
+            jsonl_ingest.run = self._real_run
+            sources.SourceConfig.load = self._real_load
+            receiver._con = self._real_con
+        self.addCleanup(restore)
+        sources.SourceConfig.load = staticmethod(lambda *a, **k: _NoHosts())
+
+    def test_the_ingest_does_not_run_under_the_lock(self):
+        """A held lock here stalls every POST for the length of the pass."""
+        seen = {}
+
+        def fake_run(*a, **kw):
+            seen["locked"] = receiver._db_lock.locked()
+            return {"scanned": 0, "ingested": 0}
+
+        jsonl_ingest.run = fake_run
+        receiver.reconcile(os.path.join(self.dir, "metrics.db"))
+        self.assertIs(seen["locked"], False)
+
+    def test_the_lock_is_free_again_afterwards(self):
+        """_note_schema_version takes it after the ingest; it must give it back."""
+        jsonl_ingest.run = lambda *a, **kw: {"scanned": 0, "ingested": 0}
+        receiver.reconcile(os.path.join(self.dir, "metrics.db"))
+        self.assertFalse(receiver._db_lock.locked())
+
+    def test_a_failing_ingest_does_not_strand_the_lock(self):
+        """An exception out of run() must not leave every POST blocked."""
+        def boom(*a, **kw):
+            raise RuntimeError("ingest exploded")
+
+        jsonl_ingest.run = boom
+        with self.assertRaises(RuntimeError):
+            receiver.reconcile(os.path.join(self.dir, "metrics.db"))
+        self.assertFalse(receiver._db_lock.locked())
+
+
+class _NoHosts:
+    """Stand-in SourceConfig: no remotes, so reconcile skips the SSH branch."""
+
+    def hosts(self):
+        return []
 
 
 class Fingerprint(ReceiverCase):
