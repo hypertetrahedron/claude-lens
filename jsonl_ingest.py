@@ -606,11 +606,12 @@ class SwitchTracker:
         # CLI's telemetry gives it, and an OTel row overwrites the transcript
         # label - so a session the receiver watched has almost no rows left
         # that say "main", and seeding on that alone found nothing and
-        # reported the session's first model as a switch.
+        # reported the session's first model as a switch. db.MAIN_QS_SQL is
+        # the one place both spellings are written down, shared with
+        # build_dashboard.py so a third spelling only has to be added once.
         row = self.con.execute(
             """SELECT model, effort, speed FROM api_requests
-               WHERE session_id=? AND query_source IN ('main',
-                     'repl_main_thread') AND ts < ?
+               WHERE session_id=? AND """ + db.MAIN_QS_SQL + """ AND ts < ?
                ORDER BY ts DESC LIMIT 1""",
             (self.session_id, ts)).fetchone()
         if row:
@@ -1113,7 +1114,7 @@ def ingest_file(con, path, label="", project_override=None):
 
 def ingest_tree(con, projects_dir, label="", force=False, project_override=None):
     """Ingest every transcript under one `projects/` directory."""
-    scanned = ingested = 0
+    scanned = ingested = failed = 0
     fh_maps = {}
     pattern = os.path.join(projects_dir, "**", "*.jsonl")
     for path in sorted(glob.glob(pattern, recursive=True)):
@@ -1124,10 +1125,25 @@ def ingest_tree(con, projects_dir, label="", force=False, project_override=None)
             continue
         if not force and not file_changed(con, path, st):
             continue
-        if os.sep + "subagents" + os.sep in path:
-            ingest_subagent_file(con, path)
-        else:
-            ingest_main_file(con, path, label, project_override, fh_maps)
+        try:
+            if os.sep + "subagents" + os.sep in path:
+                ingest_subagent_file(con, path)
+            else:
+                ingest_main_file(con, path, label, project_override, fh_maps)
+        except Exception as exc:
+            # The JSONL schema has changed across CLI versions before (see
+            # CLAUDE.md) and will again - a field that used to always be a
+            # string, a key a newer CLI stopped writing. Without this guard
+            # one transcript with a shape this parser has never seen aborts
+            # the whole run: every later transcript in every source, plus
+            # Cowork and session titles, and the receiver would re-fail on
+            # exactly the same file every hour forever. One bad file should
+            # cost one file. Roll back so a half-parsed transcript's partial
+            # inserts do not ride along with the next file's commit below.
+            con.rollback()
+            sources._warn(f"failed to ingest {path}: {exc}")
+            failed += 1
+            continue
         mark_ingested(con, path, st)
         ingested += 1
         # Commit per transcript: a run interrupted halfway (or a receiver
@@ -1137,7 +1153,7 @@ def ingest_tree(con, projects_dir, label="", force=False, project_override=None)
     recover_file_history(con, os.path.dirname(os.path.abspath(projects_dir)),
                          fh_maps)
     con.commit()
-    return scanned, ingested
+    return scanned, ingested, failed
 
 
 # ---------------------------------------------------------------------------
@@ -1158,13 +1174,95 @@ def ingest_tree(con, projects_dir, label="", force=False, project_override=None)
 # ---------------------------------------------------------------------------
 
 # Subagent edit calls that produced no `edits` row - the gap this pass exists
-# to fill. Built from EDIT_TOOLS so the two never drift apart.
-_EDIT_GAP_SQL = """SELECT COUNT(*) FROM tool_calls t
-       WHERE t.session_id=? AND t.agent_name IS NOT NULL
+# to fill. Built from EDIT_TOOLS so the two never drift apart. %s is filled in
+# per call with an IN (...) of session ids, chunked by _chunks() below.
+_EDIT_GAP_SQL = """SELECT t.session_id, COUNT(*) FROM tool_calls t
+       WHERE t.session_id IN (%%s) AND t.agent_name IS NOT NULL
          AND t.tool_name IN (%s)
          AND NOT EXISTS (SELECT 1 FROM edits e
-                         WHERE e.tool_use_id = t.tool_use_id)""" % ",".join(
+                         WHERE e.tool_use_id = t.tool_use_id)
+       GROUP BY t.session_id""" % ",".join(
     "'%s'" % name for name in sorted(EDIT_TOOLS))
+
+
+def _chunks(seq, n=400):
+    """`seq` split into pieces small enough for one IN (...) clause.
+
+    Same shape as conversations.py's helper of the same name: SQLite caps the
+    number of bound parameters in a single statement, so any batched query
+    over an arbitrary number of ids has to go through this instead of one
+    IN (...) sized to whatever the caller happened to pass.
+    """
+    seq = list(seq)
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
+
+def _edit_gaps(con, sessions):
+    """session_id -> count of subagent edit calls still missing an edits row.
+
+    Batched sibling of the per-session check recover_file_history used to run
+    once per iteration of its loop (one query per session touched by an
+    ingest pass, hourly, inside the same lock live telemetry needs). A session
+    with a zero count simply has no matching group and is absent from the
+    result, so callers read a missing key the same way as a zero one.
+    """
+    out = {}
+    for chunk in _chunks(sessions):
+        marks = ",".join("?" * len(chunk))
+        for sid, count in con.execute(_EDIT_GAP_SQL % marks, chunk):
+            out[sid] = count
+    return out
+
+
+def _session_prompts(con, sessions):
+    """session_id -> [(ts, prompt_id), ...] ordered by ts, batched.
+
+    Replaces the per-session `SELECT ts, prompt_id FROM prompts WHERE
+    session_id=?`; ts sorts the same lexically as chronologically (ISO 8601),
+    so ordering by (session_id, ts) and splitting on session_id afterwards
+    gives the same per-session order the old query did.
+    """
+    out = {s: [] for s in sessions}
+    for chunk in _chunks(sessions):
+        marks = ",".join("?" * len(chunk))
+        for sid, ts, pid in con.execute(
+                """SELECT session_id, ts, prompt_id FROM prompts
+                   WHERE session_id IN (%s) AND ts IS NOT NULL
+                   ORDER BY session_id, ts""" % marks, chunk):
+            out[sid].append((ts, pid))
+    return out
+
+
+def _session_cwds(con, sessions):
+    """session_id -> cwd (or None), batched replacement for the per-session
+    `SELECT cwd FROM sessions WHERE session_id=?`."""
+    out = {}
+    for chunk in _chunks(sessions):
+        marks = ",".join("?" * len(chunk))
+        for sid, cwd in con.execute(
+                "SELECT session_id, cwd FROM sessions WHERE session_id IN (%s)"
+                % marks, chunk):
+            out[sid] = cwd
+    return out
+
+
+def _measured_paths(con, sessions):
+    """session_id -> {_path_key(file_path), ...} already counted, batched.
+
+    source<>'file-history' matches the original per-session query: a file
+    this same pass already produced a row for on an earlier run still gets a
+    fresh look, since a new backup version can add one more diff to it.
+    """
+    out = {s: set() for s in sessions}
+    for chunk in _chunks(sessions):
+        marks = ",".join("?" * len(chunk))
+        for sid, path in con.execute(
+                """SELECT session_id, file_path FROM edits
+                   WHERE session_id IN (%s) AND file_path IS NOT NULL
+                     AND source<>'file-history'""" % marks, chunk):
+            out[sid].add(_path_key(path))
+    return out
 
 
 def claude_dir_of(path):
@@ -1232,6 +1330,18 @@ def recover_file_history(con, claude_dir, fh_maps):
     considered, and only files that session has no row for at all, so nothing
     already measured from a structuredPatch is counted twice.
 
+    This used to run its DB reads (the gap check, prompts, cwd, already-
+    measured paths) once per session inside the loop below - four round trips
+    per session touched by an ingest pass, run hourly inside the same lock
+    live telemetry needs - and call db.insert_edit() once per recovered diff.
+    Both are batched now: the filesystem checks (cheap, no lock needed) pick
+    the sessions actually worth reading from the DB, those reads happen up
+    front chunked the way conversations.py chunks prompt ids, and every
+    recovered row is collected into one list for a single insert_edits() call.
+    None of that changes what gets recovered - the same skip conditions apply
+    per session and per file, just against pre-fetched dicts instead of a
+    fresh query each time.
+
     Returns the number of rows written.
     """
     if not claude_dir or not fh_maps:
@@ -1239,18 +1349,39 @@ def recover_file_history(con, claude_dir, fh_maps):
     root = os.path.join(claude_dir, "file-history")
     if not os.path.isdir(root):
         return 0
-    written = 0
+    # Filesystem-only filtering first: a session with nothing tracked, or no
+    # file-history folder of its own, needs none of the batched reads below.
+    candidates = []
     for session, tracked in fh_maps.items():
         if not tracked:
             continue
         session_dir = os.path.join(root, session)
         if not os.path.isdir(session_dir):
             continue
-        # Is anything actually missing for this session? A session whose edits
-        # all came from tool results has nothing to recover.
-        gap = con.execute(_EDIT_GAP_SQL, (session,)).fetchone()[0]
-        if not gap:
-            continue
+        candidates.append((session, tracked, session_dir))
+    if not candidates:
+        return 0
+    # Is anything actually missing for these sessions? A session whose edits
+    # all came from tool results has nothing to recover.
+    gaps = _edit_gaps(con, [s for s, _, _ in candidates])
+    active = [c for c in candidates if gaps.get(c[0])]
+    if not active:
+        return 0
+    active_ids = [s for s, _, _ in active]
+    prompts_by_session = _session_prompts(con, active_ids)
+    # The tracked keys are relative to the session's cwd, which is the only
+    # place the absolute path can come from when the transcript's
+    # realParentDir is null - as it is on every snapshot checked.
+    cwd_by_session = _session_cwds(con, active_ids)
+    # Files each session already has a measured edit for, keyed so that a
+    # mapped drive and its UNC target compare equal. Our own rows are
+    # excluded: a later checkpoint of a file recovered last run still has a
+    # new diff to contribute, and the tool_use_id conflict is what keeps that
+    # idempotent.
+    measured_by_session = _measured_paths(con, active_ids)
+
+    edit_rows = []
+    for session, tracked, session_dir in active:
         try:
             names = os.listdir(session_dir)
         except OSError:
@@ -1260,25 +1391,9 @@ def recover_file_history(con, claude_dir, fh_maps):
             head, _, ver = name.partition("@v")
             if ver.isdigit():
                 by_hash.setdefault(head, []).append((int(ver), name))
-        prompts = con.execute(
-            """SELECT ts, prompt_id FROM prompts
-               WHERE session_id=? AND ts IS NOT NULL ORDER BY ts""",
-            (session,)).fetchall()
-        # The tracked keys are relative to the session's cwd, which is the
-        # only place the absolute path can come from when the transcript's
-        # realParentDir is null - as it is on every snapshot checked.
-        row = con.execute("SELECT cwd FROM sessions WHERE session_id=?",
-                          (session,)).fetchone()
-        cwd = row[0] if row else None
-        # Files this session already has a measured edit for, keyed so that a
-        # mapped drive and its UNC target compare equal. Our own rows are
-        # excluded: a later checkpoint of a file recovered last run still has
-        # a new diff to contribute, and the tool_use_id conflict is what
-        # keeps that idempotent.
-        measured = {_path_key(p) for (p,) in con.execute(
-            "SELECT DISTINCT file_path FROM edits WHERE session_id=? "
-            "AND file_path IS NOT NULL AND source<>'file-history'",
-            (session,))}
+        prompts = prompts_by_session.get(session, [])
+        cwd = cwd_by_session.get(session)
+        measured = measured_by_session.get(session, set())
         for tracked_path, record in tracked.items():
             versions = record["times"]
             file_path = join_tracked(record["parent"] or cwd, tracked_path)
@@ -1324,12 +1439,13 @@ def recover_file_history(con, claude_dir, fh_maps):
                 # Keyed by the backup's own filename, which is unique within
                 # the session and stable across re-runs, so a second pass
                 # collides with itself instead of inserting a duplicate.
-                db.insert_edit(
-                    con, "fh:%s:%s" % (session, name), prompt_id,
-                    session, ts, file_path, "update", added, removed, chars,
-                    None, "file-history")
-                written += 1
-    return written
+                edit_rows.append((
+                    "fh:%s:%s" % (session, name), prompt_id, session, ts,
+                    file_path, "update", added, removed, chars, None,
+                    "file-history"))
+    if edit_rows:
+        db.insert_edits(con, edit_rows)
+    return len(edit_rows)
 
 
 def apply_session_titles(con, cfg):
@@ -1360,14 +1476,15 @@ def ingest_cowork(con, cfg, force=False):
     title, giving `cowork/Install SearXNG search provider` rather than
     `local_ff2ffe59-.../outputs`.
     """
-    scanned = ingested = 0
+    scanned = ingested = failed = 0
     sessions = sources.cowork_sessions(cfg.cowork_paths)
     for sess in sessions:
-        n_scanned, n_ingested = ingest_tree(
+        n_scanned, n_ingested, n_failed = ingest_tree(
             con, os.path.join(sess.claude_dir, "projects"),
             sources.COWORK_LABEL, force, project_override=sess.title)
         scanned += n_scanned
         ingested += n_ingested
+        failed += n_failed
         # The sandbox's signed audit log knows what each completed run cost.
         # Recorded with its run count; collect() spends it only where that
         # count covers every prompt in the session.
@@ -1375,7 +1492,7 @@ def ingest_cowork(con, cfg, force=False):
                 sess.claude_dir).items():
             db.set_run_cost(con, cli_sid, cost, runs, "cowork-audit")
             db.set_session_title(con, cli_sid, sess.title)
-    return scanned, ingested, len(sessions)
+    return scanned, ingested, failed, len(sessions)
 
 
 def fetch_remotes(con, cfg, respect_backoff=False):
@@ -1461,57 +1578,68 @@ def run(force=False, root=None, config=None, skip_remote_fetch=False,
             transfers off the lock that live telemetry needs.
     """
     con = _open_db(db_path)
-    cfg = config if config is not None else sources.SourceConfig.load()
+    # Everything below runs on this connection; closing it only in `finally`
+    # means a failure partway through (a bad source directory, an unexpected
+    # exception ingest_tree's own guard did not anticipate) still releases it
+    # instead of leaking a WAL read mark that blocks checkpointing forever.
+    try:
+        cfg = config if config is not None else sources.SourceConfig.load()
 
-    remotes = []
-    if root is not None:
-        targets = [sources.Root(root, "", "primary")]
-    else:
-        remotes = [] if skip_remote_fetch else fetch_remotes(con, cfg)
-        roots = sources.discover_local(cfg.extra_locations, cfg.scan_siblings,
-                                       cfg.depth)
-        # A host that failed this run still has its previous cache on disk;
-        # ingest it so one unreachable machine doesn't make its history
-        # vanish from the report.
-        hosts = (cfg.hosts() if skip_remote_fetch
-                 else [r["host"] for r in remotes])
-        for host in hosts:
-            roots += sources.remote_roots(host)
-        roots = sources.dedupe_labels(roots)
-        targets = [sources.Root(os.path.join(r.path, "projects"), r.label,
-                                r.origin) for r in roots]
+        remotes = []
+        if root is not None:
+            targets = [sources.Root(root, "", "primary")]
+        else:
+            remotes = [] if skip_remote_fetch else fetch_remotes(con, cfg)
+            roots = sources.discover_local(cfg.extra_locations,
+                                           cfg.scan_siblings, cfg.depth)
+            # A host that failed this run still has its previous cache on
+            # disk; ingest it so one unreachable machine doesn't make its
+            # history vanish from the report.
+            hosts = (cfg.hosts() if skip_remote_fetch
+                     else [r["host"] for r in remotes])
+            for host in hosts:
+                roots += sources.remote_roots(host)
+            roots = sources.dedupe_labels(roots)
+            targets = [sources.Root(os.path.join(r.path, "projects"), r.label,
+                                    r.origin) for r in roots]
 
-    scanned = ingested = 0
-    used = []
-    for target in targets:
-        n_scanned, n_ingested = ingest_tree(con, target.path, target.label,
-                                            force)
-        scanned += n_scanned
-        ingested += n_ingested
-        used.append({"label": target.label or "(primary)",
-                     "origin": target.origin, "path": target.path,
-                     "transcripts": n_scanned})
-
-    if root is None and cfg.cowork:
-        n_scanned, n_ingested, n_sessions = ingest_cowork(con, cfg, force)
-        if n_sessions:
+        scanned = ingested = failed = 0
+        used = []
+        for target in targets:
+            n_scanned, n_ingested, n_failed = ingest_tree(
+                con, target.path, target.label, force)
             scanned += n_scanned
             ingested += n_ingested
-            used.append({"label": sources.COWORK_LABEL, "origin": "cowork",
-                         "path": ", ".join(sources.cowork_stores(cfg.cowork_paths)),
-                         "sessions": n_sessions, "transcripts": n_scanned})
+            failed += n_failed
+            used.append({"label": target.label or "(primary)",
+                         "origin": target.origin, "path": target.path,
+                         "transcripts": n_scanned})
 
-    titled = apply_session_titles(con, cfg) if root is None else 0
-    con.commit()
-    counts = {t: con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-              for t in ("prompts", "api_requests", "tool_calls", "edits",
-                        "sessions", "agents", "session_events")}
-    con.close()
+        if root is None and cfg.cowork:
+            n_scanned, n_ingested, n_failed, n_sessions = ingest_cowork(
+                con, cfg, force)
+            if n_sessions:
+                scanned += n_scanned
+                ingested += n_ingested
+                failed += n_failed
+                used.append({"label": sources.COWORK_LABEL, "origin": "cowork",
+                             "path": ", ".join(sources.cowork_stores(cfg.cowork_paths)),
+                             "sessions": n_sessions, "transcripts": n_scanned})
+
+        titled = apply_session_titles(con, cfg) if root is None else 0
+        con.commit()
+        counts = {t: con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                  for t in ("prompts", "api_requests", "tool_calls", "edits",
+                            "sessions", "agents", "session_events")}
+    finally:
+        con.close()
     out = {"scanned": scanned, "ingested": ingested, "sources": used, **counts}
     if titled:
         out["titled_sessions"] = titled
     if remotes:
         out["remotes"] = remotes
+    if failed:
+        out["failed"] = failed
     return out
 
 
@@ -1580,8 +1708,10 @@ def config_from_args(args):
 def remote_status(db_path=None):
     """Human-readable table of what each host is doing, and why."""
     con = _open_db(db_path)
-    rows = db.all_remote_state(con)
-    con.close()
+    try:
+        rows = db.all_remote_state(con)
+    finally:
+        con.close()
     if not rows:
         return "No remote host has been contacted yet."
     now = time.time()

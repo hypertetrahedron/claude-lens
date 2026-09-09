@@ -1155,8 +1155,9 @@ counterfactual.
 - **Export CSV** — the current filtered/sorted view, incl. cost components.
 - **Notices** — if a build embedded only the newest N prompts, withheld
   prompt text, dropped old sessions from the context series to stay under its
-  200,000-point cap, or could not write a conversation page because the
-  transcript is gone, the page says so rather than quietly showing less.
+  200,000-point cap, took a prompt's cost from the CLI's own per-session total
+  rather than the rate table, or could not write a conversation page because
+  the transcript is gone, the page says so rather than quietly showing less.
   Anything else the build itself wants to say about the payload (via
   `DATA.notices`) is appended to the same notice bar.
 - **More filters** — a collapsible row under the filter bar with min/max

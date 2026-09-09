@@ -819,7 +819,15 @@ class AuthoritativeCost(unittest.TestCase):
         con.commit()
         return con
 
-    def test_full_coverage_reprices_and_marks_exact(self):
+    def test_full_coverage_reprices_but_the_rows_stay_estimated(self):
+        """The CLI measured the session; it did not measure either prompt.
+
+        The total is exact and replaces the sum, but each row holds that
+        total scaled by its own estimate - an allocation, not a reading -
+        so `est` stays set and the notice bar says where the figure came
+        from. Marking these exact claimed a per-prompt measurement that was
+        never taken.
+        """
         import build_dashboard
         con = self._two_prompt_session()
         base, _ = build_dashboard.collect(con)
@@ -831,7 +839,8 @@ class AuthoritativeCost(unittest.TestCase):
         rows, _ = build_dashboard.collect(con)
         con.close()
         self.assertAlmostEqual(sum(r["cost"] for r in rows), 9.0, places=6)
-        self.assertTrue(all(not r["est"] for r in rows))
+        self.assertTrue(all(r["est"] for r in rows))
+        self.assertEqual(build_dashboard.REPRICED["rows"], len(rows))
         # the composition is scaled with it, so the donut still sums to cost
         self.assertAlmostEqual(sum(sum(r["comp"]) for r in rows), 9.0, places=2)
 

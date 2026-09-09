@@ -4253,6 +4253,16 @@ function renderNotice() {
     bits.push(`Showing the newest ${fmtFull(DATA.rows.length)} of ` +
               `${fmtFull(DATA.total_rows)} prompts. Rebuild with ` +
               `--max-rows to change that.`);
+  /* Where the money came from. A session whose runs all reported a cost to
+     the CLI has that exact total shared out over its prompts in proportion
+     to their own estimates, so the session sum is measured and the per-prompt
+     split is not - which is why those rows still read "~$". Said here because
+     the build only ever printed it to a console the receiver does not have. */
+  if (DATA.repriced)
+    bits.push(`Cost for ${fmtFull(DATA.repriced)} prompt` +
+              `${DATA.repriced > 1 ? "s comes" : " comes"} from the CLI's own ` +
+              `per-session total, shared out across the session's prompts, ` +
+              `rather than from the rate table.`);
   if (DATA.redacted)
     bits.push("Prompt text was withheld from this build (--no-prompt-text).");
   /* Whatever the build itself wants to say about this payload: conversation

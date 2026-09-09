@@ -95,7 +95,14 @@ Neither is a substitute for restarting it. On this machine that is the
 - **Never present a guess as a measurement.** Unknown cost is not zero cost —
   an unpriced model is named on the page and counted as $0.00 deliberately,
   and authoritative figures are only spent where they provably cover
-  everything (see the `run_cost` coverage guard in `collect()`).
+  everything (see the `run_cost` coverage guard in `collect()`). That guard
+  has two halves: the CLI's session total is spent only when its run count
+  matches the prompts found *and* every model in the session is priced — a
+  $0.00 unpriced prompt carries no weight in the estimate the total is shared
+  out by, so it would hand its share to its neighbours and then display as a
+  measured zero. The rows it produces stay flagged estimated either way: the
+  CLI measured the session, not the prompt, and each prompt holds that total
+  scaled by its own estimate. The notice bar says so in words.
 - **Say when data is partial.** Truncated row sets, redacted prompt text and
   unpriced models all surface in the dashboard's notice bar rather than
   silently changing the numbers.
