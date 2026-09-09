@@ -113,7 +113,10 @@ class ApiRequest(ReceiverCase):
         self.assertEqual(r["cache_create_tokens"], 400)
         self.assertAlmostEqual(r["cost_usd"], 0.0123)
         self.assertEqual(r["duration_ms"], 4200)
-        self.assertEqual(r["agent_name"], "Explore")
+        # agent.name is the subagent *type*; agent_name holds the CLI's
+        # agentId, which only a transcript knows. Storing the type here
+        # replaced the id and broke the join to the agents table.
+        self.assertIsNone(r["agent_name"])
         self.assertEqual(r["source"], "otel")
         self.assertEqual(r["model_raw"], "claude-sonnet-4-5-20250929")
 

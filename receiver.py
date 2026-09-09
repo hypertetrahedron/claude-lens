@@ -335,7 +335,12 @@ def request_row(attrs, rid, prompt_id, session_id, ts):
         "cost_usd": request_cost(attrs),
         "duration_ms": attrs.get("duration_ms"),
         "query_source": attrs.get("query_source"),
-        "agent_name": attrs.get("agent.name"),
+        # Not attrs["agent.name"]: that is the subagent *type*, and this
+        # column holds the CLI's agentId, which is what joins the agents
+        # table. Writing the type here replaced the id on every live
+        # machine and left the join matching nothing. The type is not
+        # lost - query_source carries it as `agent:builtin:<type>`.
+        "agent_name": None,
         "effort": attrs.get("effort"),
         "speed": request_speed(attrs),
         "context_tokens": inp + cread + ccreate,
@@ -361,13 +366,16 @@ def error_row(attrs, rid, prompt_id, session_id, ts):
         "provider": provider,
         "input_tokens": 0, "output_tokens": 0,
         "cache_read_tokens": 0, "cache_create_tokens": 0,
-        "cache_5m_tokens": 0, "cache_1h_tokens": 0,
+        # NULL, not 0, for the same reason request_row leaves them NULL:
+        # these two fill rather than replace, and a stored 0 is a value
+        # COALESCE will keep, so a transcript could never correct it.
+        "cache_5m_tokens": None, "cache_1h_tokens": None,
         # A failed request bills nothing; leaving cost NULL would invite the
         # dashboard to estimate one from the (zero) tokens for no benefit.
         "cost_usd": 0.0,
         "duration_ms": attrs.get("duration_ms"),
         "query_source": attrs.get("query_source"),
-        "agent_name": attrs.get("agent.name"),
+        "agent_name": None,       # the type, not an agentId - see request_row
         "effort": attrs.get("effort"),
         "speed": request_speed(attrs),
         "context_tokens": 0,
@@ -448,9 +456,10 @@ def handle_record(con, rec):
         tuid = attrs.get("tool_use_id")
         if not tuid:
             return
+        # agent_name stays None here too: tool_calls sets it on insert only,
+        # so an OTel row that arrived first would pin the type for good.
         db.insert_tool_call(con, tuid, prompt_id, session_id, ts,
-                            attrs.get("tool_name", "?"),
-                            attrs.get("agent.name"), "otel")
+                            attrs.get("tool_name", "?"), None, "otel")
         success = attrs.get("success")
         is_error = None
         if success is not None:
