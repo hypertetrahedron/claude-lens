@@ -858,6 +858,57 @@ class AuthoritativeCost(unittest.TestCase):
                                msg="a partial record must not be spent")
         self.assertTrue(all(r["est"] for r in rows))
 
+    def _session_with_an_unpriced_model(self):
+        import jsonl_ingest
+        root = os.path.join(self.tmp, "c2")
+        d = os.path.join(root, "projects", "-p")
+        os.makedirs(d, exist_ok=True)
+        entries = []
+        models = ["claude-opus-5", "a-model-pricing-py-has-never-heard-of"]
+        for i, model in enumerate(models):
+            entries += [
+                {"type": "user", "origin": {"kind": "human"},
+                 "promptId": f"p{i}", "timestamp": TS, "cwd": "/p",
+                 "sessionId": "sess2",
+                 "message": {"content": [{"type": "text", "text": f"q{i}"}]}},
+                {"type": "assistant", "timestamp": TS, "requestId": f"r{i}",
+                 "sessionId": "sess2",
+                 "message": {"model": model, "content": [],
+                             "usage": {"input_tokens": 1000,
+                                       "output_tokens": 1000,
+                                       "cache_read_input_tokens": 0,
+                                       "cache_creation_input_tokens": 0}}}]
+        with open(os.path.join(d, "sess2.jsonl"), "w", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+        con = db.connect()
+        jsonl_ingest.ingest_tree(con, os.path.join(root, "projects"), "")
+        con.commit()
+        return con
+
+    def test_a_session_with_an_unpriced_model_is_never_repriced(self):
+        """An unpriced model contributes $0 to the session's estimate, so
+        scaling that estimate up to the CLI's authoritative total would hand
+        the unpriced prompt's whole share to its priced neighbours and print
+        a confident $0.00 for a model that in fact cost something. See the
+        `any(g["unpriced"] ...)` guard in collect().
+        """
+        import build_dashboard
+        con = self._session_with_an_unpriced_model()
+        base, _ = build_dashboard.collect(con)
+        pre_repricing = {r["id"]: r["cost"] for r in base}
+        self.assertTrue(any(c == 0.0 for c in pre_repricing.values()),
+                        "fixture bug: the unpriced prompt should cost $0.00")
+
+        db.set_run_cost(con, "sess2", 9.0, 2, "test")   # would fully cover it
+        con.commit()
+        rows, _ = build_dashboard.collect(con)
+        con.close()
+        self.assertEqual(build_dashboard.REPRICED["rows"], 0)
+        for r in rows:
+            self.assertAlmostEqual(r["cost"], pre_repricing[r["id"]],
+                                   places=6, msg=r["id"])
+
 
 class BuildOptions(unittest.TestCase):
     """Payload shaping: the row cap and prompt-text redaction."""
@@ -980,6 +1031,58 @@ class TemplateWiring(unittest.TestCase):
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "template.html"), encoding="utf-8") as f:
             cls.html = f.read()
+
+    def test_the_timeline_svg_is_not_announced_as_one_flat_image(self):
+        """role="img" flattens the subtree, hiding its own focusable children.
+
+        The timeline holds tabindex="0" turn columns, subagent bars and event
+        markers, each with its own <title>. Announced as a single image, a
+        screen reader's browse mode need never surface them, so keyboard users
+        who can see the page get detail that keyboard users who cannot, do not.
+        """
+        # The attribute is built from a JS object literal, so that is the form
+        # to look for; `role="img"` also appears in the comment above it
+        # explaining why it is not used, and matching prose would be a test of
+        # the wrong thing.
+        self.assertNotIn('role: "img"', self.html)
+        self.assertIn('role: "group"', self.html)
+        self.assertIn('"aria-label": "Session timeline', self.html)
+
+    def test_the_timeline_clears_its_readout_when_focus_leaves(self):
+        """mouseleave had a counterpart; focusout did not.
+
+        Tabbing out of the SVG left the turn highlight and the readout strip
+        showing the last-focused turn as though it were still focused.
+        """
+        self.assertIn('"focusout"', self.html)
+        self.assertIn("svg.contains(e.relatedTarget)", self.html)
+
+    def test_timeline_controls_use_focus_visible_like_everything_else(self):
+        """A mouse click must not leave a ring nothing else in the page leaves."""
+        for sel in (".turn-hit", ".agent-run", ".heat-cell"):
+            self.assertIn(sel + ":focus-visible", self.html)
+            self.assertNotIn(sel + ":focus {", self.html)
+
+    def test_both_popovers_close_on_escape_and_give_focus_back(self):
+        """Only the tile popup wired Escape; these two could not be dismissed
+        from the keyboard except by re-activating their own toggle."""
+        self.assertIn('aria-controls="col-panel"', self.html)
+        self.assertIn("closeColPanel", self.html)
+        self.assertIn("closeMoreFilters", self.html)
+        # Escape is handled for both, and focus goes back to the trigger.
+        self.assertGreaterEqual(self.html.count('e.key === "Escape"'), 3)
+
+    def test_an_open_session_timeline_is_redrawn_on_resize(self):
+        """drawTimeline measures the width once, when the row is expanded, so
+        a resize afterwards left the chart sized to a width that is gone."""
+        self.assertIn("__drawTimeline", self.html)
+        self.assertIn("resizeOpenTimelines", self.html)
+
+    def test_the_notice_bar_says_when_a_cost_came_from_the_cli(self):
+        """A repriced row is the CLI's session total shared out, not a rate
+        lookup. The page has to say so, for the same reason it names an
+        unpriced model rather than quietly showing $0.00."""
+        self.assertIn("DATA.repriced", self.html)
 
     def test_range_buttons_include_month_to_date(self):
         for token in ('data-range="1"', 'data-range="7"', 'data-range="mtd"',

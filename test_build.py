@@ -300,6 +300,46 @@ class MainQuerySource(unittest.TestCase):
         self.assertNotIn("repl_main_thread", self.SIDE)
 
 
+class PeakContextIsTheMainThreads(unittest.TestCase):
+    """A subagent's own context window must never read as the main thread's.
+
+    collect()'s per-prompt peak_ctx uses a `MAX(CASE WHEN <main query source>
+    ...)` in SQL for exactly this reason (cache_scan() does the same for the
+    session series) - but the fixture every other test in this file shares
+    never gives the subagent a context bigger than the main thread's, so the
+    CASE could be deleted and nothing here would notice.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="claude-lens-peakctx-")
+        self.con = db.connect(os.path.join(self.tmp, "metrics.db"))
+        db.upsert_session(self.con, "s1", project="p", cwd="/w/p",
+                          first_ts=ts(0), last_ts=ts(0))
+        db.upsert_prompt(self.con, "q1", "s1", "p", ts(0), "hello", "jsonl",
+                         0, None, "human")
+        rows = [
+            request("m1", "q1", "s1", ts(0), OPUS, output_tokens=10,
+                    input_tokens=500, query_source="main"),
+            # A subagent's own window, far larger than the main thread's.
+            request("s1r", "q1", "s1", ts(0), HAIKU, output_tokens=10,
+                    input_tokens=90000, query_source="subagent",
+                    agent_name="ag1"),
+        ]
+        db.insert_requests_jsonl(self.con, rows)
+        self.con.commit()
+
+    def tearDown(self):
+        self.con.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_subagent_context_never_wins_over_the_main_threads(self):
+        rows, _ = bd.collect(self.con)
+        by_id = {r["id"]: r for r in rows}
+        self.assertEqual(by_id["q1"]["peak_ctx"], 500,
+                         "the subagent's 90000-token window leaked onto a "
+                         "figure that should only ever be the main thread's")
+
+
 class Rows(Fixture):
     def test_streamed_duplicate_keeps_the_complete_row(self):
         out = self.con.execute(
@@ -613,6 +653,20 @@ class Sessions(Fixture):
         # summed the column would report the run as free.
         self.assertGreater(sp["cost"], 0)
         self.assertEqual(sp["est"], 1)
+
+    def test_agent_spans_since_excludes_a_launch_before_the_cutoff(self):
+        """digest.py calls agent_spans(since=...) directly (not through
+        collect()); the agents-table read inside it applies its own `since`
+        clause, separate from the one on api_requests. Miss either half and
+        an agent launched - and used - entirely before the cutoff still shows
+        up as a request-less, zero-length span dragged into the window.
+
+        ag1 launches at ts(1) and its only request is at ts(4); a cutoff
+        after both must drop it from sess-a's spans entirely.
+        """
+        cutoff = ts(5)
+        spans = bd.agent_spans(self.con, since=cutoff)
+        self.assertNotIn("sess-a", spans)
 
     def test_ctx_cap_drops_whole_sessions(self):
         _, rows, _ = self.collect()

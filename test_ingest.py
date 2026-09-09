@@ -197,6 +197,119 @@ class StreamedDuplicates(TranscriptCase):
         self.assertEqual(row[7], 12 + 4000 + 300)
 
 
+class OtelThenTranscriptFillsHoles(TranscriptCase):
+    """The live ordering: OTel writes first, the transcript arrives later.
+
+    test_otel_rows_are_never_touched (above) only checks half of the bargain
+    in db.py's storage rules - that an OTel row's own columns survive a later
+    transcript ingest. This checks the other half, which is the one CLAUDE.md
+    says already cost real data: every column in db.OTEL_FILLS_ONLY that the
+    OTel row left NULL must come out filled with the transcript's own value,
+    because in live mode the receiver writes a request seconds after it
+    happens and the transcript is read later - that is the only order
+    effort/speed/thinking_tokens/agent_name (etc.) are ever recoverable in.
+    """
+
+    AGENT = "cc33"
+
+    def subagent_entries(self, request_id):
+        return [
+            entry(type="user", promptId="p1", agentId=self.AGENT,
+                 isSidechain=True, timestamp="2026-09-01T10:05:00.000Z",
+                 message={"role": "user", "content": "go"}),
+            assistant(request_id, "2026-09-01T10:05:01.000Z", agent=self.AGENT,
+                      output=200, speed="fast", effort="low", thinking=42,
+                      stop="tool_use"),
+        ]
+
+    def test_every_otel_hole_is_filled_with_the_transcripts_own_value(self):
+        # req_A: OTel got here first, so every OTEL_FILLS_ONLY column starts
+        # as a hole. output_tokens is deliberately lower than the transcript's
+        # (150 < 200): the fill guard requires the transcript carry at least
+        # as many, so this also proves the fill is not simply unconditional.
+        db.upsert_request(self.con, {
+            "request_id": "req_A", "session_id": SESSION,
+            "query_source": "agent:builtin:general-purpose",
+            "output_tokens": 150, "cost_usd": 0.75}, "otel")
+        self.con.commit()
+        cols = sorted(db.OTEL_FILLS_ONLY)
+        before = self.rows(
+            "SELECT %s FROM api_requests" % ",".join(cols))[0]
+        self.assertTrue(all(v is None for v in before),
+                        "fixture bug: a fill-only column was not a hole")
+
+        # req_B never touched by OTel: ingesting the identical subagent
+        # content shows what the transcript alone writes there, which is the
+        # reference req_A's fill must match - so nothing here is hand-encoded.
+        self.write_subagent(self.AGENT,
+                            self.subagent_entries("req_A")
+                            + self.subagent_entries("req_B"))
+        self.ingest()
+
+        sql = "SELECT %s FROM api_requests WHERE request_id=?" % ",".join(cols)
+        filled = self.rows(sql, "req_A")[0]
+        reference = self.rows(sql, "req_B")[0]
+        for col, got, want in zip(cols, filled, reference):
+            self.assertIsNotNone(got, "%s stayed a hole after the transcript "
+                                      "arrived" % col)
+            self.assertEqual(got, want, "%s did not take the transcript's "
+                                        "own value" % col)
+
+        # The other half of the bargain: OTel-owned columns must not move.
+        owned = self.rows(
+            "SELECT output_tokens, cost_usd, source FROM api_requests "
+            "WHERE request_id='req_A'")[0]
+        self.assertEqual(owned, (150, 0.75, "otel"))
+
+
+class RequestFillGuard(unittest.TestCase):
+    """REQUEST_SQL_JSONL_FILL's guard: fewer output tokens must not cement a
+    hole's value where no re-parse could ever move it again (COALESCE keeps
+    the first non-NULL value it is given forever).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="lens-fill-guard-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.con = db.connect(os.path.join(self.tmp, "metrics.db"))
+        self.addCleanup(self.con.close)
+        db.upsert_request(self.con, {
+            "request_id": "req_X", "session_id": SESSION,
+            "output_tokens": 500, "cost_usd": 1.2}, "otel")
+        self.con.commit()
+
+    def holes(self):
+        cols = sorted(db.OTEL_FILLS_ONLY)
+        row = self.con.execute(
+            "SELECT %s FROM api_requests WHERE request_id='req_X'"
+            % ",".join(cols)).fetchone()
+        return dict(zip(cols, row))
+
+    def fill(self, output_tokens):
+        db.upsert_request(self.con, {
+            "request_id": "req_X", "output_tokens": output_tokens,
+            "thinking_tokens": 7, "stop_reason": "end_turn",
+            "effort": "high", "speed": "standard"}, "jsonl")
+
+    def test_fewer_output_tokens_leaves_the_holes_null(self):
+        """A half-streamed content block must not cement a wrong value."""
+        self.fill(4)
+        got = self.holes()
+        self.assertTrue(all(v is None for v in got.values()), got)
+
+    def test_equal_output_tokens_fills_the_holes(self):
+        self.fill(500)
+        got = self.holes()
+        self.assertEqual(got["thinking_tokens"], 7)
+        self.assertEqual(got["stop_reason"], "end_turn")
+
+    def test_more_output_tokens_fills_the_holes(self):
+        self.fill(880)
+        got = self.holes()
+        self.assertEqual(got["thinking_tokens"], 7)
+        self.assertEqual(got["stop_reason"], "end_turn")
+
+
 class PromptText(TranscriptCase):
     """The IDE prepends its own text block in front of what a person typed."""
 
@@ -762,6 +875,129 @@ class FileHistoryRealShape(TranscriptCase):
                             ji._path_key("/repo/y.py"))
 
 
+SESSION2 = "66666666-7777-8888-9999-aaaaaaaaaaaa"
+
+
+class FileHistoryBatching(TranscriptCase):
+    """recover_file_history moved from one query per session to batched
+    IN (...) reads (_edit_gaps, _session_prompts, _session_cwds,
+    _measured_paths) across every session touched by one ingest pass. These
+    pin that the batching still keys everything per session: a session with
+    nothing to recover must not swallow, or lend its directory to, another
+    session's real one.
+    """
+
+    def _write_main(self, session, target, agent_id, tracked=True):
+        entries = [
+            human("p1", "refactor it", "2026-09-01T10:00:00.000Z"),
+            assistant("req_" + agent_id, "2026-09-01T10:00:01.000Z", blocks=[
+                tool_use("toolu_agent_" + agent_id, "Agent",
+                         {"subagent_type": "general-purpose",
+                          "description": "edit"})]),
+            tool_result("toolu_agent_" + agent_id, "2026-09-01T10:00:02.000Z",
+                        "done", tool_use_result={"agentId": agent_id,
+                                                 "status": "done",
+                                                 "resolvedModel": "claude-opus-5"}),
+        ]
+        if tracked:
+            digest = ji.backup_hash(target)
+            name = os.path.basename(target)
+            parent = os.path.dirname(target)
+            entries += [
+                {"type": "file-history-delta", "trackingPath": name,
+                 "backup": {"backupFileName": None, "version": 1,
+                            "backupTime": "2026-09-01T10:00:03.000Z",
+                            "realParentDir": parent}},
+                {"type": "file-history-snapshot", "messageId": "m1",
+                 "snapshot": {"messageId": "m1",
+                              "timestamp": "2026-09-01T10:10:00.000Z",
+                              "trackedFileBackups": {
+                                  name: {"backupFileName": "%s@v2" % digest,
+                                        "version": 2,
+                                        "backupTime": "2026-09-01T10:10:00.000Z",
+                                        "realParentDir": parent}}}},
+            ]
+        self.write(entries, session=session)
+
+    def _write_subagent_edit(self, session, agent_id, target, tool_use_id):
+        self.write_subagent(agent_id, [
+            entry(type="user", promptId="p1", agentId=agent_id,
+                 isSidechain=True, timestamp="2026-09-01T10:05:00.000Z",
+                 message={"role": "user", "content": "go"}),
+            assistant("req_S_" + agent_id, "2026-09-01T10:05:01.000Z",
+                      agent=agent_id, blocks=[
+                          tool_use(tool_use_id, "Edit",
+                                  {"file_path": target, "old_string": "a",
+                                   "new_string": "b"})]),
+            entry(type="user", promptId="p1", agentId=agent_id,
+                 isSidechain=True, timestamp="2026-09-01T10:05:02.000Z",
+                 message={"role": "user",
+                          "content": [{"type": "tool_result",
+                                      "tool_use_id": tool_use_id,
+                                      "content": "ok"}]}),
+        ], session=session)
+
+    def _write_backups(self, session, target, versions):
+        folder = os.path.join(self.claude_dir, "file-history", session)
+        os.makedirs(folder, exist_ok=True)
+        digest = ji.backup_hash(target)
+        for number, body in versions.items():
+            with open(os.path.join(folder, "%s@v%d" % (digest, number)),
+                      "w", encoding="utf-8") as f:
+                f.write(body)
+
+    def test_two_sessions_one_pass_only_the_one_with_a_real_gap_recovers(self):
+        """Session 2's edit is already measured from an ordinary tool result;
+        the batched gap count must not let that erase session 1's real gap,
+        or borrow session 1's recovery for session 2.
+        """
+        target_a = "/home/someone/repo/a.py"
+        target_b = "/home/someone/repo/b.py"
+        self._write_main(SESSION, target_a, "aaAA")
+        self._write_subagent_edit(SESSION, "aaAA", target_a, "toolu_edit_a")
+        self._write_backups(SESSION, target_a,
+                            {1: "one\ntwo\n", 2: "one\nTWO\nthree\n"})
+
+        self._write_main(SESSION2, target_b, "bbBB")
+        self._write_subagent_edit(SESSION2, "bbBB", target_b, "toolu_edit_b")
+        self._write_backups(SESSION2, target_b, {1: "x\ny\n", 2: "x\nY\nz\n"})
+        # No gap for session 2: its edit already landed the ordinary way.
+        db.insert_edit(self.con, "toolu_edit_b", "p1", SESSION2,
+                       "2026-09-01T10:05:02.000Z", target_b, "update",
+                       1, 0, 1, "bbBB", "jsonl")
+
+        self.ingest()
+
+        rows = self.rows("SELECT session_id, file_path FROM edits "
+                         "WHERE source='file-history'")
+        self.assertEqual(rows, [(SESSION, target_a)],
+                         "session 2's already-measured edit must not "
+                         "reappear, and session 1's must not be lost")
+
+    def test_only_the_session_with_a_directory_on_disk_recovers(self):
+        """Both sessions have a real gap and tracked file-history entries;
+        only session 1 has a file-history directory on disk (session 2's
+        was, say, never written). Session 2 must be skipped cleanly rather
+        than crashing the batch or borrowing session 1's files.
+        """
+        target_a = "/home/someone/repo/a.py"
+        target_b = "/home/someone/repo/b.py"
+        self._write_main(SESSION, target_a, "aaAA")
+        self._write_subagent_edit(SESSION, "aaAA", target_a, "toolu_edit_a")
+        self._write_backups(SESSION, target_a,
+                            {1: "one\ntwo\n", 2: "one\nTWO\nthree\n"})
+
+        self._write_main(SESSION2, target_b, "bbBB")
+        self._write_subagent_edit(SESSION2, "bbBB", target_b, "toolu_edit_b")
+        # Deliberately no _write_backups() call for session 2.
+
+        self.ingest()
+
+        rows = self.rows("SELECT session_id, file_path FROM edits "
+                         "WHERE source='file-history'")
+        self.assertEqual(rows, [(SESSION, target_a)])
+
+
 class SingleFileEntryPoint(TranscriptCase):
     """What the SessionEnd hook calls."""
 
@@ -921,6 +1157,156 @@ class MigrationToV8(unittest.TestCase):
         con.close()
         with self.assertRaises(RuntimeError):
             db.connect(self.path)
+
+
+# The v1-era CREATE TABLE text: no user_version stamp at all (0, which
+# connect() treats as version 1), no tool_calls.detail, no
+# sessions.source_label/title, no remote_state (added whole in
+# _migrate_to_3), no run_cost (added whole in _migrate_to_6), no
+# api_requests.model_raw/provider, and none of the v8 columns or tables.
+# Every migration from _migrate_to_2 through _migrate_to_9 has to run against
+# this, in order, for a real upgrade to work - the only thing test_ingest.py
+# exercised before this was the single hop from v7 to v8.
+V1_SCHEMA = """
+CREATE TABLE prompts (
+    prompt_id TEXT PRIMARY KEY, session_id TEXT, project TEXT, ts TEXT,
+    text TEXT DEFAULT '', source TEXT, injected INTEGER DEFAULT 0,
+    canonical_id TEXT);
+CREATE TABLE api_requests (
+    request_id TEXT PRIMARY KEY, prompt_id TEXT, session_id TEXT, ts TEXT,
+    model TEXT, input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0, cache_create_tokens INTEGER DEFAULT 0,
+    cache_5m_tokens INTEGER DEFAULT 0, cache_1h_tokens INTEGER DEFAULT 0,
+    cost_usd REAL, duration_ms INTEGER, query_source TEXT, agent_name TEXT,
+    source TEXT);
+CREATE TABLE tool_calls (
+    tool_use_id TEXT PRIMARY KEY, prompt_id TEXT, session_id TEXT, ts TEXT,
+    tool_name TEXT, agent_name TEXT, source TEXT);
+CREATE TABLE edits (
+    tool_use_id TEXT PRIMARY KEY, prompt_id TEXT, session_id TEXT, ts TEXT,
+    file_path TEXT, kind TEXT, lines_added INTEGER DEFAULT 0,
+    lines_removed INTEGER DEFAULT 0, chars_added INTEGER DEFAULT 0,
+    agent_name TEXT, source TEXT);
+CREATE TABLE sessions (
+    session_id TEXT PRIMARY KEY, project TEXT, cwd TEXT);
+CREATE TABLE ingest_state (path TEXT PRIMARY KEY, size INTEGER, mtime REAL);
+"""
+
+BEDROCK_RAW_MODEL = "anthropic.claude-sonnet-4-5-20250929-v1:0"
+
+
+class MigrationFromV1(unittest.TestCase):
+    """The full chain, v1 -> db.SCHEMA_VERSION, against a genuinely old
+    database rather than the v7 fixture the other migration test starts from.
+
+    _migrate_to_2 .. _migrate_to_7 have no coverage anywhere else: the v7
+    fixture used for MigrationToV8 already carries every column those add, so
+    only _migrate_to_8 and _migrate_to_9 were ever actually exercised. A real
+    user upgrading a years-old metrics.db runs the whole chain in order, which
+    is what this pins - deliberately never against db.SCHEMA_VERSION-hardcoded
+    expectations, so it keeps testing the right thing as the schema grows.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="lens-migrate-v1-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.path = os.path.join(self.tmp, "v1.db")
+        raw = sqlite3.connect(self.path)
+        raw.executescript(V1_SCHEMA)
+        # A raw Bedrock-style id, to exercise _migrate_to_7's in-place model
+        # normalisation (the only migration that rewrites existing rows
+        # rather than just adding a column - api_requests inserts are
+        # insert-or-ignore, so a re-parse would never touch this row).
+        raw.execute(
+            """INSERT INTO api_requests
+               (request_id, session_id, model, input_tokens, output_tokens,
+                cache_read_tokens, cache_create_tokens, agent_name, source)
+               VALUES ('req_old','s1',?,10,20,300,40,'agent-abc123','jsonl')""",
+            (BEDROCK_RAW_MODEL,))
+        raw.execute("INSERT INTO tool_calls (tool_use_id, agent_name, source) "
+                    "VALUES ('toolu_old','agent-abc123','jsonl')")
+        raw.execute("INSERT INTO edits (tool_use_id, agent_name, source) "
+                    "VALUES ('toolu_e','agent-abc123','jsonl')")
+        raw.execute("INSERT INTO sessions (session_id, project, cwd) "
+                    "VALUES ('s1','proj','/work/proj')")
+        raw.execute("INSERT INTO prompts (prompt_id, text) VALUES ('p1','hi')")
+        raw.execute("INSERT INTO ingest_state VALUES ('/some/file.jsonl', 1, 2.0)")
+        # No PRAGMA user_version at all: it defaults to 0, which is exactly
+        # what a database written before version tracking existed looks like.
+        raw.commit()
+        raw.close()
+
+    def migrate(self):
+        con = db.connect(self.path)
+        self.addCleanup(con.close)
+        return con
+
+    def test_arrives_at_the_current_schema_version(self):
+        self.assertEqual(self.migrate().execute(
+            "PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
+
+    def test_every_version_table_and_column_exists(self):
+        con = self.migrate()
+        names = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table','index')")}
+        # remote_state and run_cost are created whole partway through the
+        # chain (_migrate_to_3 and _migrate_to_6); a v1 database has neither.
+        for name in ("remote_state", "run_cost", "agents", "session_events",
+                    "idx_events_uniq", "idx_req_session", "idx_tool_session"):
+            self.assertIn(name, names, name)
+        have_remote = {r[1] for r in con.execute(
+            "PRAGMA table_info(remote_state)")}
+        self.assertIn("fail_count", have_remote)
+        self.assertIn("next_attempt", have_remote)
+        have_sessions = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
+        for name in ("source_label", "title", "git_branch", "cli_version",
+                    "entrypoint", "permission_mode", "transcript_path",
+                    "first_ts", "last_ts"):
+            self.assertIn(name, have_sessions, name)
+        have_tools = {r[1] for r in con.execute("PRAGMA table_info(tool_calls)")}
+        self.assertIn("detail", have_tools)
+        for table, columns in db._V8_COLUMNS.items():
+            have = {r[1] for r in con.execute("PRAGMA table_info(%s)" % table)}
+            for name, _ in columns:
+                self.assertIn(name, have, "%s.%s" % (table, name))
+        have_requests = {r[1] for r in con.execute(
+            "PRAGMA table_info(api_requests)")}
+        self.assertIn("model_raw", have_requests)
+        self.assertIn("provider", have_requests)
+
+    def test_the_bedrock_model_is_normalised_in_place(self):
+        """_migrate_to_7's rewrite: canonical model, original kept alongside."""
+        con = self.migrate()
+        model, model_raw, provider = con.execute(
+            "SELECT model, model_raw, provider FROM api_requests "
+            "WHERE request_id='req_old'").fetchone()
+        self.assertEqual(model, "claude-sonnet-4-5-20250929")
+        self.assertEqual(model_raw, BEDROCK_RAW_MODEL)
+        self.assertEqual(provider, "bedrock")
+
+    def test_context_tokens_backfilled_for_old_history(self):
+        self.assertEqual(self.migrate().execute(
+            "SELECT context_tokens FROM api_requests WHERE request_id='req_old'"
+        ).fetchone()[0], 10 + 300 + 40)
+
+    def test_agent_name_prefix_is_stripped_on_the_way_through(self):
+        con = self.migrate()
+        for table in ("api_requests", "tool_calls", "edits"):
+            self.assertEqual(
+                con.execute("SELECT agent_name FROM %s" % table).fetchone()[0],
+                "abc123")
+
+    def test_existing_rows_survive_the_whole_chain(self):
+        con = self.migrate()
+        self.assertEqual(con.execute(
+            "SELECT output_tokens FROM api_requests WHERE request_id='req_old'"
+        ).fetchone()[0], 20)
+        self.assertEqual(con.execute(
+            "SELECT text FROM prompts WHERE prompt_id='p1'").fetchone()[0],
+            "hi")
+        self.assertEqual(con.execute(
+            "SELECT project, cwd FROM sessions WHERE session_id='s1'"
+        ).fetchone(), ("proj", "/work/proj"))
 
 
 class BackwardCompatibleWrites(unittest.TestCase):
