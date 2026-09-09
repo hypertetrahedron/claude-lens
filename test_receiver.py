@@ -11,6 +11,7 @@ at the end rather than passing in silence.
 import gzip
 import http.client
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -38,7 +39,8 @@ def tearDownModule():
         print("\nColumns not in this schema, assertions skipped: "
               + ", ".join(sorted(SKIPPED)))
     else:
-        print("\nAll schema v8 columns present; nothing skipped.")
+        print("\nAll schema v%d columns present; nothing skipped."
+              % db.SCHEMA_VERSION)
 
 
 def record(body, attrs):
@@ -560,6 +562,15 @@ class HttpSurface(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
         receiver.reset_column_cache()
         self.addCleanup(receiver.reset_column_cache)
+        # These tests deliberately send the requests the receiver is meant to
+        # refuse, and every refusal is logged. receiver.log is the *live*
+        # service's log, so without this a test run leaves warnings there that
+        # read exactly like a real page attacking localhost:4318 - the one
+        # place someone would look to find out whether that had happened.
+        receiver.log.propagate = False
+        self._old_level = receiver.log.level
+        receiver.log.setLevel(logging.CRITICAL)
+        self.addCleanup(receiver.log.setLevel, self._old_level)
         # do_POST reads these two module globals directly (see receiver.py's
         # Handler), so the real HTTP path can only be tested by pointing them
         # at a temp database the way main() would, then restoring them.
