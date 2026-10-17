@@ -355,6 +355,7 @@ actually did:
 | `peak_ctx` | The largest context any one request of the turn carried. |
 | `misses` / `cache_miss_cost` | Cache misses and what re-writing the cache cost. See below. |
 | `tool_attrib` | The turn's input-side cost shared out across its tools. |
+| `skills` | Skills invoked on the turn, by name, with a count each. |
 | `session` / `conv` | The session it belongs to, and its conversation page. |
 
 `tool_attrib` is **an attribution, not a measurement**. A tool result enters
@@ -1033,7 +1034,7 @@ before their transcript was read.
 
 ## Chart metrics
 
-The chart card offers seventeen views (dropdown, persisted): output tokens/day,
+The chart card offers eighteen views (dropdown, persisted): output tokens/day,
 tokens & lines per **active minute** (day total ÷ summed wall-clock span of
 each prompt; days under a minute of activity are skipped), cost/day, **cost
 composition** (stacked $: cache read / cache write / output / uncached input —
@@ -1042,15 +1043,17 @@ dwarfs output), cache hit rate, **context: peak/day** (the largest single
 request's measured context per day), **cache misses: cost/day** (what the
 day's cold-cache re-writes cost), **tool errors/day**, **5h blocks** (bar per
 billing block, the open one outlined), **heatmap** (a daily-cost calendar),
-**tool cost (top 12)** (attributed cost per tool name, dearest first), cost
-per 1K lines written (≥50 lines/day), model mix (stacked by family), subagent
-share, and — when Claude Desktop is installed — the daily peak of the
-account's 5-hour and 7-day **plan limits**. The plan views are account-wide,
-so only the date range applies to them; the 5h-blocks, heatmap and tool-cost
-views draw their own x axis (a block index, a calendar, a tool name) instead
-of the shared day-bucket bar chart the others share, so they own their own
-scale and legend. Tool cost comes from the same `tool_attrib` attribution the
-per-prompt detail panel's Tools table shows, summed across the filtered rows.
+**tool cost (top 12)** (attributed cost per tool name, dearest first),
+**skill invocations (top 12)** (how many times each skill ran, most-used
+first), cost per 1K lines written (≥50 lines/day), model mix (stacked by
+family), subagent share, and — when Claude Desktop is installed — the daily
+peak of the account's 5-hour and 7-day **plan limits**. The plan views are
+account-wide, so only the date range applies to them; the 5h-blocks, heatmap,
+tool-cost and skill views draw their own x axis (a block index, a calendar, a
+tool name, a skill name) instead of the shared day-bucket bar chart the others
+share, so they own their own scale and legend. Tool cost comes from the same
+`tool_attrib` attribution the per-prompt detail panel's Tools table shows,
+summed across the filtered rows.
 
 **Stacked charts are coloured by cost, on an ironbow ramp** — darkest is
 cheapest, brightest is dearest. Model families run haiku → sonnet → opus →
@@ -1111,7 +1114,8 @@ counterfactual.
   dashboard does and is easy to forget exists.
 - **Per-prompt detail** (click a row) — cost-composition donut + table,
   per-model breakdown, files changed with lines +/−, a **Tools** table
-  (`tool_attrib`: calls, result size, attributed cost, dearest first),
+  (`tool_attrib`: calls, result size, attributed cost, dearest first), a
+  **Skills** table naming the skills the turn invoked and how many times,
   **Subagents** by name and model ("Explore on claude-sonnet-5" rather than
   the opaque agent id), an **Effort & signals** line (effort, thinking share
   of output, fast calls, errors, max-token stops, web searches, peak
@@ -1162,7 +1166,8 @@ counterfactual.
   colour-blind readers in both themes; they mark a boundary rather than name a
   project, so with more than eight projects on screen two distant blocks share
   one. Neighbours never do.
-- **Export CSV** — the current filtered/sorted view, incl. cost components.
+- **Export CSV** — the current filtered/sorted view, incl. cost components
+  and the `skills` column (names joined with `; `).
 - **Notices** — if a build embedded only the newest N prompts, withheld
   prompt text, dropped old sessions from the context series to stay under its
   200,000-point cap, took a prompt's cost from the CLI's own per-session total
@@ -1270,6 +1275,40 @@ on a 450 MB tree, which is the price of the column being usable.
 `isError` on `toolUseResult`. OTel fills `duration_ms` and `error_type` for
 the same call; neither source overwrites the other, each only fills what is
 still NULL.
+
+## Which skills ran
+
+A skill invocation reaches the CLI as a call to the built-in `Skill` tool, so
+it lands in `tool_calls` like any other, with the skill's own name in
+`detail`. The dashboard names those skills in four places:
+
+- a **Skills** column in the prompt table, carrying the names as pills rather
+  than a count, and `–` for a prompt that ran none;
+- a **Skills** table in the per-prompt detail panel, above Tools;
+- a **Skill invocations (top 12)** chart view, most-used first;
+- the `skills` column of the CSV export, names joined with `; `.
+
+The column shows names because the question is usually the negative one. A
+count tells you something ran; only a name lets you check a prompt against the
+skill it was supposed to use, and a workflow that quietly stopped triggering a
+skill is visible as a column of dashes next to the prompts that should have
+invoked it. Sorting on the column groups prompts by skill and collects the
+ones that ran none into a single block. Grouping the table by project gives
+each group row a count of the distinct skills that project used, with the
+names on hover — the whole list runs past the column's width, and a group row
+is a row of subtotals.
+
+A skill also stays in the Tools table as `Skill:<name>`, which is where its
+share of the turn's input-side cost is reported; the Skills table answers
+*which ran*, the Tools table answers *what it cost*.
+
+**An unnamed invocation is shown, not hidden.** An OTel `tool_result` knows
+the tool was `Skill` but not which skill; the transcript carries the name and
+fills it on the next ingest. In the gap the prompt shows a `?` pill reading
+"name not recorded yet". A skill ran and we cannot yet say which is a
+different statement from no skill having run, and a blank cell would tell the
+second story. The chart leaves `?` out rather than ranking an ingest lag
+alongside real skills.
 
 ## Database versioning
 
