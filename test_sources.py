@@ -1540,6 +1540,49 @@ class TemplateWiring(unittest.TestCase):
             self.html)
         self.assertIn("function drawTools(wrap, rs)", self.html)
 
+    def test_skills_chart_is_registered(self):
+        """Invocations per skill, on its own axis like the tools chart."""
+        self.assertIn('value="skills"', self.html)
+        self.assertIn(
+            'skills:{ title: "Skill invocations (top 12)", draw: drawSkills }',
+            self.html)
+        self.assertIn("function drawSkills(wrap, rs)", self.html)
+        self.assertIn("function drawNamedBars(wrap, totals, fmt, empty, whole)",
+                      self.html)
+
+    def test_skills_reach_the_row_and_the_detail_panel(self):
+        """Names, not a count: the reason to look is to check a skill
+        against the prompts that should have used it."""
+        self.assertIn("skills: (C.skills ? C.skills[i] : []).map(", self.html)
+        self.assertIn("r.skills && r.skills.length", self.html)
+        self.assertIn('["Skill", "Invocations"]', self.html)
+        self.assertIn('k: "skills", label: "Skills", def: true', self.html)
+        self.assertIn('r.skills.map(s => s[0]).join(" ")', self.html)
+
+    def test_an_unnamed_skill_call_is_shown_as_such(self):
+        """A skill ran and the transcript naming it has not been read yet.
+        Saying so beats a blank cell, which reads as 'no skill ran'."""
+        self.assertIn("name not recorded yet", self.html)
+        self.assertIn('if (name !== "?") totals.set(name,', self.html)
+
+    def test_a_group_subtotal_may_carry_a_hover_form(self):
+        """The skills group cell is a count with the names on the title: the
+        joined list measured 262px in a 150px column."""
+        self.assertIn("typeof gv === \"string\" ? gv : gv.text", self.html)
+        self.assertIn("if (gv && gv.title) gtd.title = gv.title;", self.html)
+        self.assertIn("return { text: String(sorted.length), "
+                      "title: sorted.join(\", \") };", self.html)
+
+    def test_chart_labels_are_sized_from_the_band(self):
+        """Skill names are long where tool names are short; a fixed ten-char
+        cap turned claude-in-chrome into claude-in...."""
+        self.assertIn("const cap = Math.max(6, Math.floor(band / 7));",
+                      self.html)
+
+    def test_skills_are_in_the_csv_export(self):
+        self.assertIn('"tool_calls", "skills", "subagents"', self.html)
+        self.assertIn('r.skills.map(s => s[0]).join("; ")', self.html)
+
     def test_errors_chart_is_registered(self):
         self.assertIn('value="errors"', self.html)
         self.assertIn('errors:{ title: "Tool errors per day",', self.html)
@@ -2065,6 +2108,22 @@ class FailureBackoff(unittest.TestCase):
         self.assertIn("ConnectTimeout=8", joined)
         self.assertIn("ServerAliveInterval=15", joined)
         self.assertIn("ServerAliveCountMax=3", joined)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows-only flag")
+    def test_ssh_runs_without_a_console_window(self):
+        seen = {}
+
+        def capture(cmd, **kwargs):
+            seen.update(kwargs)
+            raise subprocess.TimeoutExpired(cmd, 1)
+
+        original = sources.subprocess.run
+        sources.subprocess.run = capture
+        try:
+            sources.fetch_remote("box", connect_timeout=8)
+        finally:
+            sources.subprocess.run = original
+        self.assertEqual(seen.get("creationflags"), subprocess.CREATE_NO_WINDOW)
 
 
 class ReportIndex(unittest.TestCase):

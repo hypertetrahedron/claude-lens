@@ -185,6 +185,20 @@ class Fixture(unittest.TestCase):
                             "ag1", "jsonl", None, 20, 6000, 0)
         db.insert_tool_call(con, "toolu_agent1", "p1", "sess-a", ts(1),
                             "Agent", None, "jsonl", None, 60, 900, 0)
+        # Skill calls carry the skill's own name in `detail`. Zero result
+        # bytes so these rows do not shift the tool-cost attribution the
+        # tests above pin to the byte counts they already have.
+        db.insert_tool_call(con, "toolu_skill1", "p1", "sess-a", ts(1),
+                            "Skill", None, "jsonl", "house-style", 10, 0, 0)
+        db.insert_tool_call(con, "toolu_skill2", "p1", "sess-a", ts(1),
+                            "Skill", None, "jsonl", "house-style", 10, 0, 0)
+        # inside the subagent, on the prompt that folds into p1
+        db.insert_tool_call(con, "toolu_skill3", "p2", "sess-a", ts(2),
+                            "Skill", "ag1", "jsonl", "dataviz", 10, 0, 0)
+        # An OTel row that arrived before the transcript naming it: the tool
+        # is Skill, the skill is unknown.
+        db.insert_tool_call(con, "toolu_skill4", "p1", "sess-a", ts(1),
+                            "Skill", None, "otel")
 
         db.upsert_agent(con, "ag1", "sess-a", "p1", ts(1),
                         subagent_type="general-purpose", requested_model="haiku",
@@ -393,6 +407,52 @@ class Rows(Fixture):
                                input_cost * 6000 / total, places=4)
 
 
+class Skills(Fixture):
+    """Skill names are a field of their own, not a label to be parsed back
+    out of the tool list. The question the page has to answer is which
+    skills ran on a prompt - and, by their absence, which did not."""
+
+    def test_skills_are_named_and_counted(self):
+        r = self.collect()[0]["p1"]
+        self.assertEqual(dict(r["skills"])["house-style"], 2)
+
+    def test_a_subagents_skill_lands_on_the_parent_prompt(self):
+        # p2 folds into p1, and its subagent's skill has to fold with it or
+        # a delegated skill would simply vanish from the page.
+        r = self.collect()[0]["p1"]
+        self.assertEqual(dict(r["skills"])["dataviz"], 1)
+
+    def test_an_unnamed_skill_call_is_counted_not_dropped(self):
+        """A skill ran and we cannot yet say which. That is a different
+        statement from no skill having run, so it keeps a row under '?'."""
+        r = self.collect()[0]["p1"]
+        self.assertEqual(dict(r["skills"])["?"], 1)
+
+    def test_skills_are_ordered_by_use(self):
+        r = self.collect()[0]["p1"]
+        self.assertEqual([s[0] for s in r["skills"]][0], "house-style")
+
+    def test_a_prompt_that_ran_none_says_so_with_an_empty_list(self):
+        r = self.collect()[0]["p3"]
+        self.assertEqual(r["skills"], [])
+
+    def test_the_skill_stays_in_the_tool_list_with_its_cost_share(self):
+        """The two views are the same fact: `skills` answers which ran,
+        `tools` keeps the cost attribution under a Skill:<name> label."""
+        r = self.collect()[0]["p1"]
+        self.assertEqual(dict(r["tools"])["Skill:house-style"], 2)
+        self.assertEqual(dict(r["tools"])["Skill"], 1)
+
+    def test_skills_survive_the_payload_encoding(self):
+        rows = self.collect()[1]
+        cols, strings = bd.compact(rows)
+        self.assertIn("skills", bd.COLUMNS)
+        i = [r["id"] for r in rows].index("p1")
+        got = {strings[s[0]]: s[1] for s in cols["skills"][i]}
+        self.assertEqual(got["house-style"], 2)
+        self.assertEqual(got["dataviz"], 1)
+
+
 class CacheMisses(Fixture):
     def test_causes_are_named(self):
         self.collect()
@@ -591,21 +651,23 @@ class Sessions(Fixture):
     def test_tool_calls_land_on_the_request_that_carried_their_results(self):
         """Between the previous request and this one, main thread only.
 
-        The fixture's session A calls Bash at ts(0) and ts(1) and an Agent
-        tool at ts(1) on the main thread, plus a Read at ts(2) inside the
-        subagent - which belongs to the subagent's own bar, not to the turn
-        that launched it. Requests are at ts 0, 1, 2, 3, 75 and 76.
+        The fixture's session A calls Bash at ts(0), and at ts(1) a Bash, an
+        Agent tool and three Skill calls, all on the main thread; inside the
+        subagent it calls Read and a Skill at ts(2), and those belong to the
+        subagent's own bar, not to the turn that launched it. Requests are at
+        ts 0, 1, 2, 3, 75 and 76.
         """
         _, rows, _ = self.collect()
         sess = bd.session_rows(rows)
         points, _ = bd.ctx_points([s["id"] for s in sess])
         ti = bd.CTX_COLUMNS.index("tools")
         got = [p[ti] for p in points if p[0] == "sess-a"]
-        # ts(0): the Bash at ts(0). ts(1): the Bash and the Agent at ts(1).
-        # Nothing after that on the main thread.
-        self.assertEqual(got, [1, 2, 0, 0, 0, 0])
-        self.assertEqual(sum(p[ti] for p in points), 3,
-                         "the subagent's own Read is not the session's")
+        # ts(0): the Bash at ts(0). ts(1): the Bash, the Agent and the three
+        # Skill calls at ts(1). Nothing after that on the main thread.
+        self.assertEqual(got, [1, 5, 0, 0, 0, 0])
+        self.assertEqual(sum(p[ti] for p in points), 6,
+                         "the subagent's own Read and Skill are not the "
+                         "session's")
 
     def test_failed_tool_calls_are_counted_separately(self):
         _, rows, _ = self.collect()

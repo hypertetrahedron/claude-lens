@@ -701,6 +701,7 @@
         <option value="mix">Model mix / day</option>
         <option value="agents">Subagent share / day</option>
         <option value="tools">Tool cost (top 12)</option>
+        <option value="skills">Skill invocations (top 12)</option>
         <option value="errors">Tool errors / day</option>
       </select>
     </div>
@@ -795,6 +796,10 @@ function rehydrate(d) {
       web_searches: C.web_searches[i], peak_ctx: C.peak_ctx[i],
       misses: C.misses[i], cache_miss_cost: C.cache_miss_cost[i],
       tool_attrib: C.tool_attrib[i].map(t => [S[t[0]], t[1], t[2], t[3]]),
+      /* [skill name, invocations]. A Skill call is also in `tools` as
+         `Skill:<name>` carrying the cost share; this is the same fact keyed
+         by name so nothing downstream has to split a label apart. */
+      skills: (C.skills ? C.skills[i] : []).map(s => [S[s[0]], s[1]]),
     };
     if (T && T[i]) r.title = T[i];
     out[i] = r;
@@ -1554,6 +1559,7 @@ const CHARTS = {
   blocks:{ title: "Cost per 5-hour billing block", draw: drawBlocks },
   heat:  { title: "Daily cost", draw: drawHeatmap },
   tools: { title: "Attributed tool cost (top 12)", draw: drawTools },
+  skills:{ title: "Skill invocations (top 12)", draw: drawSkills },
   cpk:   { title: "Cost per 1,000 lines written",
            val: b => b.lines >= 50 ? b.cost / (b.lines / 1000) : null, fmt: fmtUsd },
   agents:{ title: "Subagent share of output tokens",
@@ -1978,16 +1984,43 @@ function drawTools(wrap, rs) {
   for (const r of rs)
     for (const [name, , , usd] of (r.tool_attrib || []))
       totals.set(name, (totals.get(name) || 0) + usd);
+  drawNamedBars(wrap, totals, fmtUsd,
+                "No attributed tool cost in this range.");
+}
+
+/* One bar per skill, invocations, most-used first. The companion to the
+   Skills column: the column says which skills a prompt ran, this says which
+   ran at all across the filtered range - so a skill that is missing from the
+   range entirely is missing from the chart, which is the thing worth
+   noticing. Unnamed Skill calls are left out: an "?" bar would rank an
+   ingest lag alongside real skills. */
+function drawSkills(wrap, rs) {
+  const totals = new Map();
+  for (const r of rs)
+    for (const [name, n] of (r.skills || []))
+      if (name !== "?") totals.set(name, (totals.get(name) || 0) + n);
+  drawNamedBars(wrap, totals, fmtFull, "No skills ran in this range.", true);
+}
+
+/* Shared bar chart over a Map of name -> value: top 12, descending, with the
+   y axis formatted by `fmt`. drawTools and drawSkills differ only in what
+   they count and how it reads, so the axes and bars live here. `whole` is
+   for counts: niceTop's 1/2/5 ladder quartered gives ticks like 1.25, which
+   is a fine dollar amount and a nonsense number of invocations, so the top
+   is rounded up to a multiple of four and every tick lands on an integer. */
+function drawNamedBars(wrap, totals, fmt, empty, whole) {
   const top = [...totals.entries()].filter(([, v]) => v > 0)
                                     .sort((a, b) => b[1] - a[1]).slice(0, 12);
   if (!top.length) {
-    wrap.append(el("div", "empty", "No attributed tool cost in this range."));
+    wrap.append(el("div", "empty", empty));
     return;
   }
   const W = Math.max(wrap.clientWidth || 900, 320), H = 190;
   const padL = 46, padR = 8, padT = 8, padB = 34;
   const plotW = W - padL - padR, plotH = H - padT - padB;
-  const top4 = niceTop(Math.max(...top.map(([, v]) => v)));
+  const peak = Math.max(...top.map(([, v]) => v));
+  const top4 = whole ? Math.max(4, Math.ceil(niceTop(peak) / 4) * 4)
+                     : niceTop(peak);
   const band = plotW / top.length;
   const barW = Math.min(40, Math.max(6, band - 10));
 
@@ -1998,7 +2031,7 @@ function drawTools(wrap, rs) {
                                class: i ? "grid-line" : "base-line" }));
     const t = svgEl("text", { x: padL - 6, y: y + 4, "text-anchor": "end",
                               class: "tick-label" });
-    t.textContent = v ? fmtUsd(v) : "0";
+    t.textContent = v ? fmt(v) : "0";
     svg.append(t);
   }
   top.forEach(([name, v], i) => {
@@ -2008,9 +2041,14 @@ function drawTools(wrap, rs) {
     const bar = svgEl("rect", { x, y, width: barW, height: h,
                                 rx: Math.min(4, barW / 2), class: "bar",
                                 tabindex: 0 });
-    svgTip(bar, name + ": " + fmtUsd(v));
+    svgTip(bar, name + ": " + fmt(v));
     svg.append(bar);
-    const short = name.length > 10 ? name.slice(0, 9) + "…" : name;
+    // Fit the label to the band rather than a fixed ten characters: tool
+    // names are short ("Bash"), skill names are long and hyphenated
+    // ("claude-in-chrome"), and a chart of four bars has room to spell them
+    // out. ~7px per character at the tick-label size.
+    const cap = Math.max(6, Math.floor(band / 7));
+    const short = name.length > cap ? name.slice(0, cap - 1) + "…" : name;
     const t = svgEl("text", { x: padL + i * band + band / 2, y: H - padB + 16,
                               "text-anchor": "middle", class: "tick-label" });
     t.textContent = short;
@@ -3670,6 +3708,38 @@ const COLCAT = [
   { k: "tools", label: "Tools", num: true, def: true, val: toolN,
     cell: r => numCell(String(toolN(r))),
     groupVal: l => fmtFull(l.reduce((s, r) => s + toolN(r), 0)) },
+  /* Names, not a count. A count answers "did anything run"; the reason to
+     look at this column is to check a particular skill against the prompts
+     that should have used it, and a number cannot be checked that way.
+     Sorting on the joined names groups prompts by skill and collects the
+     ones that ran none into a single block. */
+  { k: "skills", label: "Skills", def: true,
+    val: r => r.skills.map(s => s[0]).join(" "),
+    cell: r => {
+      const td = el("td");
+      if (!r.skills.length) { td.className = "muted"; td.textContent = "–"; return td; }
+      for (const [name, n] of r.skills) {
+        const known = name !== "?";
+        const pill = el("span", "pill");
+        pill.append(document.createTextNode(known ? name : "?"));
+        pill.title = (known ? name : "a skill ran; the transcript naming it "
+                      + "has not been ingested yet")
+                     + " · " + n + (n === 1 ? " invocation" : " invocations");
+        td.append(pill);
+      }
+      return td;
+    },
+    /* The group row is a row of subtotals, and the whole name list runs well
+       past this column's width - measured at 262px in a 150px cell. So the
+       subtotal is how many distinct skills the group used, with the names on
+       hover; the names themselves belong on the prompt rows. */
+    groupVal: l => {
+      const names = new Set();
+      for (const r of l) for (const [name] of r.skills) if (name !== "?") names.add(name);
+      if (!names.size) return "";
+      const sorted = [...names].sort();
+      return { text: String(sorted.length), title: sorted.join(", ") };
+    } },
   { k: "agents", label: "Agents", num: true, def: true, val: r => r.agents.length,
     cell: r => numCell(String(r.agents.length)),
     groupVal: l => fmtFull(l.reduce((s, r) => s + r.agents.length, 0)) },
@@ -3788,7 +3858,7 @@ const sortVal = (r, k) => {
    absorbs whatever the fixed columns do not use. See SESS_COL_WIDTH for the
    sessions table's version of the same idea. */
 const COL_WIDTH = { ts: 130, project: 130, title: 140, models: 130,
-  inp: 90, out: 90, tools: 70, agents: 70, errors: 70, files: 70,
+  inp: 90, out: 90, tools: 70, skills: 150, agents: 70, errors: 70, files: 70,
   lines: 120, cost: 90, wall_s: 100, api_calls: 90, tpm: 100, lpm: 100,
   cache: 90, cpk: 110, ashare: 90, alt: 100, cr: 90, chars: 110,
   effort: 90, thinking: 110, fast_calls: 90, max_tokens_stops: 120,
@@ -3951,7 +4021,13 @@ function renderTable(rs) {
     first.append(el("span", "cnt", "— " + list.length + " prompts"));
     gtr.append(first);
     for (const c of cols.slice(span)) {
-      gtr.append(el("td", "num", c.groupVal ? c.groupVal(list) : ""));
+      // groupVal may return a plain string, or {text, title} when the
+      // subtotal has to stay short enough for its column but the long form
+      // is still worth having on hover.
+      const gv = c.groupVal ? c.groupVal(list) : "";
+      const gtd = el("td", "num", typeof gv === "string" ? gv : gv.text);
+      if (gv && gv.title) gtd.title = gv.title;
+      gtr.append(gtd);
     }
     out.push(gtr);
     const rowEls = list.slice(0, GROUP_ROW_CAP).map(r => appendRow(out, r, cols));
@@ -4131,7 +4207,7 @@ function exportCsv() {
   };
   const head = ["time", "project", "prompt", "models", "api_calls",
                 "input_tokens", "output_tokens", "cache_read_tokens",
-                "tool_calls", "subagents", "files_changed", "lines_added",
+                "tool_calls", "skills", "subagents", "files_changed", "lines_added",
                 "lines_removed", "chars_written", "cost_usd", "cost_estimated",
                 "duration_s", "cost_cache_read", "cost_cache_write",
                 "cost_output", "cost_uncached_input", "cost_without_cache",
@@ -4144,7 +4220,8 @@ function exportCsv() {
       r.ts, esc(projLabel(r.project)), esc(r.text),
       esc(r.models.map(m => shortModel(m.model)).join("; ")),
       r.api_calls, r.inp, r.out, r.cr || 0,
-      r.tools.reduce((a, t) => a + t[1], 0), r.agents.length,
+      r.tools.reduce((a, t) => a + t[1], 0),
+      r.skills.map(s => s[0]).join("; "), r.agents.length,
       r.files, r.ladd, r.lrem, r.chars,
       r.cost, r.est ? 1 : 0, r.wall_s ?? "",
       ...(r.comp || [0, 0, 0, 0]), r.alt ?? "",
@@ -4323,6 +4400,30 @@ function toggleDetail(tr, r) {
       ft.append(more);
     }
     secF.append(ft); box.append(secF);
+  }
+  /* Skills get their own section rather than living only as `Skill:<name>`
+     rows in the cost table below. The question this answers is usually the
+     negative one - a skill that was expected and did not run - and that is
+     only readable if the names sit in a fixed, findable place instead of
+     wherever the cost ranking happened to put them. */
+  if (r.skills && r.skills.length) {
+    const secS = el("div");
+    secS.append(el("h3", null, "Skills"));
+    const st = el("table");
+    const sh = el("tr");
+    for (const h of ["Skill", "Invocations"]) sh.append(el("th", null, h));
+    st.append(sh);
+    for (const [name, n] of r.skills) {
+      const row = el("tr");
+      // A Skill call the transcript has not been read for yet: the tool is
+      // known, the skill is not. Saying so beats guessing or hiding it.
+      const known = name !== "?";
+      row.append(el("td", known ? null : "muted",
+                    known ? name : "name not recorded yet"),
+                 el("td", "num", String(n)));
+      st.append(row);
+    }
+    secS.append(st); box.append(secS);
   }
   if (r.tool_attrib && r.tool_attrib.length) {
     const secT = el("div");

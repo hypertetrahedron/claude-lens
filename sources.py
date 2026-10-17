@@ -490,8 +490,13 @@ def fetch_remote(host, since=0, depth=DEFAULT_REMOTE_DEPTH,
     try:
         fd, tmp = tempfile.mkstemp(prefix="claude-lens-", suffix=".tar.gz")
         with os.fdopen(fd, "wb") as out:
+            # The receiver runs under pythonw, which has no console, so a
+            # console child like ssh would otherwise open a visible window
+            # (and steal focus from fullscreen apps) on every pass.
             proc = subprocess.run(cmd, input=REMOTE_SH.encode(), stdout=out,
-                                  stderr=subprocess.PIPE, timeout=timeout)
+                                  stderr=subprocess.PIPE, timeout=timeout,
+                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                                  if sys.platform == "win32" else 0)
         if proc.returncode == 3:
             return done("no Claude directory found on this machine", "no_claude")
         if proc.returncode != 0:

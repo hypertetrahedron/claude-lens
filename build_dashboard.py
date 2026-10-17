@@ -769,6 +769,11 @@ def collect(con, since=None):
             "models": defaultdict(lambda: {"in": 0, "out": 0, "cr": 0, "cw": 0,
                                            "cost": 0.0, "calls": 0}),
             "tools": defaultdict(int), "agents": set(),
+            # Skill invocations, by the skill's own name. A Skill call is also
+            # a tool call and stays in "tools" as `Skill:<name>` with its cost
+            # share; this is the same fact keyed so the page can ask "which
+            # skills ran here" without parsing a display label back apart.
+            "skills": defaultdict(int),
             "api_calls": 0, "cost": 0.0, "est": False, "last_ts": "",
             "files": defaultdict(lambda: [0, 0]), "chars": 0, "agent_out": 0,
             "comp": [0.0, 0.0, 0.0, 0.0],  # $: cache_read, cache_write, output, uncached_in
@@ -969,6 +974,13 @@ def collect(con, since=None):
             tool_args):
         r = bucket(pid)
         display = f"Skill:{detail}" if (name == "Skill" and detail) else (name or "?")
+        if name == "Skill":
+            # An OTel tool_result knows the tool is Skill but not which skill;
+            # the transcript carries the name and fills the NULL on the next
+            # ingest. Until it does, the invocation is counted under "?" -
+            # a skill ran and we cannot yet say which, which is a different
+            # statement from no skill having run.
+            r["skills"][detail or "?"] += n
         r["tools"][display] += n
         r["tool_bytes"][display] += rbytes or 0
         r["errors"] += errs or 0
@@ -1032,6 +1044,7 @@ def collect(con, since=None):
                     if project.startswith(sources.COWORK_LABEL + "/")
                     else CODE_KIND)
         tools = sorted(r["tools"].items(), key=lambda kv: (-kv[1], kv[0]))
+        skills = sorted(r["skills"].items(), key=lambda kv: (-kv[1], kv[0]))
         # What a tool cost, as far as anything can say. A tool's result enters
         # the context once and is then re-read on every later request of the
         # turn, so the turn's whole input-side bill (cache read + cache write +
@@ -1061,6 +1074,7 @@ def collect(con, since=None):
             "text": r["text"],
             "models": models,
             "tools": tools,
+            "skills": skills,
             "agents": agent_ids,
             "agent_info": [[a, agent_meta.get(a, (None, None))[0],
                             agent_meta.get(a, (None, None))[1]]
@@ -1252,7 +1266,9 @@ COLUMNS = ("ts", "project", "kind", "text", "models", "tools", "agents",
            # v2
            "session", "conv", "effort", "thinking", "fast_calls", "errors",
            "max_tokens_stops", "web_searches", "peak_ctx", "misses",
-           "cache_miss_cost", "tool_attrib")
+           "cache_miss_cost", "tool_attrib",
+           # v3
+           "skills")
 
 # Column order of the `sessions` and `ctx` tables, which go out in the same
 # column-oriented form as the rows and against the same string table. The
@@ -1322,6 +1338,7 @@ def compact(out_rows, strings=None):
                                 m["cw"], m["cost"], m["calls"]]
                                for m in r["models"]])
         cols["tools"].append([[sid(t), n] for t, n in r["tools"]])
+        cols["skills"].append([[sid(s), n] for s, n in r.get("skills", ())])
         # [agent id, subagent_type, resolved model] - the id on its own is
         # opaque, and the detail view has no other way to reach the type.
         cols["agents"].append([[sid(a[0]), sid(a[1]), sid(a[2])]
