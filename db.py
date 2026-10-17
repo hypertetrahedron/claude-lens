@@ -140,8 +140,21 @@ def is_subagent_qs(value):
 #       which COALESCE reads as a value rather than a hole and so no re-parse
 #       could ever correct; those are reset to NULL and refilled. Adds
 #       idx_tool_session and idx_prompts_session. Clears ingest_state.
+#       (The re-parse restored api_requests.agent_name only: tool_calls
+#       did not fill agent_name on conflict until v10.)
+#  10 - no column change: lets a transcript complete rows it used to be shut
+#       out of, then clears ingest_state so a re-parse does. Usage in a
+#       session started by another agent ("peer" turns, no human prompt) was
+#       dropped and is now attributed to the latest prompt; tool_calls fill
+#       prompt_id, session_id, ts and agent_name on conflict, so a live
+#       subagent call gets the transcript's agentId (and the file-history
+#       pass, which needs it, runs for live sessions); prompt text OTel stored
+#       as "<REDACTED>" is replaced by the transcript's. Prompts adopt their
+#       session's project, so one session reached through two spellings of
+#       its cwd is no longer split across two projects. Migrations now run
+#       one locked transaction per step.
 # ---------------------------------------------------------------------------
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS prompts (
@@ -302,6 +315,23 @@ CREATE INDEX IF NOT EXISTS idx_prompts_session ON prompts(session_id, ts);
 """
 
 
+def _apply_schema(con):
+    """SCHEMA, one statement at a time, inside the caller's transaction.
+
+    executescript() would be shorter, but it COMMITs before it starts. A
+    migration calling it ended the transaction connect() opens around each
+    step, so a failure after that point left the database half migrated with
+    user_version still claiming the old version - and released the lock that
+    keeps a second process from migrating the same file at the same time.
+    """
+    buf = ""
+    for line in SCHEMA.splitlines(True):
+        buf += line
+        if sqlite3.complete_statement(buf):
+            con.execute(buf)
+            buf = ""
+
+
 def _migrate_to_2(con):
     """tool_calls.detail + one-time re-parse to backfill skill/MCP names."""
     cols = [r[1] for r in con.execute("PRAGMA table_info(tool_calls)")]
@@ -364,13 +394,19 @@ def _migrate_to_7(con):
         con.execute("ALTER TABLE api_requests ADD COLUMN provider TEXT")
     seen = [r[0] for r in con.execute(
         "SELECT DISTINCT model FROM api_requests WHERE model IS NOT NULL")]
+    # `model_raw IS NULL` is what makes each row convert exactly once. The
+    # list above is taken up front, so when it holds both a Bedrock id and
+    # the plain id that Bedrock id canonicalises to, the later UPDATE would
+    # re-match the rows the earlier one had just rewritten - overwriting
+    # their model_raw with the canonical id and their provider with
+    # "anthropic", the only record that they went through Bedrock.
     for raw in seen:
         canon, provider = pricing.canonical_model(raw)
         if canon is None and provider is None:
             continue                      # "<synthetic>" and friends: leave be
         con.execute(
             """UPDATE api_requests SET model=?, model_raw=?, provider=?
-               WHERE model=?""",
+               WHERE model=? AND model_raw IS NULL""",
             (canon or raw, raw, provider, raw))
 
 
@@ -407,7 +443,7 @@ def _migrate_to_8(con):
         for name, kind in columns:
             if name not in have:
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
-    con.executescript(SCHEMA)               # new tables + indexes
+    _apply_schema(con)                      # new tables + indexes
     # Fill context_tokens for history that will never be re-parsed (the
     # transcript is gone); rows that are re-parsed get the same answer.
     con.execute("""UPDATE api_requests SET context_tokens =
@@ -431,7 +467,7 @@ def _migrate_to_9(con):
     transcript correct an OTel row only fills a NULL. Clearing the bad values
     is what turns them back into holes the next parse can fill.
     """
-    con.executescript(SCHEMA)               # new indexes
+    _apply_schema(con)                      # new indexes
     # OTel stored 0/0 for the cache-TTL split before it learned to leave the
     # split alone. Zero is a measurement - COALESCE keeps it - so these rows
     # would have been billed at the unsplit 1h multiplier forever.
@@ -444,7 +480,9 @@ def _migrate_to_9(con):
     # written by OTel over the transcript's agentId. Clearing it lets the
     # re-parse below put the id back; the type is not lost, query_source
     # carries it. Rows whose transcript is gone keep a NULL, which is honest -
-    # the type they held was never the thing this column means.
+    # the type they held was never the thing this column means. That held
+    # for api_requests at once; tool_calls ignored agent_name on conflict, so
+    # its rows stayed NULL until v10 made the column fill and re-parsed.
     for table in ("api_requests", "tool_calls", "edits"):
         con.execute(f"""UPDATE {table} SET agent_name = NULL
                         WHERE source = 'otel' AND agent_name IS NOT NULL
@@ -452,9 +490,35 @@ def _migrate_to_9(con):
     con.execute("DELETE FROM ingest_state")
 
 
+def _migrate_to_10(con):
+    """Re-parse every transcript under rules that can complete what was missed.
+
+    Nothing here rewrites a measurement, and the re-parse is safe for the
+    reason every earlier one was: a transcript row can raise another
+    transcript row but never lower it, it can only fill the holes in an OTel
+    row, and the prompts, tool_calls and agents upserts fill rather than
+    replace. The rows it touches gain what the old rules withheld - usage in
+    peer-started sessions, a live tool call's agent id, prompt text OTel had
+    redacted - and keep everything they already had.
+
+    The project repair is done in place, because it is the one thing a
+    re-parse cannot reach: prompts.project is first-writer-wins, so a prompt
+    already filed under the other spelling of its session's cwd would keep it
+    however often the transcript was read.
+    """
+    con.execute("""UPDATE prompts SET project =
+                     (SELECT s.project FROM sessions s
+                      WHERE s.session_id = prompts.session_id)
+                   WHERE EXISTS (SELECT 1 FROM sessions s
+                                 WHERE s.session_id = prompts.session_id
+                                   AND s.project IS NOT NULL
+                                   AND s.project IS NOT prompts.project)""")
+    con.execute("DELETE FROM ingest_state")
+
+
 MIGRATIONS = {2: _migrate_to_2, 3: _migrate_to_3, 4: _migrate_to_4,
               5: _migrate_to_5, 6: _migrate_to_6, 7: _migrate_to_7,
-              8: _migrate_to_8, 9: _migrate_to_9}
+              8: _migrate_to_8, 9: _migrate_to_9, 10: _migrate_to_10}
 
 
 def connect(path=DB_PATH, cross_thread=False):
@@ -483,6 +547,28 @@ def connect(path=DB_PATH, cross_thread=False):
         con.execute("PRAGMA mmap_size=268435456")
     except sqlite3.Error:
         pass
+    # Any failure from here on closes the connection before it propagates.
+    # A migration that raised used to leave the file open, which on Windows
+    # locks it (and blocks rmtree of a test's directory) until the process
+    # exits.
+    try:
+        _prepare(con, path)
+    except BaseException:
+        try:
+            con.rollback()
+        finally:
+            con.close()
+        raise
+    return con
+
+
+def _schema_version(con):
+    version = con.execute("PRAGMA user_version").fetchone()[0]
+    return version or 1  # 0 = a database from before version tracking
+
+
+def _prepare(con, path):
+    """Create a fresh database current, or migrate an old one up to date."""
     fresh = con.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='prompts'"
     ).fetchone() is None
@@ -490,16 +576,25 @@ def connect(path=DB_PATH, cross_thread=False):
     if fresh:
         con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         con.commit()
-        return con
-    version = con.execute("PRAGMA user_version").fetchone()[0]
-    if version == 0:
-        version = 1  # databases from before version tracking
+        return
+    version = _schema_version(con)
     if version > SCHEMA_VERSION:
-        con.close()  # a connection left open here blocks rmtree on Windows
         raise RuntimeError(
             f"metrics.db is schema v{version} but this code only knows "
             f"v{SCHEMA_VERSION} - update the project before running.")
+    # One write transaction per step, with the version read again inside it.
+    # The receiver and an ingest run started together would otherwise both
+    # see the old version and both run the step, and not every step survives
+    # running twice. BEGIN IMMEDIATE takes the write lock up front, so the
+    # second process waits and then finds the step already done. Each step is
+    # atomic too: if it raises, the rollback leaves the database at exactly
+    # the version user_version claims.
     while version < SCHEMA_VERSION:
+        con.execute("BEGIN IMMEDIATE")
+        version = _schema_version(con)
+        if version >= SCHEMA_VERSION:
+            con.commit()
+            break
         version += 1
         MIGRATIONS[version](con)
         con.execute(f"PRAGMA user_version = {version}")
@@ -508,19 +603,29 @@ def connect(path=DB_PATH, cross_thread=False):
         # message that always says "metrics.db" reads as if the real one had
         # just been rewritten.
         print(f"{os.path.basename(path)} migrated to schema v{version}")
-    return con
 
 
 PROMPT_COLS = ("prompt_id", "session_id", "project", "ts", "text", "source",
                "injected", "canonical_id", "kind")
 
-PROMPT_SQL = """INSERT INTO prompts (prompt_id, session_id, project, ts, text, source, injected, canonical_id, kind)
+# What the CLI's telemetry sends as the `prompt` attribute when
+# OTEL_LOG_USER_PROMPTS is off: this literal string, not an empty one. It is a
+# placeholder rather than text, so the upsert treats it as a hole exactly as
+# it treats ''. Otherwise the receiver, which writes a prompt seconds after it
+# is typed, pinned the placeholder in place and the transcript's real text,
+# read later, could never replace it.
+REDACTED_PROMPT = "<REDACTED>"
+
+PROMPT_SQL = f"""INSERT INTO prompts (prompt_id, session_id, project, ts, text, source, injected, canonical_id, kind)
            VALUES (?,?,?,?,?,?,?,?,?)
            ON CONFLICT(prompt_id) DO UPDATE SET
              session_id   = COALESCE(prompts.session_id, excluded.session_id),
              project      = COALESCE(prompts.project, excluded.project),
              ts           = COALESCE(prompts.ts, excluded.ts),
-             text         = CASE WHEN prompts.text = '' THEN excluded.text ELSE prompts.text END,
+             text         = CASE
+               WHEN COALESCE(prompts.text, '') IN ('', '{REDACTED_PROMPT}')
+                    AND COALESCE(excluded.text, '') <> ''
+               THEN excluded.text ELSE prompts.text END,
              injected     = MAX(prompts.injected, excluded.injected),
              canonical_id = COALESCE(prompts.canonical_id, excluded.canonical_id),
              kind         = COALESCE(excluded.kind, prompts.kind)
@@ -719,11 +824,22 @@ TOOL_CALL_COLS = ("tool_use_id", "prompt_id", "session_id", "ts", "tool_name",
 # input and result bytes and the specific name, OTel has the duration and the
 # error type. Neither is ever authoritative over the other, so each write fills
 # NULLs and leaves everything already known alone.
+#
+# That includes the identifying columns. The receiver writes a tool call
+# seconds after it runs, with no agent_name (OTel's is the subagent type, not
+# what the column means), and the transcript, read later, is the only source
+# of the agentId. Leaving these out of the update meant a live subagent call
+# never got one - and the file-history pass, which finds subagent edit calls
+# by agent_name, never ran for a live session at all.
 TOOL_CALL_SQL = """INSERT INTO tool_calls
            (tool_use_id, prompt_id, session_id, ts, tool_name, agent_name, source, detail,
             input_bytes, result_bytes, is_error, duration_ms, error_type)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(tool_use_id) DO UPDATE SET
+             prompt_id    = COALESCE(tool_calls.prompt_id, excluded.prompt_id),
+             session_id   = COALESCE(tool_calls.session_id, excluded.session_id),
+             ts           = COALESCE(tool_calls.ts, excluded.ts),
+             agent_name   = COALESCE(tool_calls.agent_name, excluded.agent_name),
              tool_name = CASE
                WHEN tool_calls.tool_name = 'mcp_tool'
                     AND excluded.tool_name LIKE 'mcp__%'

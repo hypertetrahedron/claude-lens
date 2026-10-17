@@ -176,8 +176,11 @@ def main(argv=None, stream=None):
                  session, os.path.basename(path), used, built,
                  time.time() - started, ("; " + text.replace("\n", " ")
                                          if text else ""))
-    except Exception:
-        # Never let a reporting tool break the end of a session.
+    except (Exception, SystemExit):
+        # Never let a reporting tool break the end of a session. SystemExit is
+        # named because it is not an Exception: argparse raises it (exit 2) on
+        # a bad flag, and the .sh wrapper execs this script, so it would have
+        # become the hook's own exit status.
         log.exception("session end hook failed after %.2fs",
                       time.time() - started)
     return 0

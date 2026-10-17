@@ -22,6 +22,7 @@ import logging
 import os
 import socket
 import sqlite3
+import sys
 import threading
 import time
 import zlib
@@ -88,7 +89,7 @@ LOG_PATH = os.path.join(BASE, "receiver.log")
 # older code - ingestion carries on, and the log says to restart.
 WATCHED_FILES = ("receiver.py", "build_dashboard.py", "template.html",
                  "jsonl_ingest.py", "sources.py", "db.py", "pricing.py",
-                 "report_index.py")
+                 "report_index.py", "conversations.py", "pricing.local.json")
 
 log = logging.getLogger("receiver")
 log.setLevel(logging.INFO)
@@ -540,6 +541,65 @@ def _content_media_type(headers):
     return headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
 
 
+# A page left open in a browser can retry its fetch() in a loop, and each try
+# used to cost a log line. The log rotates at 2 MB with two backups, so a flood
+# of identical rejections pushed the real errors out of it. The first rejection
+# in a window is logged in full; the rest are counted and summarised once the
+# window closes, so the log still says how many there were.
+ORIGIN_LOG_EVERY = 60       # seconds between Origin-rejection log lines
+_origin_lock = threading.Lock()
+_origin_last = None         # monotonic time of the last line written
+_origin_skipped = 0         # rejections since then that were not logged
+
+
+def _warn_origin(path, origin):
+    global _origin_last, _origin_skipped
+    with _origin_lock:
+        now = time.monotonic()
+        if _origin_last is not None and now - _origin_last < ORIGIN_LOG_EVERY:
+            _origin_skipped += 1
+            return
+        skipped, _origin_skipped = _origin_skipped, 0
+        _origin_last = now
+    if skipped:
+        log.warning("rejected POST %s carrying Origin %r (and %d more "
+                    "since the last line)", path, origin, skipped)
+    else:
+        log.warning("rejected POST %s carrying Origin %r", path, origin)
+
+
+class BodyTooLarge(Exception):
+    """A request body ran past MAX_BODY_BYTES while being read."""
+
+
+def read_chunked(rfile, limit):
+    """Decode a Transfer-Encoding: chunked body, refusing more than `limit`.
+
+    An OTLP exporter built on a streaming HTTP client may send its body this
+    way, with no Content-Length at all, and the length-based read below would
+    take that for an empty body. The cap is enforced as chunks arrive, so a
+    sender cannot make us buffer more than it would have been allowed to
+    declare.
+    """
+    out = bytearray()
+    while True:
+        size_line = rfile.readline(1024)
+        # A chunk size may carry extensions after a semicolon; ignore them.
+        size = int(size_line.split(b";", 1)[0].strip() or b"x", 16)
+        if size == 0:
+            # Trailers, if any, end at the blank line.
+            while rfile.readline(65537).strip():
+                pass
+            return bytes(out)
+        if len(out) + size > limit:
+            raise BodyTooLarge()
+        chunk = rfile.read(size)
+        if len(chunk) != size:
+            raise ValueError("chunked body ended early")
+        out += chunk
+        rfile.readline(3)       # the CRLF after the chunk data
+
+
 class Handler(BaseHTTPRequestHandler):
     # StreamRequestHandler.setup() applies this to the socket. Without it, a
     # client that sends a Content-Length and then never sends the body (or
@@ -561,8 +621,7 @@ class Handler(BaseHTTPRequestHandler):
                 # an attempt worth knowing about or this check misreading a
                 # real exporter, and silence would make the second one look
                 # like telemetry that simply stopped arriving.
-                log.warning("rejected POST %s carrying Origin %r",
-                            self.path, self.headers.get("Origin"))
+                _warn_origin(self.path, self.headers.get("Origin"))
                 self.send_response(403)
                 self.end_headers()
                 return
@@ -580,14 +639,24 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(415)
                 self.end_headers()
                 return
-            length = as_int(self.headers.get("Content-Length"), 0)
-            if length < 0 or length > MAX_BODY_BYTES:
-                log.warning("rejected POST %s declaring %d bytes (cap %d)",
-                            self.path, length, MAX_BODY_BYTES)
-                self.send_response(413)
-                self.end_headers()
-                return
-            body = self.rfile.read(length)
+            if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+                try:
+                    body = read_chunked(self.rfile, MAX_BODY_BYTES)
+                except BodyTooLarge:
+                    log.warning("rejected POST %s: chunked body past the %d "
+                                "byte cap", self.path, MAX_BODY_BYTES)
+                    self.send_response(413)
+                    self.end_headers()
+                    return
+            else:
+                length = as_int(self.headers.get("Content-Length"), 0)
+                if length < 0 or length > MAX_BODY_BYTES:
+                    log.warning("rejected POST %s declaring %d bytes (cap %d)",
+                                self.path, length, MAX_BODY_BYTES)
+                    self.send_response(413)
+                    self.end_headers()
+                    return
+                body = self.rfile.read(length)
             if self.headers.get("Content-Encoding") == "gzip":
                 # 16 + MAX_WBITS tells zlib to parse a gzip header/trailer (a
                 # bare zlib stream uses MAX_WBITS alone). Decompressing via an
@@ -606,11 +675,20 @@ class Handler(BaseHTTPRequestHandler):
             if self.path.rstrip("/") == "/v1/logs":
                 payload = json.loads(body)
                 with _db_lock:
-                    for rl in payload.get("resourceLogs", []):
-                        for sl in rl.get("scopeLogs", []):
-                            for rec in sl.get("logRecords", []):
-                                handle_record(_con, rec)
-                    _con.commit()
+                    # _con is shared by every handler thread, so a batch that
+                    # dies half way must not leave its transaction open: other
+                    # writers would get "database is locked" until the next
+                    # good POST, and that POST would commit the half batch
+                    # whose sender was already told 500.
+                    try:
+                        for rl in payload.get("resourceLogs", []):
+                            for sl in rl.get("scopeLogs", []):
+                                for rec in sl.get("logRecords", []):
+                                    handle_record(_con, rec)
+                        _con.commit()
+                    except BaseException:
+                        _con.rollback()
+                        raise
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -765,13 +843,23 @@ def maintenance_loop(db_path=None):
     last_fingerprint = None
     build_con = None
     while True:
-        try:
-            stale = code_is_stale()
-            now = time.time()
-            if now - last_reconcile >= RECONCILE_EVERY:
+        stale = code_is_stale()
+        now = time.time()
+        if now - last_reconcile >= RECONCILE_EVERY:
+            # Stamped before the attempt, not after it succeeds: a reconcile
+            # that keeps failing would otherwise run again - SSH fetches
+            # included - on every tick instead of once an hour. The rebuild
+            # below has its own try for the same reason in the other
+            # direction: a broken reconcile must not stop fresh telemetry
+            # reaching the page.
+            last_reconcile = now
+            try:
                 stats = reconcile(db_path)
-                last_reconcile = now
                 log.info("reconcile: %s", stats)
+            except Exception:
+                log.exception("reconcile failed; retrying in %ds",
+                              RECONCILE_EVERY)
+        try:
             if not stale:
                 with _db_lock:
                     fingerprint = data_fingerprint(_con)
@@ -800,15 +888,41 @@ def parse_args(argv=None):
     return ap.parse_args(argv)
 
 
+def _log_uncaught(exc_type, exc, tb):
+    if issubclass(exc_type, KeyboardInterrupt):
+        return
+    log.error("uncaught exception", exc_info=(exc_type, exc, tb))
+
+
+def _log_thread_uncaught(args):
+    if args.exc_type is SystemExit:
+        return
+    log.error("uncaught exception in thread %s",
+              getattr(args.thread, "name", "?"),
+              exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+
 def main(argv=None):
     global _con
+    # Under pythonw (the scheduled task) stderr goes nowhere, so a receiver
+    # that failed to start - port taken, a migration that raised - used to
+    # leave an empty log and no clue. Everything that would only reach stderr
+    # is routed to the log first.
+    sys.excepthook = _log_uncaught
+    threading.excepthook = _log_thread_uncaught
     args = parse_args(argv)
-    path = resolve_db(args.db)
-    _con = db.connect(path, cross_thread=True)
-    server = Server((HOST, args.port), Handler)  # fails if already running
-    threading.Thread(target=maintenance_loop, args=(path,), daemon=True).start()
-    log.info("receiver listening on %s:%s (db %s)", HOST, args.port, path)
-    server.serve_forever()
+    log.info("receiver starting (port %s)", args.port)
+    try:
+        path = resolve_db(args.db)
+        _con = db.connect(path, cross_thread=True)
+        server = Server((HOST, args.port), Handler)  # fails if already running
+        threading.Thread(target=maintenance_loop, args=(path,),
+                         daemon=True).start()
+        log.info("receiver listening on %s:%s (db %s)", HOST, args.port, path)
+        server.serve_forever()
+    except Exception:
+        log.exception("receiver failed to start or crashed")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

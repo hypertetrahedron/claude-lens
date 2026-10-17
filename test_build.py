@@ -34,6 +34,10 @@ OPUS = "claude-opus-5"
 SONNET = "claude-sonnet-5"
 HAIKU = "claude-haiku-4-5"
 
+# The Wednesday of the week after T0's (T0 is a Tuesday): the last complete ISO
+# week is the one T0 falls in, Monday 2026-05-11 to Monday 2026-05-18.
+WED = datetime(2026, 5, 20, 3, 0, tzinfo=UTC)
+
 SCRIPT_TEXT = "<script>alert('xss')</script> please refactor the parser"
 
 
@@ -112,7 +116,7 @@ class Fixture(unittest.TestCase):
         db.upsert_session(con, "sess-b", project="proj2", cwd="/work/proj2",
                           first_ts=ts(10), last_ts=ts(13))
         db.upsert_session(con, "sess-c", project="proj3", cwd="/work/proj3",
-                          first_ts=ts(0, days=-9), last_ts=ts(0, days=-9))
+                          first_ts=ts(0, days=-6), last_ts=ts(0, days=-6))
 
         db.upsert_prompt(con, "p1", "sess-a", "proj", ts(0), SCRIPT_TEXT,
                          "jsonl", 0, None, "human")
@@ -122,8 +126,9 @@ class Fixture(unittest.TestCase):
                          "jsonl", 1, "p1", "task-notification")
         db.upsert_prompt(con, "p3", "sess-b", "proj2", ts(10),
                          "second session", "jsonl", 0, None, "human")
-        # Last week, so the digest has something to compare against.
-        db.upsert_prompt(con, "p0", "sess-c", "proj3", ts(0, days=-9),
+        # The ISO week before p1's (a Wednesday, T0 being a Tuesday), so the
+        # digest has something to compare against.
+        db.upsert_prompt(con, "p0", "sess-c", "proj3", ts(0, days=-6),
                          "last week", "jsonl", 0, None, "human")
 
         rows = [
@@ -171,7 +176,7 @@ class Fixture(unittest.TestCase):
             request("b3", "p3", "sess-b", ts(13), OPUS, input_tokens=10,
                     output_tokens=130, cache_create_tokens=9000,
                     cache_1h_tokens=9000),
-            request("z1", "p0", "sess-c", ts(0, days=-9), OPUS,
+            request("z1", "p0", "sess-c", ts(0, days=-6), OPUS,
                     input_tokens=1000, output_tokens=1000,
                     cache_create_tokens=1000, cache_1h_tokens=1000),
         ]
@@ -737,8 +742,12 @@ class Sessions(Fixture):
             bd.CTX_CAP = 5
             sess = bd.session_rows(rows)
             points, dropped = bd.ctx_points([s["id"] for s in sess])
-            self.assertEqual(dropped, 1, "session A does not fit")
-            self.assertEqual(len({p[0] for p in points}), 2)
+            # Newest first: B (3 points) fits, A does not - and C, which
+            # would fit behind it, is older than A and goes too. The notice
+            # says "the oldest sessions were left out", so what is kept has to
+            # be the newest run, not whatever happens to be small enough.
+            self.assertEqual(dropped, 2, "session A does not fit, nor C after it")
+            self.assertEqual({p[0] for p in points}, {"sess-b"})
         finally:
             bd.CTX_CAP = saved
 
@@ -931,6 +940,15 @@ class ConversationPages(Fixture):
         joined = " ".join(p["notices"])
         self.assertIn("Conversation pages cover the newest", joined)
         self.assertIn("--conversations", joined)
+
+    def test_telemetry_redacted_prompt_text_is_named_in_the_notice_bar(self):
+        """"<REDACTED>" from OTel must not pass for --no-prompt-text."""
+        self.con.execute("UPDATE prompts SET text = ? WHERE prompt_id = 'p1'",
+                         (db.REDACTED_PROMPT,))
+        self.con.commit()
+        joined = " ".join(Payload._payload(self)["notices"])
+        self.assertIn("1 prompt(s) show", joined)
+        self.assertIn("OTEL_LOG_USER_PROMPTS", joined)
 
     def test_no_cap_notice_when_nothing_was_cut(self):
         p = Payload._payload(self, conversations_n=500)
@@ -1157,7 +1175,7 @@ class Digest(Fixture):
             return res, f.read()
 
     def test_week_over_week(self):
-        res, page = self._run(datetime(2026, 5, 14, 3, 0, tzinfo=UTC))
+        res, page = self._run(WED)
         self.assertEqual(res["prompts"], 2, "this week's prompts only")
         self.assertIn("on last week", page)
         self.assertIn("Cache hit", page)
@@ -1170,14 +1188,13 @@ class Digest(Fixture):
         self.assertGreater(res["cost"], 0)
 
     def test_prompt_text_is_escaped_in_the_digest(self):
-        _, page = self._run(datetime(2026, 5, 14, 3, 0, tzinfo=UTC))
+        _, page = self._run(WED)
         self.assertIn("&lt;script&gt;", page)
         self.assertNotIn("<script", page.lower())
 
     def test_existing_digests_are_never_overwritten(self):
-        now = datetime(2026, 5, 14, 3, 0, tzinfo=UTC)
-        first, _ = self._run(now)
-        second, _ = self._run(now)
+        first, _ = self._run(WED)
+        second, _ = self._run(WED)
         self.assertNotEqual(first["digest"], second["digest"])
         self.assertTrue(os.path.exists(first["digest"]))
 
@@ -1197,6 +1214,314 @@ class SinceBound(Fixture):
         self.assertNotIn("p0", by_id)
         all_ids, _, _ = self.collect()
         self.assertIn("p0", all_ids)
+
+
+class RedactionSweep(Fixture):
+    """--no-prompt-text has to withhold what an earlier build already wrote.
+
+    Pages from an unredacted build, the titles Claude Desktop gives a session
+    (a summary of the conversation) and the links on index.html all say what
+    was typed; clearing the prompt text alone left every one of them behind.
+    """
+    TITLE = "Secret plan to gut the billing module"
+
+    def setUp(self):
+        super().setUp()
+        db.set_session_title(self.con, "sess-a", self.TITLE)
+        self.con.commit()
+        self.cfg = os.path.join(self.tmp, "cfg")
+        os.makedirs(os.path.join(self.cfg, "usage-data"))
+        with open(os.path.join(self.cfg, "usage-data", "report.html"), "w",
+                  encoding="utf-8") as f:
+            f.write("<html></html>")
+        self._saved_env = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = self.cfg
+        self._saved = (bd.OUTPUT, report_index.OUTPUT, report_index.BASE,
+                       report_index.REPORTS)
+        bd.OUTPUT = os.path.join(self.tmp, "dashboard.html")
+        report_index.OUTPUT = os.path.join(self.tmp, "index.html")
+        report_index.BASE = self.tmp
+        report_index.REPORTS = os.path.join(self.tmp, "reports")
+
+    def tearDown(self):
+        (bd.OUTPUT, report_index.OUTPUT, report_index.BASE,
+         report_index.REPORTS) = self._saved
+        if self._saved_env is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = self._saved_env
+        super().tearDown()
+
+    def _build(self, **kw):
+        bd.build(self.con, check_receiver=False, **kw)
+        with open(bd.OUTPUT, encoding="utf-8") as f:
+            html = f.read()
+        with open(report_index.OUTPUT, encoding="utf-8") as f:
+            return html, f.read()
+
+    def test_titles_are_withheld_from_rows_and_sessions(self):
+        html, _ = self._build()
+        self.assertIn(self.TITLE, html, "sanity: an ordinary build shows it")
+        html, _ = self._build(redact=True)
+        self.assertNotIn("Secret plan", html)
+
+    def test_session_title_is_blank_in_the_session_rows(self):
+        _, rows, _ = self.collect()
+        self.assertEqual(
+            {s["id"]: s["title"] for s in bd.session_rows(rows)}["sess-a"],
+            self.TITLE)
+        for s in bd.session_rows(rows, redact=True):
+            self.assertIsNone(s["title"])
+
+    def test_pages_from_an_earlier_build_are_removed(self):
+        _, idx = self._build(conversations_n=50)
+        folder = os.path.join(self.tmp, "conversations")
+        self.assertTrue(os.path.exists(os.path.join(folder, "p1.html")))
+        self.assertIn("conversations/index.html", idx)
+        self.assertIn("file:", idx, "the /insights link is there to be withheld")
+        _, idx = self._build(redact=True, conversations_n=50)
+        self.assertFalse(os.path.exists(os.path.join(folder, "p1.html")))
+        self.assertFalse(os.path.exists(os.path.join(folder, "index.html")))
+        self.assertNotIn("conversations/", idx)
+        self.assertNotIn("file:", idx)
+        self.assertIn("dashboard.html", idx)
+
+    def test_only_pages_this_tool_wrote_are_removed(self):
+        self._build(conversations_n=50)
+        folder = os.path.join(self.tmp, "conversations")
+        notes = os.path.join(folder, "notes.txt")
+        mine = os.path.join(folder, "my-own-page.html")
+        for path, text in ((notes, "keep"), (mine, "<html>not generated</html>")):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        self._build(redact=True)
+        self.assertTrue(os.path.exists(notes))
+        self.assertTrue(os.path.exists(mine))
+        self.assertFalse(os.path.exists(os.path.join(folder, "p1.html")))
+
+
+class RepricedModelCosts(Fixture):
+    """A CLI session total scales the whole row, per-model costs included."""
+
+    def test_model_costs_still_add_up_to_the_row(self):
+        db.set_run_cost(self.con, "sess-a", 7.0, 1, "test")
+        self.con.commit()
+        by_id, _, _ = self.collect()
+        r = by_id["p1"]
+        self.assertEqual(bd.REPRICED["rows"], 1)
+        self.assertAlmostEqual(r["cost"], 7.0, places=3)
+        self.assertTrue(r["est"], "a share of the session total is an estimate")
+        self.assertAlmostEqual(sum(m["cost"] for m in r["models"]), r["cost"],
+                               places=3)
+        self.assertAlmostEqual(sum(r["comp"]), r["cost"], places=3)
+
+    def test_blocks_follow_the_repricing_and_say_they_are_estimates(self):
+        now = T0 + timedelta(hours=2)
+        plain, _ = bd.compute_blocks(self.con, now=now, days=365)
+        scaled, _ = bd.compute_blocks(self.con, now=now, days=365,
+                                      factors={"sess-a": 2.0})
+        a = sum(r["cost"] for r in self.collect()[1] if r["session"] == "sess-a")
+        self.assertAlmostEqual(scaled[-1]["cost"] - plain[-1]["cost"], a,
+                               places=3)
+        self.assertTrue(scaled[-1]["est"])
+
+
+class CompositionMatchesTheTotal(Fixture):
+    def test_unsplit_cache_writes_use_the_providers_multiplier(self):
+        """comp used the 1h multiplier whatever the provider's was, so the
+        split drifted from the total and was only rescued by rescaling."""
+        saved = dict(pricing.UNSPLIT_CACHE_MULT)
+        pricing.UNSPLIT_CACHE_MULT[pricing.BEDROCK] = 1.25
+        try:
+            db.upsert_prompt(self.con, "pbd", "sess-bd", "proj4", ts(20),
+                             "bedrock", "jsonl", 0, None, "human")
+            db.insert_requests_jsonl(self.con, [request(
+                "bd1", "pbd", "sess-bd", ts(20), OPUS,
+                cache_create_tokens=1000000, provider=pricing.BEDROCK)])
+            self.con.commit()
+            by_id, _, _ = self.collect()
+            r = by_id["pbd"]
+            rate = pricing.resolve(OPUS, ts(20), pricing.BEDROCK)
+            want = bd.cache_write_cost(rate, 0, 0, 1000000, pricing.BEDROCK)
+            self.assertAlmostEqual(r["comp"][1], want, places=3)
+            self.assertAlmostEqual(r["cost"], want, places=3)
+        finally:
+            pricing.UNSPLIT_CACHE_MULT.clear()
+            pricing.UNSPLIT_CACHE_MULT.update(saved)
+
+
+class WindowAndBlockEstimates(Fixture):
+    NOW = T0 + timedelta(hours=2)
+
+    def _blocks(self):
+        return bd.compute_blocks(self.con, now=self.NOW, days=365)[0]
+
+    def test_an_estimated_block_says_so(self):
+        b = self._blocks()[-1]
+        self.assertTrue(b["est"])
+        self.assertEqual(b["unpriced"], 0)
+        w = bd.current_window(self._blocks(), now=self.NOW)
+        self.assertTrue(w["est"])
+        self.assertEqual(w["unpriced"], 0)
+
+    def test_a_block_of_cli_figures_is_exact(self):
+        db.insert_requests_jsonl(self.con, [request(
+            "exact1", "p9", "sess-x", ts(days=3), OPUS, input_tokens=10,
+            output_tokens=10, cost_usd=0.5)])
+        self.con.commit()
+        b = bd.compute_blocks(self.con, now=T0 + timedelta(days=3, hours=1),
+                              days=365)[0][-1]
+        self.assertFalse(b["est"])
+        self.assertEqual(b["unpriced"], 0)
+        self.assertAlmostEqual(b["cost"], 0.5)
+
+    def test_unpriced_requests_are_counted_not_hidden(self):
+        db.insert_requests_jsonl(self.con, [
+            request("u1", "p9", "sess-x", ts(days=3), "mystery-model",
+                    input_tokens=100, output_tokens=10),
+            request("u2", "p9", "sess-x", ts(1, days=3), "mystery-model",
+                    input_tokens=100, output_tokens=10),
+            # a placeholder with no tokens is not a model that billed anything
+            request("u3", "p9", "sess-x", ts(2, days=3), "<synthetic>"),
+            # a CLI-reported figure is a cost, whatever the model is called
+            request("u4", "p9", "sess-x", ts(3, days=3), "mystery-model",
+                    input_tokens=100, cost_usd=0.25),
+        ])
+        self.con.commit()
+        now = T0 + timedelta(days=3, hours=1)
+        blocks = bd.compute_blocks(self.con, now=now, days=365)[0]
+        b = blocks[-1]
+        self.assertEqual(b["unpriced"], 2)
+        self.assertTrue(b["est"])
+        w = bd.current_window(blocks, now=now)
+        self.assertEqual(w["unpriced"], 2)
+        self.assertEqual(w["requests"], 4)
+
+    def test_window_and_open_block_count_the_same_requests(self):
+        """The tile skipped requests with no prompt id; the block did not."""
+        db.insert_requests_jsonl(self.con, [
+            request("np1", None, "sess-a", ts(30), OPUS, output_tokens=777)])
+        self.con.commit()
+        blocks = self._blocks()
+        w = bd.current_window(blocks, now=self.NOW)
+        self.assertEqual(w["requests"], blocks[-1]["calls"])
+        self.assertEqual(w["requests"], 11)
+        self.assertEqual(w["out"], blocks[-1]["out"])
+        self.assertAlmostEqual(w["cost"], blocks[-1]["cost"], places=3)
+
+    def test_an_idle_window_is_none(self):
+        later = T0 + timedelta(days=2)
+        self.assertIsNone(bd.current_window(
+            bd.compute_blocks(self.con, now=later, days=365)[0], now=later))
+
+    def test_the_payload_carries_the_new_fields(self):
+        blocks = self._blocks()
+        enc = bd.compact_table(
+            [dict(b, start=b["start"].isoformat(), end=b["end"].isoformat(),
+                  models=sorted(b["models"])) for b in blocks],
+            bd.BLOCK_COLUMNS, bd.Strings(), list_str_cols=("models",))
+        self.assertEqual(enc["cols"]["est"], [1] * len(blocks))
+        self.assertEqual(enc["cols"]["unpriced"], [0] * len(blocks))
+
+
+class PageRefresh(Fixture):
+    def _write(self):
+        _, rows, _ = self.collect()
+        return conversations.write_pages(self.con, self.tmp, rows,
+                                         limit=10), rows
+
+    def test_a_cost_change_rewrites_a_page_whose_transcript_did_not_move(self):
+        self._write()
+        again, _ = self._write()
+        self.assertEqual(again["written"], 0, "nothing changed, nothing written")
+        # A late OTel row, a corrected rate: the cost moves, the transcript does not.
+        self.con.execute(
+            "UPDATE api_requests SET cost_usd = 9.99 WHERE request_id = 'r6'")
+        self.con.commit()
+        third, rows = self._write()
+        self.assertEqual(third["written"], 1)
+        with open(os.path.join(self.tmp, "conversations", "p1.html"),
+                  encoding="utf-8") as f:
+            page = f.read()
+        row = next(r for r in rows if r["id"] == "p1")
+        self.assertIn(conversations.fmt_cost(row["cost"], row["est"]), page)
+        fourth, _ = self._write()
+        self.assertEqual(fourth["written"], 0)
+
+    def test_a_page_without_a_fingerprint_is_rewritten_once(self):
+        self._write()
+        page = os.path.join(self.tmp, "conversations", "p1.html")
+        with open(page, encoding="utf-8") as f:
+            text = f.read()
+        with open(page, "w", encoding="utf-8") as f:
+            f.write(conversations.FINGERPRINT_RE.sub("", text))
+        again, _ = self._write()
+        self.assertEqual(again["written"], 1)
+
+
+class DigestWeek(Fixture):
+    """The digest covers one whole ISO week, whatever day it is run."""
+    _run = Digest._run
+
+    def test_the_window_ends_on_the_most_recent_monday(self):
+        mon = datetime(2026, 5, 18, tzinfo=UTC)
+        for day in range(7):       # Monday through Sunday
+            now = datetime(2026, 5, 18 + day, 15, 30, tzinfo=UTC)
+            start, end = digest.week_bounds(now)
+            self.assertEqual(end, mon)
+            self.assertEqual(start, mon - timedelta(days=7))
+            self.assertEqual(tuple(start.isocalendar())[:2], (2026, 20))
+        self.assertEqual(digest.week_bounds(WED)[1], mon)
+
+    def test_label_filename_and_contents_agree(self):
+        """On a Wednesday the old window ran Wed-Tue, across two ISO weeks."""
+        db.upsert_prompt(self.con, "pnext", "sess-b", "proj2", ts(0, days=6),
+                         "this week, not last", "jsonl", 0, None, "human")
+        db.insert_requests_jsonl(self.con, [request(
+            "nx1", "pnext", "sess-b", ts(0, days=6), OPUS, output_tokens=50)])
+        self.con.commit()
+        res, page = self._run(WED)
+        self.assertIn("digest-2026-W20", os.path.basename(res["digest"]))
+        self.assertIn("2026-05-11", page)
+        self.assertIn("2026-05-17", page)
+        self.assertEqual(res["prompts"], 2, "p1 and p3; pnext is on the 18th")
+        self.assertNotIn("this week, not last", page)
+
+    def test_api_errors_are_counted_in_the_week_only(self):
+        db.insert_requests_jsonl(self.con, [
+            request("e1", "p1", "sess-a", ts(5), OPUS, error="overloaded"),
+            request("e2", "p1", "sess-a", ts(6), OPUS, error="overloaded"),
+            # the previous week, and the one before it: inside collect()'s
+            # prefilter margin or outside it, neither is this week's figure
+            request("e3", "p0", "sess-c", ts(0, days=-6), OPUS, error="x"),
+            request("e4", "p0", "sess-c", ts(0, days=-12), OPUS, error="x"),
+            # the week after
+            request("e5", "p1", "sess-a", ts(0, days=7), OPUS, error="x"),
+        ])
+        self.con.commit()
+        _, page = self._run(WED)
+        self.assertIn("2 API errors", page)
+
+    def test_tool_errors_until_is_exclusive(self):
+        everything = bd.tool_errors(self.con)
+        early = bd.tool_errors(self.con, until=ts(1))
+        # the fixture's four tool calls plus its four Skill calls
+        self.assertEqual(sum(t[1] for t in everything["tools"]), 8)
+        self.assertEqual(sum(t[1] for t in early["tools"]), 1)
+
+
+class ReceiverPort(unittest.TestCase):
+    def test_port_overrides_the_default_address(self):
+        import socket
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        try:
+            port = srv.getsockname()[1]
+            self.assertTrue(bd.receiver_running(port=port))
+        finally:
+            srv.close()
+        self.assertFalse(bd.receiver_running(port=port))
 
 
 if __name__ == "__main__":

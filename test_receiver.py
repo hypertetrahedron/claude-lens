@@ -14,6 +14,8 @@ import json
 import logging
 import os
 import shutil
+import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -520,6 +522,14 @@ class SessionEndHook(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(proc.stdout, "")
 
+    def test_bad_arguments_still_exit_zero(self):
+        """argparse raises SystemExit(2), which `except Exception` misses."""
+        proc = subprocess.run(
+            [sys.executable, HOOK, "--db", self.db, "--no-such-flag"],
+            input="{}", capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "")
+
     def test_garbage_stdin_still_exits_zero(self):
         proc = subprocess.run(
             [sys.executable, HOOK, "--db", self.db, "--no-build"],
@@ -676,6 +686,200 @@ class HttpSurface(unittest.TestCase):
             conn.close()
         self.assertEqual(status, 413)
         self.assertEqual(self.count(), 0)
+
+    def test_a_chunked_body_is_decoded_and_ingested(self):
+        """No Content-Length at all: it used to be read as an empty body."""
+        body = self.payload()
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.request("POST", "/v1/logs",
+                         body=iter([body[:50], body[50:200], body[200:]]),
+                         headers={"Content-Type": "application/json"},
+                         encode_chunked=True)
+            resp = conn.getresponse()
+            status = resp.status
+            resp.read()
+        finally:
+            conn.close()
+        self.assertEqual(status, 200)
+        self.assertEqual(self.count(), 1)
+
+    def test_a_chunked_body_past_the_cap_is_rejected(self):
+        old = receiver.MAX_BODY_BYTES
+        receiver.MAX_BODY_BYTES = 100
+        self.addCleanup(setattr, receiver, "MAX_BODY_BYTES", old)
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.request("POST", "/v1/logs", body=iter([b"x" * 60, b"x" * 60]),
+                         headers={"Content-Type": "application/json"},
+                         encode_chunked=True)
+            resp = conn.getresponse()
+            status = resp.status
+            resp.read()
+        finally:
+            conn.close()
+        self.assertEqual(status, 413)
+
+    def test_a_failed_batch_leaves_no_transaction_open(self):
+        """_con is shared: a half batch must be rolled back, not left for the
+        next good POST to commit while its own sender was told 500."""
+        recs = [record("claude_code.api_request",
+                       dict(ApiRequest.ATTRS, request_id="req_half_%d" % i))
+                for i in range(2)]
+        body = json.dumps(
+            {"resourceLogs": [{"scopeLogs": [{"logRecords": recs}]}]}
+        ).encode("utf-8")
+        real = receiver.handle_record
+        calls = []
+
+        def flaky(con, rec):
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError("second record exploded")
+            return real(con, rec)
+
+        receiver.handle_record = flaky
+        self.addCleanup(setattr, receiver, "handle_record", real)
+        status, _ = self.post("/v1/logs", body)
+        self.assertEqual(status, 500)
+        self.assertFalse(receiver._con.in_transaction)
+        self.assertEqual(self.count(), 0)
+        # Another connection can take the write lock straight away.
+        path = os.path.join(self.dir, "metrics.db")
+        other = sqlite3.connect(path, timeout=0.5)
+        try:
+            other.execute("BEGIN IMMEDIATE")
+            other.rollback()
+        finally:
+            other.close()
+        # ... and the next good POST carries only its own record.
+        receiver.handle_record = real
+        status, _ = self.post("/v1/logs", self.payload())
+        self.assertEqual(status, 200)
+        self.assertEqual(self.count(), 1)
+
+
+class OriginLogging(unittest.TestCase):
+    """A page retrying fetch() must not be able to bury the real errors."""
+
+    def setUp(self):
+        self._saved = (receiver._origin_last, receiver._origin_skipped)
+        receiver._origin_last, receiver._origin_skipped = None, 0
+        self.addCleanup(lambda: setattr(receiver, "_origin_last",
+                                        self._saved[0]))
+        self.addCleanup(lambda: setattr(receiver, "_origin_skipped",
+                                        self._saved[1]))
+
+    def test_a_flood_is_logged_once_then_summarised(self):
+        with self.assertLogs("receiver", level="WARNING") as cm:
+            for _ in range(50):
+                receiver._warn_origin("/v1/logs", "http://evil.example")
+            self.assertEqual(len(cm.records), 1)
+            # Close the window, as a minute going by would.
+            receiver._origin_last -= receiver.ORIGIN_LOG_EVERY + 1
+            receiver._warn_origin("/v1/logs", "http://evil.example")
+        self.assertEqual(len(cm.records), 2)
+        self.assertIn("49 more", cm.records[1].getMessage())
+
+
+class StartupLogging(unittest.TestCase):
+    """Under pythonw stderr goes nowhere, so the log is the only witness."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="lens-receiver-start-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self._hooks = (sys.excepthook, threading.excepthook)
+        self.addCleanup(lambda: (setattr(sys, "excepthook", self._hooks[0]),
+                                 setattr(threading, "excepthook",
+                                         self._hooks[1])))
+        self._con = receiver._con
+        self.addCleanup(setattr, receiver, "_con", self._con)
+
+    def test_a_port_already_taken_is_logged_and_exits_nonzero(self):
+        blocker = socket.socket()
+        self.addCleanup(blocker.close)
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        port = blocker.getsockname()[1]
+        with self.assertLogs("receiver", level="INFO") as cm:
+            with self.assertRaises(SystemExit) as ctx:
+                receiver.main(["--port", str(port), "--db",
+                               os.path.join(self.dir, "metrics.db")])
+        self.assertEqual(ctx.exception.code, 1)
+        text = "\n".join(cm.output)
+        self.assertIn("receiver starting", text)
+        self.assertIn("failed to start", text)
+        if receiver._con is not None and receiver._con is not self._con:
+            receiver._con.close()
+
+    def test_a_database_that_will_not_open_is_logged(self):
+        real = db.connect
+
+        def boom(*a, **kw):
+            raise RuntimeError("migration exploded")
+        db.connect = boom
+        self.addCleanup(setattr, db, "connect", real)
+        with self.assertLogs("receiver", level="INFO") as cm:
+            with self.assertRaises(SystemExit):
+                receiver.main(["--port", "0", "--db",
+                               os.path.join(self.dir, "metrics.db")])
+        self.assertIn("migration exploded", "\n".join(cm.output))
+
+    def test_uncaught_exceptions_reach_the_log(self):
+        with self.assertLogs("receiver", level="ERROR") as cm:
+            receiver._log_uncaught(ValueError, ValueError("main thread"), None)
+            receiver._log_thread_uncaught(threading.ExceptHookArgs(
+                (RuntimeError, RuntimeError("worker"), None, None)))
+        text = "\n".join(cm.output)
+        self.assertIn("main thread", text)
+        self.assertIn("worker", text)
+
+
+class MaintenanceLoop(unittest.TestCase):
+    """One tick at a time: time.sleep is the loop's only exit."""
+
+    class _Done(Exception):
+        pass
+
+    def run_ticks(self, ticks, reconcile):
+        from unittest import mock
+        sleeps = []
+
+        def fake_sleep(_):
+            sleeps.append(1)
+            if len(sleeps) >= ticks:
+                raise self._Done()
+
+        builds = []
+        with mock.patch.object(receiver, "reconcile", reconcile), \
+                mock.patch.object(receiver, "code_is_stale", lambda: False), \
+                mock.patch.object(receiver, "_con", object()), \
+                mock.patch.object(receiver, "data_fingerprint",
+                                  lambda con: (1,)), \
+                mock.patch.object(receiver.db, "connect",
+                                  lambda *a, **kw: mock.MagicMock()), \
+                mock.patch.object(receiver.build_dashboard, "build",
+                                  lambda *a, **kw: builds.append(1)), \
+                mock.patch.object(receiver.time, "sleep", fake_sleep), \
+                self.assertLogs("receiver", level="INFO"):
+            with self.assertRaises(self._Done):
+                receiver.maintenance_loop("unused.db")
+        return builds
+
+    def test_a_failing_reconcile_does_not_block_the_rebuild(self):
+        def boom(*a, **kw):
+            raise RuntimeError("ssh hung")
+        builds = self.run_ticks(1, boom)
+        self.assertEqual(builds, [1])
+
+    def test_a_failing_reconcile_is_not_retried_every_tick(self):
+        calls = []
+
+        def boom(*a, **kw):
+            calls.append(1)
+            raise RuntimeError("ssh hung")
+        self.run_ticks(4, boom)
+        self.assertEqual(len(calls), 1)
 
 
 class CliFlags(unittest.TestCase):

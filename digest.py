@@ -1,4 +1,4 @@
-"""Weekly digest: a static snapshot report for the last 7 full days (UTC).
+"""Weekly digest: a static snapshot report for the last full ISO week (UTC).
 
 Each digest is written to reports/digest-<YYYY>-W<week>.html; if that name is
 already taken (re-run, manual run) a -HHMMSS suffix is added so an existing
@@ -133,12 +133,25 @@ def table(headers, rows, num_cols):
     return f"<table><tr>{h}</tr>{body}</table>"
 
 
+def week_bounds(now):
+    """(start, end) of the last complete ISO week before `now`, in UTC.
+
+    `end` is the most recent Monday 00:00 (today's, when it is Monday), `start`
+    is seven days before it. Ending on "today 00:00" instead made the window
+    the last seven days, which on any day but Monday spans two ISO weeks while
+    the file and the heading name only one of them.
+    """
+    midnight = now.astimezone(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    end = midnight - timedelta(days=midnight.weekday())
+    return end - timedelta(days=7), end
+
+
 def build_digest(now=None, db_path=None):
     now = now or datetime.now(timezone.utc)
-    end = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    start = end - timedelta(days=7)
+    start, end = week_bounds(now)
     prev_start = start - timedelta(days=7)
-    iso = (end - timedelta(days=1)).isocalendar()
+    iso = start.isocalendar()
     base_name = f"digest-{iso.year}-W{iso.week:02d}"
 
     resolved = db.resolve_path(db_path)
@@ -146,8 +159,11 @@ def build_digest(now=None, db_path=None):
     since = (prev_start - timedelta(days=COLLECT_MARGIN_DAYS)).isoformat()
     all_rows, _ = build_dashboard.collect(con, since=since)
     extras = dict(build_dashboard.EXTRAS)
-    con.close()
     lo, hi = start.isoformat(), end.isoformat()
+    # collect()'s own error count runs from `since`, which sits a fortnight and
+    # a margin back, so it would report the API errors of three weeks as one.
+    week_errors = build_dashboard.tool_errors(con, since=lo, until=hi)
+    con.close()
     plo = prev_start.isoformat()
     rows = [r for r in all_rows if r["ts"] and lo <= r["ts"] < hi]
     prev_rows = [r for r in all_rows if r["ts"] and plo <= r["ts"] < lo]
@@ -231,7 +247,7 @@ def build_digest(now=None, db_path=None):
     tool_errors = sum(r.get("errors", 0) for r in rows)
     tool_calls = sum(n for r in rows for _, n in r["tools"])
     truncations = sum(r.get("max_tokens_stops", 0) for r in rows)
-    api_errors = (extras.get("errors") or {}).get("api", 0)
+    api_errors = week_errors["api"]
 
     tiles = "".join(
         "<div class='tile'><div class='l'>{l}</div><div class='v'>{v}</div>"
@@ -265,7 +281,7 @@ def build_digest(now=None, db_path=None):
         basis_note = "Costs are the figures the CLI reported."
 
     cache_rows = [
-        ["Cache reads", fmt(cr), "billed at a tenth of the input rate"],
+        ["Cache reads", fmt(cr), "billed at a fraction of the input rate"],
         ["Cache writes", fmt(cw),
          f"{fmt(prev_cw)} last week" if prev_rows else "no prior week"],
         ["Uncached input", fmt(uncached), "paid in full"],
@@ -344,7 +360,7 @@ def rebuild_index():
 
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
-        description="Write a weekly digest for the last 7 full UTC days.")
+        description="Write a weekly digest for the last full ISO week (UTC).")
     ap.add_argument("--db", metavar="PATH", default=None,
                     help="metrics database to read (default: $CLAUDE_LENS_DB, "
                          "the \"db\" key in sources.json, then metrics.db)")

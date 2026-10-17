@@ -9,14 +9,21 @@ Serves two roles:
 
 Validated schema facts (checked against real transcripts, not assumed):
 - Real user prompts: type=="user" with origin.kind=="human"; carry promptId.
-  Other origin kinds seen: "task-notification", "coordinator".
+  Other origin kinds seen: "task-notification", "coordinator", and "peer" -
+  a message from another Claude session, which is how a session started by
+  another agent begins. Peer turns are isMeta and open with "Another Claude
+  session sent a message:".
 - Assistant entries in main files have no promptId -> attribute sequentially
-  to the last human prompt above them.
+  to the last human prompt above them, or, before any human prompt, to the
+  last prompt of any kind (which is what OTel's prompt.id does).
 - One API request spans multiple JSONL lines (one per content block) sharing
   requestId; the LAST one carries the complete usage, so a re-parse may raise
   an existing row's figures but never lower them.
 - Subagent transcripts live in <proj>/<sessionId>/subagents/agent-<agentId>
   .jsonl and carry the parent prompt's promptId (often a task-notification's).
+  An older CLI wrote them as <proj>/agent-<agentId>.jsonl beside the main
+  transcripts, so they are recognised by shape too, and take their session
+  from the entries' sessionId rather than from the path.
 - Per-request detail: `effort` is top-level on the entry; `speed`,
   `service_tier`, `inference_geo`, `output_tokens_details.thinking_tokens`
   and `server_tool_use.*` live in message.usage; `stop_reason` in message.
@@ -58,6 +65,16 @@ PROJECTS_ROOT = os.path.join(sources.primary_dir(), "projects")
 # caused it.
 HUMAN_ORIGINS = frozenset({"human"})
 
+# origin.kind values that prove a file was written by a CLI that marks human
+# prompts, so a file holding one is read as modern even when no person ever
+# typed in it. A session started by another agent runs on "peer" turns and
+# may never see a human prompt; read as legacy, its origin-less user entries
+# (command output, interruption notices) were candidates for "human prompt"
+# by shape. Every real file carrying a peer marker also marks its human
+# prompts. task-notification is deliberately absent: older files carried it
+# on notifications while their prompts had no marker at all.
+MODERN_ORIGINS = HUMAN_ORIGINS | frozenset({"peer"})
+
 # promptSource values the harness uses for turns it generated itself.
 SYSTEM_PROMPT_SOURCES = frozenset({"system"})
 
@@ -96,7 +113,11 @@ IDE_WRAPPERS = ("<ide_", "<system-reminder>")
 # so both sources spell the same thing the same way.
 KNOWN_KINDS = frozenset({"human", "task-notification", "coordinator", "loop",
                          "scheduled", "team", "command", "other"})
+# "peer" is another Claude session messaging this one. Its text opens with
+# "Another Claude session sent a message:", which KIND_PREFIXES below already
+# calls "team", so the origin marker and the text agree on one spelling.
 ORIGIN_KIND_ALIASES = {"teammate": "team", "teammate-message": "team",
+                       "peer": "team",
                        "cron": "scheduled", "schedule": "scheduled"}
 KIND_PREFIXES = (
     ("<task-notification>", "task-notification"),
@@ -326,7 +347,9 @@ def scan_header(path, default_session):
 
     Returns (session_id, legacy, cwd). `legacy` is True when no user entry in
     the file carries an origin marker, meaning human prompts have to be
-    recognised by shape instead (see is_human_prompt).
+    recognised by shape instead (see is_human_prompt). A "peer" marker counts
+    as well as a human one (see MODERN_ORIGINS); a task-notification marker
+    does not.
 
     Only lines that could carry one of the three answers are decoded, and the
     scan stops as soon as all three are known - on a modern transcript that is
@@ -357,7 +380,7 @@ def scan_header(path, default_session):
                     cwd = e["cwd"]
                 if (want_o and e.get("type") == "user"
                         and isinstance(e.get("origin"), dict)
-                        and e["origin"].get("kind") in HUMAN_ORIGINS):
+                        and e["origin"].get("kind") in MODERN_ORIGINS):
                     legacy = False
                 if session is not None and cwd is not None and not legacy:
                     break
@@ -366,19 +389,36 @@ def scan_header(path, default_session):
     return session or default_session, legacy, cwd
 
 
-def first_prompt_id(path):
-    """The first promptId in a subagent transcript, without parsing the rest."""
+def subagent_header(path):
+    """(promptId, sessionId) of a subagent transcript: the first of each,
+    without parsing the rest.
+
+    The session has to come from the entries, not the path. The path only
+    names it in the current layout (<session>/subagents/agent-<id>.jsonl);
+    an older CLI wrote agent-<id>.jsonl straight into the project folder,
+    where the grandparent directory is `projects` and every such subagent was
+    filed under a session of that name.
+    """
+    pid = session = None
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
-                if '"promptId"' not in line:
+                want_p = pid is None and '"promptId"' in line
+                want_s = session is None and '"sessionId"' in line
+                if not (want_p or want_s):
                     continue
                 e = _loads(line)
-                if isinstance(e, dict) and e.get("promptId"):
-                    return e["promptId"]
+                if not isinstance(e, dict):
+                    continue
+                if want_p and e.get("promptId"):
+                    pid = e["promptId"]
+                if want_s and e.get("sessionId"):
+                    session = e["sessionId"]
+                if pid is not None and session is not None:
+                    break
     except OSError:
-        return None
-    return None
+        pass
+    return pid, session
 
 
 # canonical_model parses and re-assembles a model id; a transcript names the
@@ -481,10 +521,14 @@ def inline_agent(entry):
     Naming the agent keeps that work attributed to a subagent instead of
     silently inflating the main thread's own usage. Returns None for ordinary
     main-thread entries, which is what `agent=` already expects.
+
+    agentId comes first: a subagent line carries both, and attributionAgent is
+    the subagent *type* ("general-purpose"), which joins nothing. The id is
+    what `agents.agent_id` holds and what a subagents/ file is named after.
     """
     if not entry.get("isSidechain"):
         return None
-    for key in ("attributionAgent", "agentId"):
+    for key in ("agentId", "attributionAgent"):
         value = entry.get(key)
         if isinstance(value, str) and value:
             return value
@@ -953,10 +997,27 @@ def ingest_main_file(con, path, label="", project_override=None, fh_maps=None):
                       os.path.basename(os.path.dirname(path)))
     session, legacy, cwd = scan_header(
         path, os.path.splitext(os.path.basename(path))[0])
+    # A session has one project, but the folder a transcript sits in is named
+    # after the cwd as typed, and one session resumed through a mapped drive
+    # and through its UNC path lands in two folders. Prompts used to take the
+    # folder's name each, so the session's prompts were split across two
+    # projects. The session row is first-writer-wins already; the prompts now
+    # follow it, so whichever spelling was seen first names all of them.
+    known = con.execute("SELECT project FROM sessions WHERE session_id=?",
+                        (session,)).fetchone()
+    prompt_project = known[0] if known and known[0] else project
     rows = Rows()
     info = SessionInfo()
     switches = SwitchTracker(con, session)
     fh = None if fh_maps is None else fh_maps.setdefault(session, {})
+    # current_pid is the prompt usage is attributed to: the last human prompt,
+    # or - until the first one arrives - the last prompt of any kind. A
+    # session another agent started opens with "peer" turns and may never see
+    # a person at all; demanding a human prompt dropped every request in it
+    # (a thousand requests on the machine this was found on, and sessions
+    # with prompts but no usage at all). OTel's prompt.id works this way, so
+    # the two sources now agree. Once a human prompt exists nothing changes:
+    # injected turns still fold into it through canonical_id.
     current_pid = None
     last_human = None
     try:
@@ -992,7 +1053,8 @@ def ingest_main_file(con, path, label="", project_override=None, fh_maps=None):
                 if current_pid:
                     text = prompt_text(e.get("message") or {})
                     rows.prompts.append(
-                        (current_pid, session, project, e.get("timestamp"),
+                        (current_pid, session, prompt_project,
+                         e.get("timestamp"),
                          text, "jsonl", 0, None, "human"))
                     last_human = (current_pid, e.get("timestamp"))
                     _note_compaction(rows, e, session, current_pid, text)
@@ -1000,7 +1062,10 @@ def ingest_main_file(con, path, label="", project_override=None, fh_maps=None):
                 handle_assistant(rows, e, current_pid, session,
                                  agent=inline_agent(e), switches=switches)
             elif etype == "user":
-                record_injected_prompt(rows, e, session, project, last_human)
+                if (record_injected_prompt(rows, e, session, prompt_project,
+                                           last_human)
+                        and last_human is None):
+                    current_pid = e.get("promptId")
                 if current_pid:
                     handle_tool_result_blocks(rows, e)
                     # Both of the following start by demanding toolUseResult,
@@ -1045,11 +1110,17 @@ def agent_id_from_path(path):
 
 
 def ingest_subagent_file(con, path):
-    session = os.path.basename(os.path.dirname(os.path.dirname(path)))
     agent = agent_id_from_path(path)
-    pid = first_prompt_id(path)
+    pid, session = subagent_header(path)
     if not pid:
         return
+    if not session:
+        # No entry named its session. The current layout still says it in
+        # the path; the old flat one does not, and NULL is more honest than
+        # filing the work under the folder's name.
+        parent = os.path.dirname(os.path.abspath(path))
+        session = (os.path.basename(os.path.dirname(parent))
+                   if os.path.basename(parent) == "subagents" else None)
     rows = Rows()
     subagent_type = resolved = None
     try:
@@ -1085,14 +1156,22 @@ def is_subagent_transcript(path):
     """Main transcript or subagent transcript, by layout then by shape."""
     if os.sep + "subagents" + os.sep in path or "/subagents/" in path:
         return True
+    # The first conversational entry decides, not the first line: a file can
+    # open with a summary or snapshot entry that says nothing either way.
+    # Bounded, because a main transcript answers on its first user turn and
+    # this runs for every changed file in a tree.
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
-            first = f.readline()
+            for _, line in zip(range(20), f):
+                if '"isSidechain"' not in line:
+                    continue
+                entry = _loads(line)
+                if isinstance(entry, dict) and "isSidechain" in entry:
+                    return bool(entry.get("isSidechain")
+                                and entry.get("agentId"))
     except OSError:
-        return False
-    entry = _loads(first)
-    return bool(isinstance(entry, dict) and entry.get("isSidechain")
-                and entry.get("agentId"))
+        pass
+    return False
 
 
 def ingest_file(con, path, label="", project_override=None):
@@ -1126,7 +1205,12 @@ def ingest_tree(con, projects_dir, label="", force=False, project_override=None)
         if not force and not file_changed(con, path, st):
             continue
         try:
-            if os.sep + "subagents" + os.sep in path:
+            # By shape as well as by folder: an older CLI wrote subagent
+            # transcripts as agent-<id>.jsonl beside the main ones, and read
+            # as a main transcript such a file lost its requests (no human
+            # prompt) and took over its parent session's transcript_path,
+            # branch and version.
+            if is_subagent_transcript(path):
                 ingest_subagent_file(con, path)
             else:
                 ingest_main_file(con, path, label, project_override, fh_maps)

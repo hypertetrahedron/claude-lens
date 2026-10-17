@@ -134,11 +134,11 @@
   }
   .wrap { max-width: 1280px; margin: 0 auto; }
 
-  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px; margin-bottom: 16px; }
   header h1 { font-size: 20px; font-weight: 600; margin: 0; }
   header .sub { color: var(--text-muted); font-size: 12px; }
   header .spacer { flex: 1; }
-  #theme-btn {
+  #theme-btn, #tz-btn {
     background: var(--surface-1); color: var(--text-secondary);
     border: 1px solid var(--border); border-radius: 6px;
     padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer;
@@ -600,6 +600,7 @@
     <span class="sub" id="generated-at"></span>
     <a class="sub" id="insights-link" href="#" target="_blank" rel="noopener" hidden>Claude Code's own insights report</a>
     <span class="spacer"></span>
+    <button id="tz-btn" type="button">UTC</button>
     <button id="theme-btn" type="button">Theme</button>
   </header>
 
@@ -893,6 +894,17 @@ const fmtC = (n) => {                       // compact: 12.9K / 4.2M
 };
 const fmtFull = (n) => n == null ? "–" : n.toLocaleString("en-US");
 const fmtCost = (c, est) => (est ? "~$" : "$") + (c >= 100 ? c.toFixed(0) : c >= 1 ? c.toFixed(2) : c.toFixed(3));
+/* The window and each billing block say whether their cost is estimated and
+   how many requests were on a model with no price. A payload that predates
+   the fields says neither, which is read as estimated: absence of a claim
+   to precision is not one. Unpriced requests are counted as $0 on purpose, so
+   the number of them is stated wherever the cost is. The blocks table is
+   column-encoded, so its flag arrives as 1/0 rather than true/false: only a
+   missing flag defaults to estimated, and 0 is a real "measured". */
+const isEst = (x) => x.est == null ? true : !!x.est;
+const unpricedNote = (n) => n > 0
+  ? fmtFull(n) + " request" + (n === 1 ? "" : "s") + " on unpriced models counted as $0"
+  : "";
 const fmtDur = (s) => {
   if (s == null) return "–";
   if (s < 60) return s + "s";
@@ -905,7 +917,44 @@ const el = (tag, cls, text) => {
   if (text != null) e.textContent = text;   // textContent only — data is untrusted
   return e;
 };
-const dayOf = (iso) => iso ? iso.slice(0, 10) : "";
+/* Times are shown in one zone, chosen by the viewer: UTC, or this browser's
+   own. Every timestamp on the page and every day boundary - the daily
+   buckets, the calendar, the range cutoffs, the session timeline - goes
+   through these, so a prompt at 23:30 sits on the day its own row says it
+   happened. It used to be both at once: the table and the day buckets were
+   UTC while "Today" began at local midnight and the timeline spoke local
+   time. The payload stays UTC and is never rewritten; CSV keeps the raw ISO
+   instants. A viewer preference like the theme, so "Remove all filters"
+   leaves it alone. */
+let tzLocal = (() => { try { return localStorage.getItem("ccu-tz") === "local"; } catch { return false; } })();
+const pad2 = (n) => String(n).padStart(2, "0");
+const toMs = (x) => typeof x === "number" ? x : Date.parse(x || "");
+// [year, month0, day, hour, minute] of an instant in the chosen zone
+const zoned = (ms) => {
+  const d = new Date(ms);
+  return tzLocal
+    ? [d.getFullYear(), d.getMonth(), d.getDate(), d.getHours(), d.getMinutes()]
+    : [d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), d.getUTCHours(), d.getUTCMinutes()];
+};
+// ISO string or epoch ms -> "YYYY-MM-DD", or "" when it does not parse
+const dayKey = (x) => {
+  const ms = toMs(x); if (isNaN(ms)) return "";
+  const [y, m, d] = zoned(ms);
+  return y + "-" + pad2(m + 1) + "-" + pad2(d);
+};
+const fmtHM = (x) => {
+  const ms = toMs(x); if (isNaN(ms)) return "";
+  const z = zoned(ms);
+  return pad2(z[3]) + ":" + pad2(z[4]);
+};
+// "YYYY-MM-DD HH:MM", the spelling every table and tooltip uses
+const fmtStamp = (x) => { const d = dayKey(x); return d ? d + " " + fmtHM(x) : ""; };
+const tzName = () => {
+  if (!tzLocal) return "UTC";
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "local"; }
+  catch { return "local"; }
+};
+const dayOf = dayKey;
 const fmtBytes = (n) => {
   n = n || 0;
   if (n >= 1e6) return (n / 1e6).toFixed(1) + " MB";
@@ -940,7 +989,14 @@ function setCapNotice(node, shown, total) {
 
 /* ---------- state & filters ---------- */
 // Filters persist across the 5-min auto-refresh reload.
-const saved = (() => { try { return JSON.parse(localStorage.getItem("ccu-state")) || {}; } catch { return {}; } })();
+// Anything that parses but is not an object ("5", "[]", "true") reads as no
+// saved state at all, so the field checks below can index it freely.
+const saved = (() => {
+  try {
+    const v = JSON.parse(localStorage.getItem("ccu-state"));
+    return v && typeof v === "object" && !Array.isArray(v) ? v : {};
+  } catch { return {}; }
+})();
 /* Claude products that can appear in one database. Rows carry `kind` from the
    ingester; older payloads have none, so they read as Claude Code. `prefix` is
    the source label the ingester puts on project names - redundant once the
@@ -958,6 +1014,12 @@ const DEFAULT_KIND = "code";
    `baseKind` is the product this particular payload defaults to: initFilters()
    settles it once the data says which products are present. */
 const DEFAULT_RANGE = 30;
+/* The values the range buttons carry (data-range), which is the whole
+   vocabulary state.range may take. A restored value outside it - 1e9 reaches
+   a Date and throws a RangeError on every load, "abc" selects All with no
+   button lit - falls back to the default. Keep in step with the markup; a
+   test in TemplateWiring does. */
+const RANGE_VALUES = [0, 1, 7, 30, 90, "mtd"];
 let baseKind = DEFAULT_KIND;
 const kindOf = r => r.kind || DEFAULT_KIND;
 const kindLabel = id =>
@@ -1007,13 +1069,14 @@ function sanitizeRf(v) {
   }
   return out;
 }
-const state = { range: saved.range ?? DEFAULT_RANGE, project: saved.project || "all",
-                kind: saved.kind || DEFAULT_KIND,
-                model: saved.model || "all",
+const state = { range: RANGE_VALUES.includes(saved.range) ? saved.range : DEFAULT_RANGE,
+                project: typeof saved.project === "string" && saved.project ? saved.project : "all",
+                kind: typeof saved.kind === "string" && saved.kind ? saved.kind : DEFAULT_KIND,
+                model: typeof saved.model === "string" && saved.model ? saved.model : "all",
                 q: typeof saved.q === "string" ? saved.q : "",
                 sort: typeof saved.sort === "string" ? saved.sort : "ts",
                 dir: saved.dir === 1 ? 1 : -1,
-                chart: saved.chart || "out", group: !!saved.group,
+                chart: typeof saved.chart === "string" && saved.chart ? saved.chart : "out", group: !!saved.group,
                 cols: saved.cols,
                 view: VIEWS.includes(saved.view) ? saved.view : "prompts",
                 session: typeof saved.session === "string" ? saved.session : null,
@@ -1134,7 +1197,14 @@ function initFilters() {
       if (o.hasAttribute("data-plan")) o.remove();
     if (state.chart.startsWith("plan")) state.chart = "out";
   }
-  if (!CHARTS[state.chart]) state.chart = "out";
+  // Blocks are a subscription rate-limit concept: the 5h tiles are hidden when
+  // traffic is not on a subscription, so the chart is not offered either.
+  if (DATA.subscription === false) {
+    for (const o of [...$("chart-sel").options])
+      if (o.value === "blocks") o.remove();
+    if (state.chart === "blocks") state.chart = "out";
+  }
+  if (!Object.prototype.hasOwnProperty.call(CHARTS, state.chart)) state.chart = "out";
   $("chart-sel").value = state.chart;
   $("chart-sel").addEventListener("change", e => {
     state.chart = e.target.value;
@@ -1395,15 +1465,18 @@ function rfPassSession(s) {
 /* Start of the selected period as an ISO instant, or "" for All. Shared so
    the account-wide plan charts use exactly the same window as the rows. */
 function rangeCutoff() {
-  if (state.range === "mtd") {
-    // calendar month to date, in the viewer's own timezone
-    const d = new Date(); d.setDate(1); d.setHours(0, 0, 0, 0);
+  // Midnight in the chosen zone, so "Today" is the day the buckets call today
+  const midnight = (mtd, back) => {
+    const d = new Date();
+    if (tzLocal) {
+      d.setDate(mtd ? 1 : d.getDate() - back); d.setHours(0, 0, 0, 0);
+    } else {
+      d.setUTCDate(mtd ? 1 : d.getUTCDate() - back); d.setUTCHours(0, 0, 0, 0);
+    }
     return d.toISOString();
-  }
-  if (state.range > 0) {
-    const d = new Date(); d.setDate(d.getDate() - (state.range - 1)); d.setHours(0, 0, 0, 0);
-    return d.toISOString();
-  }
+  };
+  if (state.range === "mtd") return midnight(true, 0);    // calendar month to date
+  if (state.range > 0) return midnight(false, state.range - 1);
   return "";
 }
 
@@ -1431,7 +1504,7 @@ const sessById = new Map(sessions.map(s => [s.id, s]));
    row, so they are not guaranteed to be the same ISO spelling the rows use.
    Comparing them as numbers costs one parse per session and cannot be wrong
    about a "+00:00" that a lexical compare would sort after a "Z". */
-const tsMs = (x) => { const v = Date.parse(x || ""); return isNaN(v) ? 0 : v; };
+const tsMs = (x) => { const v = toMs(x); return isNaN(v) ? 0 : v; };
 const lcSess = (s) => s._lc !== undefined ? s._lc
   : (s._lc = ((s.title || "") + " " + (s.first_prompt_text || "")).toLowerCase());
 const sessDur = (s) => Math.max(0, Math.round((tsMs(s.end) - tsMs(s.start)) / 1000));
@@ -1520,10 +1593,11 @@ function renderWindow() {
     return;
   }
   $("t-window").textContent = fmtC(w.out);
-  $("t-window").title = fmtFull(w.out) + " output tokens · " + w.requests + " requests";
-  const end = new Date(w.end);
-  $("t-window-h").textContent = "out tokens · " + fmtCost(w.cost, false) +
-    " · resets " + end.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const un = unpricedNote(w.unpriced || 0);
+  $("t-window").title = fmtFull(w.out) + " output tokens · " + w.requests + " requests" +
+    (un ? " · " + un : "");
+  $("t-window-h").textContent = "out tokens · " + fmtCost(w.cost, isEst(w)) +
+    " · resets " + fmtHM(w.end) + (un ? " · " + un : "");
 }
 
 /* ---------- daily bar chart ---------- */
@@ -1556,7 +1630,11 @@ const CHARTS = {
      resets the legend first, so a `draw` chart starts from the same blank
      slate a bar chart does. Add a chart by adding an entry here and an
      <option> with the same key. */
-  blocks:{ title: "Cost per 5-hour billing block", draw: drawBlocks },
+  // Blocks are built over all of the account's requests, so like the plan
+  // charts only the date range applies; the title says so rather than letting
+  // a project or model filter appear to have been honoured.
+  blocks:{ title: "Cost per 5-hour billing block (account-wide, date range only)",
+           draw: drawBlocks },
   heat:  { title: "Daily cost", draw: drawHeatmap },
   tools: { title: "Attributed tool cost (top 12)", draw: drawTools },
   skills:{ title: "Skill invocations (top 12)", draw: drawSkills },
@@ -1616,9 +1694,29 @@ const famSlot = (fam) => (FAMILIES.find(([n]) => n === fam) || [])[2] || "o";
    the filter state that produced them; the chart choice is deliberately not
    part of the key. */
 let dayCache = null, dayCacheKey = "";
+/* Plan gauges per day, peak of each. The payload carries hourly peaks keyed
+   by epoch hour so they can be folded into whichever zone's days the viewer
+   chose; `days` (UTC) is the fallback for a payload built before `hours`. In
+   a zone offset by a half hour, an hour that straddles midnight counts
+   toward the day it starts in. */
+let planDayCache = null, planDayTz = null;
+function planDays() {
+  const plan = DATA.plan || {};
+  if (!plan.hours) return plan.days || {};
+  if (planDayCache && planDayTz === tzLocal) return planDayCache;
+  const out = {};
+  for (const [h, [fh, sd]] of Object.entries(plan.hours)) {
+    const k = dayKey(+h * 1000);
+    const cur = out[k] || (out[k] = [0, 0]);
+    if (fh > cur[0]) cur[0] = fh;
+    if (sd > cur[1]) cur[1] = sd;
+  }
+  planDayCache = out; planDayTz = tzLocal;
+  return out;
+}
 const filterKey = () =>
   [state.range, state.kind, state.project, state.model, state.q,
-   state.session || "", JSON.stringify(state.rf)].join("\u0001");
+   state.session || "", JSON.stringify(state.rf), tzLocal].join("\u0001");
 
 function dayBuckets(rs) {
   const key = filterKey();
@@ -1653,7 +1751,8 @@ function dayBuckets(rs) {
 function renderChart(rs) {
   const wrap = $("chart-wrap");
   for (const n of [...wrap.children]) if (n.id !== "tooltip") n.remove();
-  const chart = CHARTS[state.chart] || CHARTS.out;
+  const chart = Object.prototype.hasOwnProperty.call(CHARTS, state.chart)
+    ? CHARTS[state.chart] : CHARTS.out;
   $("chart-title").textContent = chart.title;
   /* Clear the legend up front. Only stacked charts refill it, and the
      no-data path below returns early - without this, switching to a chart
@@ -1669,22 +1768,27 @@ function renderChart(rs) {
   let byDay = dayBuckets(rs);
   if (chart.plan != null) {
     byDay = new Map();
-    const from = (rangeCutoff() || "").slice(0, 10);
-    const src = (DATA.plan && DATA.plan.days) || {};
+    const from = dayKey(rangeCutoff());
+    const src = planDays();
     for (const day of Object.keys(src)) {
       if (!from || day >= from) byDay.set(day, { plan: src[day][chart.plan] });
     }
   }
   const days = [...byDay.keys()].sort();
   if (!days.length) return;
-  // contiguous day axis from first to last
+  /* Contiguous day axis, last day back to the first - or to the 400th, when
+     the data spans more. It is anchored at the newest day and walks
+     backwards: anchored at the oldest it ran out of room exactly where
+     today is, and a chart of a long history lost its most recent days
+     without a word. What was cut is said under the chart. */
+  const MAX_AXIS_DAYS = 400;
   const seq = [];
-  for (let d = new Date(days[0] + "T00:00:00Z"); ; d.setUTCDate(d.getUTCDate() + 1)) {
+  for (let d = new Date(days[days.length - 1] + "T00:00:00Z"); ; d.setUTCDate(d.getUTCDate() - 1)) {
     const key = d.toISOString().slice(0, 10);
-    seq.push(key);
-    if (key >= days[days.length - 1]) break;
-    if (seq.length > 400) break;
+    seq.unshift(key);
+    if (key <= days[0] || seq.length >= MAX_AXIS_DAYS) break;
   }
+  const cutDays = days.filter(k => k < seq[0]).length;
 
   const W = Math.max(wrap.clientWidth || 900, 320), H = 190;
   const padL = 46, padR = 8, padT = 8, padB = 26;
@@ -1860,6 +1964,14 @@ function renderChart(rs) {
   svg.addEventListener("pointerleave", () => { tt.style.display = "none"; svg.querySelectorAll(".bar.hot").forEach(x => x.classList.remove("hot")); });
   svg.addEventListener("focusin", e => { if (e.target.classList.contains("bar-hit")) show(e); });
   wrap.append(svg);
+  const notes = [];
+  if (cutDays)
+    notes.push("Showing the latest " + seq.length + " days; " + fmtFull(cutDays) +
+               " earlier day" + (cutDays === 1 ? "" : "s") + " not drawn. " +
+               "Pick a shorter range to see them.");
+  if (chart.plan != null && tzLocal && !(DATA.plan && DATA.plan.hours))
+    notes.push("Plan days are UTC in this build; the toggle does not move them.");
+  if (notes.length) wrap.append(el("div", "streak", notes.join(" ")));
 }
 
 /* ---------- shared SVG helpers ---------- */
@@ -1885,8 +1997,7 @@ const niceTop = (maxV) => {
   const pow = Math.pow(10, Math.floor(Math.log10(m)));
   return [1, 2, 5, 10].map(k => k * pow).find(v => v >= m);
 };
-const hhmm = (ms) => new Date(ms).toLocaleTimeString([],
-  { hour: "2-digit", minute: "2-digit" });
+const hhmm = fmtHM;
 
 /* The ironbow ramp as a scale rather than a rank. famSlot() maps a category
    to a fixed rung; this maps a magnitude to one, by quartiles of the non-zero
@@ -1939,11 +2050,11 @@ function drawBlocks(wrap) {
                                 rx: Math.min(4, barW / 2),
                                 class: "bar" + (b.active ? " blk-active" : ""),
                                 tabindex: 0 });
-    svgTip(bar, (b.start || "").slice(0, 16).replace("T", " ") + " to " +
-                (b.end || "").slice(11, 16) +
+    svgTip(bar, fmtStamp(b.start) + " to " + fmtHM(b.end) +
                 (b.active ? " (open)" : "") +
-                " | " + fmtCost(b.cost || 0, false) +
+                " | " + fmtCost(b.cost || 0, isEst(b)) +
                 " | " + fmtFull(b.calls) + " calls" +
+                (b.unpriced > 0 ? " | " + unpricedNote(b.unpriced) : "") +
                 " | " + fmtC(b.out) + " out, " + fmtC(b.inp) + " in" +
                 ((b.models || []).length
                   ? " | " + b.models.map(shortModel).join(", ") : ""));
@@ -1951,8 +2062,10 @@ function drawBlocks(wrap) {
     if (i % labelEvery === 0) {
       const t = svgEl("text", { x: padL + i * band + band / 2, y: H - 8,
                                 "text-anchor": "middle", class: "tick-label" });
-      t.textContent = (b.start || "").slice(5, 10) + " " +
-                      (b.start || "").slice(11, 13) + "h";
+      const st = fmtStamp(b.start);
+      // a half-hour zone starts blocks at :30, which "05h" would hide
+      t.textContent = st.slice(5, 10) + " " +
+        (st.slice(14, 16) === "00" ? st.slice(11, 13) + "h" : st.slice(11, 16));
       svg.append(t);
     }
   });
@@ -1962,11 +2075,12 @@ function drawBlocks(wrap) {
   if (open && DATA.burn) {
     note.append(
       document.createTextNode("Open block so far "),
-      el("b", null, fmtCost(open.cost || 0, false)),
+      el("b", null, fmtCost(open.cost || 0, isEst(open))),
       document.createTextNode(", projected "),
-      el("b", null, fmtCost(DATA.burn.projected_cost || 0, false)),
+      el("b", null, fmtCost(DATA.burn.projected_cost || 0, isEst(open))),
       document.createTextNode(" by close in " +
-        Math.round(DATA.burn.minutes_left) + " min."));
+        Math.round(DATA.burn.minutes_left) + " min." +
+        (open.unpriced > 0 ? " " + unpricedNote(open.unpriced) + "." : "")));
   } else {
     note.textContent = "A block opens with the first request after the " +
       "previous one closed and runs five hours. No block is open now.";
@@ -2064,20 +2178,20 @@ function drawNamedBars(wrap, totals, fmt, empty, whole) {
 const HEAT_WEEKS_ALL = 26;
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-/* The calendar is built in UTC, because dayBuckets' keys are the UTC date of
-   a row's timestamp. Drawing local weeks over UTC buckets would put a day's
-   cost in the wrong square for everyone west of Greenwich. */
+/* The calendar walks day keys, not instants: each square is a calendar date
+   held as a UTC midnight, so the UTC getters below are date arithmetic and
+   nothing more. Which zone a row's date belongs to was settled by dayKey()
+   when the buckets were made; "today" and the cutoff go through it too, or
+   the grid would end a day early or late against its own buckets. */
 function drawHeatmap(wrap, rs) {
   const byDay = dayBuckets(rs);
   const known = [...byDay.keys()].sort();
-  const utcMidnight = (d) => new Date(Date.UTC(
-    d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-  const today = utcMidnight(new Date());
-  const lastKnown = known.length
-    ? new Date(known[known.length - 1] + "T00:00:00Z") : null;
+  const asDate = (key) => new Date(key + "T00:00:00Z");
+  const today = asDate(dayKey(Date.now()));
+  const lastKnown = known.length ? asDate(known[known.length - 1]) : null;
   const end = lastKnown && lastKnown > today ? lastKnown : today;
   const cutoff = rangeCutoff();
-  const start = cutoff ? utcMidnight(new Date(cutoff)) : new Date(end);
+  const start = cutoff ? asDate(dayKey(cutoff)) : new Date(end);
   if (!cutoff) start.setUTCDate(start.getUTCDate() - (HEAT_WEEKS_ALL * 7 - 1));
   if (start > end) start.setTime(end.getTime());
   // pad back to the start of that week so every column is a full week
@@ -2406,9 +2520,11 @@ const fmtGap = (s) => s >= 86400 ? Math.round(s / 86400) + "d"
                     : s >= 3600 ? Math.round(s / 3600) + "h"
                     : Math.round(s / 60) + "m";
 // Epoch seconds, not the ISO day string dayOf() takes.
-const calDay = (t) => new Date(t * 1000).toDateString();
-const dayTime = (t) => new Date(t * 1000).toLocaleString([],
-  { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+const calDay = (t) => dayKey(t * 1000);
+const dayTime = (t) => {
+  const z = zoned(t * 1000);
+  return MONTHS[z[1]] + " " + z[2] + ", " + pad2(z[3]) + ":" + pad2(z[4]);
+};
 
 /* The three parts of a request's context - what was read from cache, what was
    uncached input, and what was written to cache - add up to the context total
@@ -3115,22 +3231,39 @@ function ctxLegend(points, spans, mode) {
    the cause lives. Indexing them by session and day once keeps the tile off
    the 200,000-point array on every keystroke. */
 let missIdx = null;
-function missCauseCounts(sids, fromDay) {
+/* Causes among the misses that belong to `rs`, the filtered rows. A miss is
+   attributed to the prompt it happened under - the latest row of its session
+   at or before it, the same boundary turnsFor() draws - and counted only when
+   that row is one of the rows shown. Tallying every miss in the rows' sessions
+   instead let a search, model or cost filter name a cause that none of the
+   misses the tile is counting actually had. The rows already carry the date
+   range, so a miss under an earlier prompt falls out with it. */
+function missCauseCounts(rs) {
   if (!missIdx) {
     missIdx = new Map();
     for (const p of (DATA.ctx || [])) {
       if (!p.miss) continue;
-      const day = new Date(p.t * 1000).toISOString().slice(0, 10);
       let a = missIdx.get(p.session);
       if (!a) missIdx.set(p.session, a = []);
-      a.push([day, p.cause || "unknown"]);
+      a.push([p.t, p.cause || "unknown"]);
+    }
+    for (const a of missIdx.values()) a.sort((x, y) => x[0] - y[0]);
+  }
+  const shown = new Set(rs);
+  const sids = new Set();
+  for (const r of rs) if (r.session) sids.add(r.session);
+  const counts = new Map();
+  for (const sid of sids) {
+    const misses = missIdx.get(sid);
+    if (!misses) continue;
+    const list = rowsForSession(sid);
+    let ri = 0;
+    for (const [t, c] of misses) {
+      while (ri + 1 < list.length && tsMs(list[ri + 1].ts) / 1000 <= t) ri++;
+      const owner = list.length && tsMs(list[ri].ts) / 1000 <= t ? list[ri] : null;
+      if (owner && shown.has(owner)) counts.set(c, (counts.get(c) || 0) + 1);
     }
   }
-  const counts = new Map();
-  for (const sid of sids)
-    for (const [day, c] of (missIdx.get(sid) || []))
-      if (!fromDay || day >= fromDay)
-        counts.set(c, (counts.get(c) || 0) + 1);
   return counts;
 }
 
@@ -3152,9 +3285,7 @@ function renderCacheTile(rs) {
     hint.textContent = "no cache misses";
     return;
   }
-  const sids = new Set();
-  for (const r of rs) if (r.session) sids.add(r.session);
-  const counts = missCauseCounts(sids, (rangeCutoff() || "").slice(0, 10));
+  const counts = missCauseCounts(rs);
   let topCause = null;
   for (const [c, n] of counts)
     if (!topCause || n > topCause[1] ||
@@ -3260,7 +3391,7 @@ const SESSCOLS = [
     cell: s => el("td", "muted proj", projLabel(s.project)) },
   { k: "start", label: "Start", val: s => tsMs(s.start),
     cell: s => { const td = el("td", null,
-                   (s.start || "").slice(0, 16).replace("T", " ") || "–");
+                   fmtStamp(s.start) || "–");
                  td.style.whiteSpace = "nowrap"; return td; } },
   { k: "dur", label: "Duration", num: true, val: sessDur,
     cell: s => numCell(fmtDur(sessDur(s))) },
@@ -3302,7 +3433,8 @@ const SESSCOLS = [
                            s.subagent_ttl + " time to live";
                  td.append(p); return td; } },
 ];
-const SESSCOL_BY_KEY = Object.fromEntries(SESSCOLS.map(c => [c.k, c]));
+const SESSCOL_BY_KEY = Object.assign(Object.create(null),
+                                     Object.fromEntries(SESSCOLS.map(c => [c.k, c])));
 /* Per-column pixel widths for the fixed table layout below - everything
    except "title" (the session name), which is the one column meant to take
    whatever space the others leave it. table-layout: fixed reads these from
@@ -3394,7 +3526,9 @@ function sessEl(s) {
 
 function renderSessions(ss) {
   renderSessHead();
-  if (sessCacheKey !== state.kind) { sessCache = new Map(); sessCacheKey = state.kind; }
+  // the zone is part of the key: a cached row holds its Start already formatted
+  const sk = state.kind + "|" + tzLocal;
+  if (sessCacheKey !== sk) { sessCache = new Map(); sessCacheKey = sk; }
   const col = SESSCOL_BY_KEY[state.ssort] || SESSCOL_BY_KEY.start;
   const dir = state.sdir;
   const sorted = [...ss].sort((a, b) => {
@@ -3503,14 +3637,19 @@ function toggleSessionDetail(tr, s) {
        it, so it is sized to the *visible* width instead and simply sits at
        the left of a cell that is wider than it. */
     const scroller = plot.closest(".tbl-scroll");
+    /* The cap set by the previous draw has to come off before measuring:
+       clientWidth is read through it, so left in place the chart could only
+       ever shrink on a resize, and a first measurement of 0 (a cell not laid
+       out yet) pinned it at nothing for good. */
+    plot.style.maxWidth = "";
     const w = Math.min(plot.clientWidth,
                        scroller ? scroller.clientWidth - 30 : Infinity);
     /* And the readout and legend are capped to the same width, or they wrap
        against the table's width and run off the right of the card - which is
        exactly the bug the chart itself was given this width to avoid. Capping
        the container is idempotent: the next draw measures the cap and gets
-       the same answer. */
-    plot.style.maxWidth = w + "px";
+       the same answer once the line above has lifted it. */
+    if (w > 0) plot.style.maxWidth = w + "px";
     const readout = el("div", "tl-readout");
     plot.replaceChildren(
       sessionTimelineSvg(points, spans, s.id, w, state.ctxAxis, readout),
@@ -3596,7 +3735,7 @@ function toggleSessionDetail(tr, s) {
   };
   addRow("Id", s.id);
   addRow("Effort", s.effort || "–");
-  addRow("Ended", (s.end || "").slice(0, 16).replace("T", " ") || "–");
+  addRow("Ended", fmtStamp(s.end) || "–");
   addRow("Output", fmtFull(s.out));
   secA.append(at);
   const show = el("button", "btn", "Show prompts");
@@ -3680,7 +3819,7 @@ const dash = (v, f) => v == null ? "–" : f(v);
    groupVal(list) renders the group-by-project subtotal (blank if absent). */
 const COLCAT = [
   { k: "ts", label: "Time", def: true, val: r => r.ts || "",
-    cell: r => { const t = el("td", null, r.ts ? r.ts.slice(0, 16).replace("T", " ") : "–"); t.style.whiteSpace = "nowrap"; return t; } },
+    cell: r => { const t = el("td", null, fmtStamp(r.ts) || "–"); t.style.whiteSpace = "nowrap"; return t; } },
   { k: "project", label: "Project", def: true, val: r => projLabel(r.project),
     cell: r => el("td", "muted proj", projLabel(r.project)) },
   { k: "title", label: "Session", val: r => r.title || "",
@@ -3836,7 +3975,10 @@ const COLCAT = [
       return td;
     } },
 ];
-const COL_BY_KEY = Object.fromEntries(COLCAT.map(c => [c.k, c]));
+/* Null-prototype, so a restored key like "constructor" is unknown rather than
+   resolving to Object's own member and passing the checks below. */
+const COL_BY_KEY = Object.assign(Object.create(null),
+                                 Object.fromEntries(COLCAT.map(c => [c.k, c])));
 const DEFAULT_COLS = COLCAT.filter(c => c.def).map(c => c.k);
 if (!Array.isArray(state.cols) || !state.cols.length ||
     !state.cols.every(k => COL_BY_KEY[k]))
@@ -3907,7 +4049,8 @@ function shortModel(m) {
    elements instead of building six thousand cells again. The fingerprint
    covers everything a cell reads, so a stale cell cannot be shown. */
 let rowCache = new Map(), rowCacheKey = null;
-const rowFingerprint = () => state.cols.join(",") + "|" + state.kind;
+// tzLocal: a cached row holds its Time already formatted in one zone
+const rowFingerprint = () => state.cols.join(",") + "|" + state.kind + "|" + tzLocal;
 /* Rendering thousands of <tr> nodes is cheap now that content-visibility
    (see the CSS) skips their layout until they scroll into view, so these
    bound memory and the initial DOM-build cost rather than layout - raised
@@ -4201,8 +4344,14 @@ function exportCsv() {
     const va = sortVal(a, state.sort), vb = sortVal(b, state.sort);
     return (va < vb ? -1 : va > vb ? 1 : 0) * state.dir;
   });
+  // One pass, applied to every cell exactly once: escaping a cell twice turns
+  // each quote into four and corrupts any prompt that contains one. A string
+  // that opens with = + - @ TAB or CR is a formula to a spreadsheet (prompt
+  // text is outside input: "=cmd|..." would run on open), so it gets a
+  // leading apostrophe; numbers are exempt, since a negative one must stay one.
   const esc = (v) => {
-    const s = String(v ?? "");
+    let s = String(v ?? "");
+    if (typeof v === "string" && /^[=+\-@\t\r]/.test(s)) s = "'" + s;
     return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
   };
   const head = ["time", "project", "prompt", "models", "api_calls",
@@ -4217,8 +4366,8 @@ function exportCsv() {
   const lines = [head.join(",")];
   for (const r of rs) {
     lines.push([
-      r.ts, esc(projLabel(r.project)), esc(r.text),
-      esc(r.models.map(m => shortModel(m.model)).join("; ")),
+      r.ts, projLabel(r.project), r.text,
+      r.models.map(m => shortModel(m.model)).join("; "),
       r.api_calls, r.inp, r.out, r.cr || 0,
       r.tools.reduce((a, t) => a + t[1], 0),
       r.skills.map(s => s[0]).join("; "), r.agents.length,
@@ -4535,7 +4684,7 @@ function renderPlanTile() {
   tile.hidden = false;
   $("t-plan").textContent = plan.fh + "% / " + plan.sd + "%";
   $("t-plan-h").textContent = "5h / 7d limit · account-wide · as of " +
-    (plan.ts || "").replace("T", " ").slice(0, 16);
+    fmtStamp(plan.ts);
 }
 
 /* The 5h block is a subscription rate-limit concept. Traffic routed through
@@ -4562,11 +4711,30 @@ function render() {
   renderView(rs);
 }
 
-$("generated-at").textContent = "generated " + (DATA.generated_at || "").replace("T", " ").slice(0, 16);
+/* Everything outside render() that prints a time: the header stamp and the
+   two account-wide tiles, which are drawn once rather than per filter. */
+function renderClock() {
+  const b = $("tz-btn");
+  // The label names the zone in use, so it is not also a pressed toggle:
+  // "Local time, pressed" would announce the same fact twice.
+  b.textContent = tzLocal ? "Local time" : "UTC";
+  b.title = "Times and day boundaries are shown in " + tzName() +
+    ". Click for " + (tzLocal ? "UTC" : "this computer's local time") + ".";
+  $("generated-at").textContent = "generated " + fmtStamp(DATA.generated_at) +
+    " " + (tzLocal ? "local" : "UTC");
+  if (DATA.subscription !== false) { renderWindow(); renderPlanTile(); }
+}
+$("tz-btn").addEventListener("click", () => {
+  tzLocal = !tzLocal;
+  try { localStorage.setItem("ccu-tz", tzLocal ? "local" : "utc"); } catch {}
+  renderClock();
+  render();
+});
 renderNotice();
 initFilters();
 initViewSwitch();
-if (!hideSubscriptionTiles()) { renderWindow(); renderPlanTile(); renderBurnTile(); }
+if (!hideSubscriptionTiles()) renderBurnTile();
+renderClock();
 renderOverheadTile();
 renderInsightsLink();
 renderCostBasisBadge();

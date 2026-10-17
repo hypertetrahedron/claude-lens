@@ -1164,8 +1164,8 @@ class MigrationToV8(unittest.TestCase):
 # sessions.source_label/title, no remote_state (added whole in
 # _migrate_to_3), no run_cost (added whole in _migrate_to_6), no
 # api_requests.model_raw/provider, and none of the v8 columns or tables.
-# Every migration from _migrate_to_2 through _migrate_to_9 has to run against
-# this, in order, for a real upgrade to work - the only thing test_ingest.py
+# Every migration from _migrate_to_2 to the latest has to run against this,
+# in order, for a real upgrade to work - the only thing test_ingest.py
 # exercised before this was the single hop from v7 to v8.
 V1_SCHEMA = """
 CREATE TABLE prompts (
@@ -1550,6 +1550,422 @@ class EventsWithoutTimestampsDedupe(unittest.TestCase):
         con.commit()
         self.assertEqual(con.execute(
             "SELECT COUNT(*) FROM session_events").fetchone()[0], 1)
+
+
+# ---------------------------------------------------------------------------
+# Sessions another agent started
+# ---------------------------------------------------------------------------
+
+def peer(prompt_id, text, ts):
+    """A message from another Claude session, shaped like the real ones:
+    isMeta, origin.kind "peer", and the harness's own opener on the text."""
+    return entry(type="user", promptId=prompt_id, uuid=prompt_id, isMeta=True,
+                 timestamp=ts, origin={"kind": "peer", "from": "unknown"},
+                 message={"role": "user", "content": [
+                     {"type": "text", "text":
+                      "Another Claude session sent a message:\n" + text}]})
+
+
+def notification(prompt_id, ts):
+    return entry(type="user", promptId=prompt_id, timestamp=ts,
+                 origin={"kind": "task-notification"},
+                 message={"role": "user", "content":
+                          "<task-notification>done</task-notification>"})
+
+
+class PeerStartedSessions(TranscriptCase):
+    """A session started by another agent has no human prompt at all.
+
+    Real transcripts: 19 of 32 sessions holding "peer" turns opened with one,
+    and requiring a human prompt before attributing anything dropped every
+    request in them.
+    """
+
+    def test_usage_hangs_off_the_latest_peer_prompt(self):
+        self.write([
+            peer("pp1", "build the parser", "2026-09-01T10:00:00.000Z"),
+            assistant("req_1", "2026-09-01T10:00:01.000Z",
+                      blocks=[tool_use("toolu_1", "Read", {"file": "a"})]),
+            tool_result("toolu_1", "2026-09-01T10:00:02.000Z", "abc"),
+            peer("pp2", "now test it", "2026-09-01T10:05:00.000Z"),
+            assistant("req_2", "2026-09-01T10:05:01.000Z"),
+        ])
+        self.ingest()
+        self.assertEqual(
+            self.rows("SELECT request_id, prompt_id FROM api_requests "
+                      "ORDER BY request_id"),
+            [("req_1", "pp1"), ("req_2", "pp2")])
+        self.assertEqual(self.rows("SELECT prompt_id, result_bytes "
+                                   "FROM tool_calls"), [("pp1", 3)])
+
+    def test_peer_prompts_are_team_turns_that_stand_alone(self):
+        self.write([
+            peer("pp1", "go", "2026-09-01T10:00:00.000Z"),
+            assistant("req_1", "2026-09-01T10:00:01.000Z"),
+        ])
+        self.ingest()
+        self.assertEqual(
+            self.rows("SELECT kind, injected, canonical_id FROM prompts"),
+            [("team", 1, "pp1")])
+
+    def test_a_notification_before_any_human_prompt_takes_the_usage(self):
+        self.write([
+            peer("pp1", "go", "2026-09-01T10:00:00.000Z"),
+            notification("tn1", "2026-09-01T10:01:00.000Z"),
+            assistant("req_1", "2026-09-01T10:01:01.000Z"),
+        ])
+        self.ingest()
+        self.assertEqual(self.one("SELECT prompt_id FROM api_requests"), "tn1")
+
+    def test_a_peer_only_file_is_not_read_as_legacy(self):
+        """Read as legacy, an origin-less plain-text user turn is a "human"
+        prompt by shape - a compaction summary would have become one."""
+        path = self.write([
+            peer("pp1", "go", "2026-09-01T10:00:00.000Z"),
+            entry(type="user", promptId="pp1", timestamp="2026-09-01T10:00:05Z",
+                  message={"role": "user", "content": "Summary of earlier work"}),
+            assistant("req_1", "2026-09-01T10:00:06.000Z"),
+        ])
+        self.assertFalse(ji.scan_header(path, SESSION)[1])
+        self.ingest()
+        self.assertEqual(self.one(
+            "SELECT COUNT(*) FROM prompts WHERE kind='human'"), 0)
+        self.assertEqual(self.one("SELECT prompt_id FROM api_requests"), "pp1")
+
+    def test_a_human_started_session_is_unchanged(self):
+        """Once a person has typed, a peer turn folds into their prompt and
+        the usage after it stays theirs - exactly as before."""
+        self.write([
+            human("p1", "start", "2026-09-01T10:00:00.000Z"),
+            assistant("req_1", "2026-09-01T10:00:01.000Z"),
+            peer("pp1", "more", "2026-09-01T10:02:00.000Z"),
+            assistant("req_2", "2026-09-01T10:02:01.000Z"),
+        ])
+        self.ingest()
+        self.assertEqual(
+            self.rows("SELECT request_id, prompt_id FROM api_requests "
+                      "ORDER BY request_id"),
+            [("req_1", "p1"), ("req_2", "p1")])
+        self.assertEqual(
+            self.rows("SELECT prompt_id, injected, canonical_id FROM prompts "
+                      "ORDER BY prompt_id"),
+            [("p1", 0, None), ("pp1", 1, "p1")])
+
+
+class PromptsFollowTheirSession(TranscriptCase):
+    """One session resumed through a mapped drive and through its UNC path
+    lands in two project folders; its prompts must not split between them."""
+
+    def test_the_second_folder_adopts_the_sessions_project(self):
+        self.write([human("p1", "a", "2026-09-01T10:00:00.000Z")])
+        other = os.path.join(self.projects, "--host-share-repo")
+        os.makedirs(other)
+        with open(os.path.join(other, SESSION + ".jsonl"), "w") as f:
+            f.write(json.dumps(human("p2", "b", "2026-09-01T11:00:00Z")) + "\n")
+        self.ingest()
+        projects = {r[0] for r in self.rows("SELECT project FROM prompts")}
+        self.assertEqual(projects, {self.one("SELECT project FROM sessions")})
+
+
+# ---------------------------------------------------------------------------
+# Tool calls: the transcript fills what OTel did not know
+# ---------------------------------------------------------------------------
+
+class ToolCallFillsOnConflict(unittest.TestCase):
+
+    def setUp(self):
+        d = tempfile.mkdtemp(prefix="lens-toolfill-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        self.con = db.connect(os.path.join(d, "t.db"))
+        self.addCleanup(self.con.close)
+
+    def transcript(self):
+        db.insert_tool_calls(self.con, [(
+            "toolu_1", "p_tx", "s_tx", "2026-09-01T10:00:00Z", "Read",
+            "a1b2c3", "jsonl", None, 10, 200, 0, None, None)])
+
+    def test_the_transcript_fills_identity_columns_otel_left_null(self):
+        # What the receiver writes for a subagent's call: no agent name.
+        db.insert_tool_call(self.con, "toolu_1", None, None, None, "Read",
+                            None, "otel", duration_ms=55)
+        self.transcript()
+        self.assertEqual(self.con.execute(
+            "SELECT prompt_id, session_id, ts, agent_name, duration_ms, "
+            "input_bytes, source FROM tool_calls").fetchone(),
+            ("p_tx", "s_tx", "2026-09-01T10:00:00Z", "a1b2c3", 55, 10, "otel"))
+
+    def test_what_otel_knew_is_kept(self):
+        db.insert_tool_call(self.con, "toolu_1", "p_otel", "s_otel",
+                            "2026-09-01T10:00:00.5Z", "Read", None, "otel")
+        self.transcript()
+        self.assertEqual(self.con.execute(
+            "SELECT prompt_id, session_id, ts, agent_name FROM tool_calls"
+        ).fetchone(),
+            ("p_otel", "s_otel", "2026-09-01T10:00:00.5Z", "a1b2c3"))
+
+
+class RedactedPromptText(unittest.TestCase):
+    """OTel sends the literal "<REDACTED>" when prompt logging is off."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp(prefix="lens-redacted-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        self.con = db.connect(os.path.join(d, "t.db"))
+        self.addCleanup(self.con.close)
+
+    def text(self):
+        return self.con.execute("SELECT text FROM prompts").fetchone()[0]
+
+    def test_the_transcript_replaces_the_placeholder(self):
+        db.upsert_prompt(self.con, "p1", "s1", text=db.REDACTED_PROMPT,
+                         source="otel")
+        db.upsert_prompts(self.con, [("p1", "s1", "proj", "t", "fix the parser",
+                                      "jsonl", 0, None, "human")])
+        self.assertEqual(self.text(), "fix the parser")
+
+    def test_real_text_is_never_replaced_by_the_placeholder(self):
+        db.upsert_prompt(self.con, "p1", "s1", text="fix it", source="jsonl")
+        db.upsert_prompt(self.con, "p1", "s1", text=db.REDACTED_PROMPT,
+                         source="otel")
+        self.assertEqual(self.text(), "fix it")
+
+    def test_an_empty_text_does_not_blank_the_placeholder(self):
+        db.upsert_prompt(self.con, "p1", "s1", text=db.REDACTED_PROMPT,
+                         source="otel")
+        db.upsert_prompt(self.con, "p1", "s1", text="", source="jsonl")
+        self.assertEqual(self.text(), db.REDACTED_PROMPT)
+
+
+# ---------------------------------------------------------------------------
+# The older flat subagent layout
+# ---------------------------------------------------------------------------
+
+class FlatSubagentLayout(TranscriptCase):
+    """agent-<id>.jsonl straight in the project folder, beside the main
+    transcripts, as an older CLI wrote it."""
+
+    def build(self):
+        main = self.write([
+            human("p1", "hello", "2026-09-01T10:00:00.000Z"),
+            assistant("req_M", "2026-09-01T10:00:01.000Z"),
+        ])
+        flat = os.path.join(self.projects, PROJECT, "agent-ab12.jsonl")
+        with open(flat, "w", encoding="utf-8") as f:
+            for e in (entry(type="user", promptId="p1", agentId="ab12",
+                            isSidechain=True, gitBranch="side",
+                            timestamp="2026-09-01T10:00:02.000Z",
+                            message={"role": "user", "content": "go"}),
+                      assistant("req_S", "2026-09-01T10:00:03.000Z",
+                                agent="ab12", output=13)):
+                f.write(json.dumps(e) + "\n")
+        return main, flat
+
+    def test_the_tree_ingests_it_as_a_subagent(self):
+        main, _ = self.build()
+        self.ingest()
+        self.assertEqual(
+            self.rows("SELECT session_id, agent_name, query_source "
+                      "FROM api_requests WHERE request_id='req_S'"),
+            [(SESSION, "ab12", "subagent")])
+        # ...and it did not take over its parent session's descriptors.
+        self.assertEqual(
+            self.rows("SELECT session_id, transcript_path, git_branch "
+                      "FROM sessions"), [(SESSION, main, "main")])
+
+    def test_the_single_file_entry_point_takes_the_session_from_entries(self):
+        _, flat = self.build()
+        ji.ingest_file(self.con, flat)
+        self.assertEqual(self.one("SELECT session_id FROM api_requests"),
+                         SESSION)
+        self.assertEqual(self.one("SELECT session_id FROM agents"), SESSION)
+
+    def test_the_current_layout_still_falls_back_to_the_path(self):
+        e = entry(type="user", promptId="p1", agentId="cd34", isSidechain=True,
+                  timestamp="2026-09-01T10:00:00.000Z",
+                  message={"role": "user", "content": "go"})
+        a = assistant("req_S", "2026-09-01T10:00:01.000Z", agent="cd34")
+        del e["sessionId"], a["sessionId"]
+        ji.ingest_file(self.con, self.write_subagent("cd34", [e, a]))
+        self.assertEqual(self.one("SELECT session_id FROM api_requests"),
+                         SESSION)
+
+
+class InlineAgentName(unittest.TestCase):
+
+    def test_agent_id_beats_the_subagent_type(self):
+        self.assertEqual(ji.inline_agent(
+            {"isSidechain": True, "agentId": "a1b2",
+             "attributionAgent": "general-purpose"}), "a1b2")
+
+    def test_the_type_is_still_better_than_nothing(self):
+        self.assertEqual(ji.inline_agent(
+            {"isSidechain": True, "attributionAgent": "general-purpose"}),
+            "general-purpose")
+
+
+# ---------------------------------------------------------------------------
+# Migrations: v7 conversion, atomic locked steps, v10
+# ---------------------------------------------------------------------------
+
+class MigrationSevenConvertsEachRowOnce(unittest.TestCase):
+    """A Bedrock id and the plain id it canonicalises to, in one database:
+    the plain id's UPDATE must not re-match the rows the Bedrock one just
+    rewrote."""
+
+    def setUp(self):
+        tmp = tempfile.mkdtemp(prefix="lens-migrate-v7-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        self.path = os.path.join(tmp, "v1.db")
+        raw = sqlite3.connect(self.path)
+        raw.executescript(V1_SCHEMA)
+        raw.execute("INSERT INTO api_requests (request_id, model, source) "
+                    "VALUES ('r_bed', ?, 'jsonl')", (BEDROCK_RAW_MODEL,))
+        raw.execute("INSERT INTO api_requests (request_id, model, source) "
+                    "VALUES ('r_api', 'claude-sonnet-4-5-20250929', 'jsonl')")
+        raw.commit()
+        raw.close()
+        self.con = db.connect(self.path)
+        self.addCleanup(self.con.close)
+
+    def models(self):
+        return self.con.execute(
+            "SELECT request_id, model, model_raw, provider FROM api_requests "
+            "ORDER BY request_id").fetchall()
+
+    def test_bedrock_provenance_survives(self):
+        self.assertEqual(self.models(), [
+            ("r_api", "claude-sonnet-4-5-20250929",
+             "claude-sonnet-4-5-20250929", "anthropic"),
+            ("r_bed", "claude-sonnet-4-5-20250929", BEDROCK_RAW_MODEL,
+             "bedrock")])
+
+    def test_running_it_again_changes_nothing(self):
+        before = self.models()
+        db._migrate_to_7(self.con)
+        self.assertEqual(self.models(), before)
+
+
+class MigrationSteps(unittest.TestCase):
+    """Each step runs in its own write transaction and the connection never
+    outlives a failure."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="lens-migrate-steps-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.path = os.path.join(self.tmp, "v9.db")
+        con = db.connect(self.path)
+        con.execute("INSERT INTO prompts (prompt_id, text) VALUES ('p1','hi')")
+        con.execute("PRAGMA user_version = 9")
+        con.commit()
+        con.close()
+        saved = dict(db.MIGRATIONS)
+        self.addCleanup(lambda: (db.MIGRATIONS.clear(),
+                                 db.MIGRATIONS.update(saved)))
+
+    def version(self):
+        raw = sqlite3.connect(self.path)
+        try:
+            return raw.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            raw.close()
+
+    def test_a_failed_step_is_rolled_back_and_the_file_released(self):
+        def broken(con):
+            db._apply_schema(con)       # must not commit the step early
+            con.execute("UPDATE prompts SET text='half migrated'")
+            raise ValueError("boom")
+        db.MIGRATIONS[10] = broken
+        with self.assertRaises(ValueError):
+            db.connect(self.path)
+        self.assertEqual(self.version(), 9)
+        raw = sqlite3.connect(self.path)
+        self.assertEqual(raw.execute("SELECT text FROM prompts").fetchone()[0],
+                         "hi")
+        raw.close()
+        # A connection left open would hold the file; on Windows this raises.
+        os.rename(self.path, self.path + ".moved")
+
+    def test_a_step_another_process_finished_is_not_run_twice(self):
+        """The version is read again under the write lock: a process that saw
+        v9 but waited for the lock behind one migrating to v10 must find v10
+        and leave it alone."""
+        raw = sqlite3.connect(self.path)
+        raw.execute("PRAGMA user_version = %d" % db.SCHEMA_VERSION)
+        raw.commit()
+        raw.close()
+        calls = []
+        db.MIGRATIONS[db.SCHEMA_VERSION] = calls.append
+        real = db._schema_version
+        reads = []
+
+        def stale_first_read(con):
+            reads.append(1)
+            return db.SCHEMA_VERSION - 1 if len(reads) == 1 else real(con)
+        db._schema_version = stale_first_read
+        self.addCleanup(setattr, db, "_schema_version", real)
+        db.connect(self.path).close()
+        self.assertEqual(calls, [])
+        self.assertGreaterEqual(len(reads), 2)
+
+
+class MigrationToV10(TranscriptCase):
+    """From v9: the project split is repaired in place and every transcript
+    is re-read, which is what completes the live rows."""
+
+    def setUp(self):
+        super().setUp()
+        self.con.close()
+        self.path = os.path.join(self.tmp, "metrics.db")
+        raw = sqlite3.connect(self.path)
+        raw.executescript("""
+            INSERT INTO sessions (session_id, project) VALUES ('s1', 'unc-repo');
+            INSERT INTO prompts (prompt_id, session_id, project, text)
+                VALUES ('p1', 's1', 'unc-repo', 'a'),
+                       ('p2', 's1', 'drive-repo', 'b'),
+                       ('p3', 'orphan', 'elsewhere', 'c');
+            INSERT INTO ingest_state VALUES ('/some/file.jsonl', 1, 2.0);
+            PRAGMA user_version = 9;""")
+        raw.commit()
+        raw.close()
+
+    def migrate(self):
+        self.con = db.connect(self.path)
+        self.addCleanup(self.con.close)
+
+    def test_version_and_reparse(self):
+        self.migrate()
+        self.assertEqual(self.one("PRAGMA user_version"), db.SCHEMA_VERSION)
+        self.assertEqual(self.one("SELECT COUNT(*) FROM ingest_state"), 0)
+
+    def test_prompts_adopt_their_sessions_project(self):
+        self.migrate()
+        self.assertEqual(
+            self.rows("SELECT prompt_id, project FROM prompts "
+                      "ORDER BY prompt_id"),
+            [("p1", "unc-repo"), ("p2", "unc-repo"), ("p3", "elsewhere")])
+
+    def test_a_live_subagent_call_gets_its_agent_id_on_the_reparse(self):
+        """The receiver wrote the call with no agent name; the transcript was
+        already marked ingested under v9, so only the reset re-reads it."""
+        sub = self.write_subagent("ab12", [
+            entry(type="user", promptId="p1", agentId="ab12", isSidechain=True,
+                  timestamp="2026-09-01T10:00:00.000Z",
+                  message={"role": "user", "content": "go"}),
+            assistant("req_S", "2026-09-01T10:00:01.000Z", agent="ab12",
+                      blocks=[tool_use("toolu_S", "Edit", {"file": "x"})]),
+        ])
+        raw = sqlite3.connect(self.path)
+        raw.execute("INSERT INTO tool_calls (tool_use_id, session_id, "
+                    "tool_name, source) VALUES ('toolu_S', ?, 'Edit', 'otel')",
+                    (SESSION,))
+        st = os.stat(sub)
+        raw.execute("INSERT INTO ingest_state VALUES (?,?,?)",
+                    (sub, st.st_size, st.st_mtime))
+        raw.commit()
+        raw.close()
+        self.migrate()
+        ji.ingest_tree(self.con, self.projects)
+        self.assertEqual(self.one("SELECT agent_name FROM tool_calls"), "ab12")
 
 
 if __name__ == "__main__":

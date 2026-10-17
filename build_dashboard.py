@@ -29,8 +29,6 @@ TEMPLATE = os.path.join(BASE, "template.html")
 OUTPUT = os.path.join(BASE, "dashboard.html")
 
 MAX_TEXT = 400
-WINDOW_HOURS = 5          # Anthropic rate-limit window length
-WINDOW_LOOKBACK_H = 36    # how far back to scan when locating the current window
 
 # The payload is parsed by the browser on every load and every auto-refresh,
 # and each prompt costs roughly a kilobyte. Newest rows are kept; the UI says
@@ -46,6 +44,10 @@ DEFAULT_CONVERSATIONS = 300
 # previous one closed and runs for five hours. Only the recent past is worth
 # computing - a block from last spring cannot be spent - so the scan is
 # bounded, and the burn rate for the open block is measured over half an hour.
+#
+# The 5h rate-limit window tile is the open block, not a second computation of
+# its own: two scans with different look-back and different request filters
+# disagreed about where a block began and which requests were in it.
 BLOCK_HOURS = 5
 BLOCK_DAYS = 30
 BURN_WINDOW_MIN = 30
@@ -180,31 +182,29 @@ def resolve_map(con):
     return m
 
 
-def compute_window(recent):
-    """ccusage-style 5h blocks: a block starts at the floored hour of the first
-    request after the previous block ends. Returns the block containing now,
-    or None if idle. `recent` = [(dt, out_tokens, cost), ...]."""
-    if not recent:
+def current_window(blocks, now=None):
+    """The open billing block as the 5h-window tile's figures, or None if idle.
+
+    Derived from compute_blocks() rather than scanned separately, so the tile
+    and the block table cannot count different requests (the old scan skipped
+    requests with no prompt id, and started its chain from a 36 hour look-back,
+    which can put the block boundaries in a different place). `est` is true
+    when any request in it was costed by estimate, and `unpriced` counts the
+    requests that were counted as $0.00 because their model has no rate.
+    """
+    now = now or datetime.now(timezone.utc)
+    if not blocks or not now < blocks[-1]["end"]:
         return None
-    recent.sort(key=lambda x: x[0])
-    now = datetime.now(timezone.utc)
-    block_start = block_end = None
-    stats = None
-    for dt, out, cost in recent:
-        if block_end is None or dt >= block_end:
-            block_start = dt.replace(minute=0, second=0, microsecond=0)
-            block_end = block_start + timedelta(hours=WINDOW_HOURS)
-            stats = {"out": 0, "cost": 0.0, "requests": 0}
-        stats["out"] += out
-        stats["cost"] += cost
-        stats["requests"] += 1
-    if block_end and now < block_end:
-        return {
-            "start": block_start.isoformat(timespec="seconds"),
-            "end": block_end.isoformat(timespec="seconds"),
-            **{k: (round(v, 4) if k == "cost" else v) for k, v in stats.items()},
-        }
-    return None
+    b = blocks[-1]
+    return {
+        "start": b["start"].isoformat(timespec="seconds"),
+        "end": b["end"].isoformat(timespec="seconds"),
+        "out": b["out"],
+        "cost": round(b["cost"], 4),
+        "requests": b["calls"],
+        "est": b["est"],
+        "unpriced": b["unpriced"],
+    }
 
 
 def _since_clause(sql, since, args=()):
@@ -479,17 +479,28 @@ def agent_spans(con, since=None):
     return dict(out_by_session)
 
 
-def compute_blocks(con, now=None, days=BLOCK_DAYS):
+def compute_blocks(con, now=None, days=BLOCK_DAYS, factors=None):
     """ccusage-style 5h billing blocks over the recent past, newest last.
 
-    Same rule as compute_window(): a block opens at the floored hour of the
-    first request after the previous block closed, and runs BLOCK_HOURS. The
-    open block also gets a burn rate - tokens and dollars per minute over the
+    The 5h window tile is the open block (see current_window()). A block opens
+    at the floored hour of the first request after the previous block closed,
+    and runs BLOCK_HOURS. Every request counts, prompt id or not. The open
+    block also gets a burn rate - tokens and dollars per minute over the
     last BURN_WINDOW_MIN - and a projection of what it will have cost by the
     time it closes, which is the number that tells you to slow down while
     there is still something to slow down for.
+
+    A block's cost is only exact when every request in it carried the CLI's
+    own figure, so each block says whether any was estimated (`est`) and how
+    many requests were counted at $0.00 because their model has no rate
+    (`unpriced`) - an unknown cost is not a zero one. `factors` is
+    session_id -> the scale reprice_from_run_cost() applied to that session's
+    rows; applying it here keeps a block from disagreeing with the prompts
+    inside it, and a scaled request is an estimate of its share, so it is
+    flagged as one.
     """
     now = now or datetime.now(timezone.utc)
+    factors = factors or {}
     cutoff = now - timedelta(days=days)
     cutoff_day = (cutoff - timedelta(days=1)).strftime("%Y-%m-%d")
     burn_since = now - timedelta(minutes=BURN_WINDOW_MIN)
@@ -504,9 +515,9 @@ def compute_blocks(con, now=None, days=BLOCK_DAYS):
     blocks = []
     end = None
     burn_tokens = burn_usd = 0.0
-    for (ts, model, provider, speed, geo, inp, out, cr, cw, c5, c1,
+    for (ts, sid, model, provider, speed, geo, inp, out, cr, cw, c5, c1,
          cost) in con.execute(
-            """SELECT ts, model, provider, speed, inference_geo,
+            """SELECT ts, session_id, model, provider, speed, inference_geo,
                       COALESCE(input_tokens, 0), COALESCE(output_tokens, 0),
                       COALESCE(cache_read_tokens, 0),
                       COALESCE(cache_create_tokens, 0),
@@ -517,21 +528,33 @@ def compute_blocks(con, now=None, days=BLOCK_DAYS):
         dt = parse_ts(ts)
         if not dt or dt < cutoff:
             continue
+        est = unpriced = False
         if cost is None:
+            est = True
             key = (model, provider, speed, geo, ts[:10] if ts else None)
             try:
                 rate = rates[key]
             except KeyError:
                 rate = rates[key] = pricing.resolve(model, ts, provider, speed,
                                                     geo)
-            cost = 0.0 if rate is None else cost_at(
-                rate, inp, out, cr, c5, c1, max(cw - c5 - c1, 0), provider)
+            if rate is None:
+                cost = 0.0
+                # Zero-token rows are placeholders ('<synthetic>'), not a
+                # model that billed anything - same rule as warn_unpriced().
+                unpriced = (inp + out + cr + cw) > 0
+            else:
+                cost = cost_at(rate, inp, out, cr, c5, c1,
+                               max(cw - c5 - c1, 0), provider)
+        f = factors.get(sid)
+        if f is not None:
+            cost *= f
+            est = True
         if end is None or dt >= end:
             start = dt.replace(minute=0, second=0, microsecond=0)
             end = start + timedelta(hours=BLOCK_HOURS)
             blocks.append({"start": start, "end": end, "calls": 0,
                            "cost": 0.0, "out": 0, "inp": 0, "cr": 0, "cw": 0,
-                           "models": set()})
+                           "models": set(), "est": False, "unpriced": 0})
             # Burn only ever describes the block currently open, so a new
             # block starting resets it - otherwise a block only a few
             # minutes old would still carry requests from the one before it.
@@ -539,6 +562,8 @@ def compute_blocks(con, now=None, days=BLOCK_DAYS):
         b = blocks[-1]
         b["calls"] += 1
         b["cost"] += cost
+        b["est"] = b["est"] or est
+        b["unpriced"] += 1 if unpriced else 0
         b["out"] += out
         b["inp"] += inp + cr + cw
         b["cr"] += cr
@@ -574,11 +599,18 @@ def compute_blocks(con, now=None, days=BLOCK_DAYS):
     return blocks, burn
 
 
-def tool_errors(con, since=None):
-    """Per-tool call/error counts, plus whatever the API itself refused."""
+def tool_errors(con, since=None, until=None):
+    """Per-tool call/error counts, plus whatever the API itself refused.
+
+    `until` is an exclusive upper bound, for a caller that reports on a window
+    rather than on everything since `since` (digest.py: collect()'s `since`
+    carries a margin before the week, so it is not the week's start).
+    """
     sql, args = _since_clause(
         "SELECT tool_name, COUNT(*), SUM(COALESCE(is_error, 0)) "
         "FROM tool_calls WHERE 1=1", since)
+    if until:
+        sql, args = sql + " AND ts < ?", args + (until,)
     tools = []
     for name, calls, errs in con.execute(sql + " GROUP BY tool_name", args):
         errs = errs or 0
@@ -588,6 +620,8 @@ def tool_errors(con, since=None):
     sql, args = _since_clause(
         "SELECT error, COUNT(*) FROM api_requests WHERE error IS NOT NULL",
         since)
+    if until:
+        sql, args = sql + " AND ts < ?", args + (until,)
     kinds = [[str(e), n] for e, n in con.execute(sql + " GROUP BY error", args)]
     kinds.sort(key=lambda k: -k[1])
     return {"tools": tools, "api": sum(k[1] for k in kinds),
@@ -664,14 +698,17 @@ def session_lookups(con):
             slug_display)
 
 
-def reprice_from_run_cost(con, emitted):
+def reprice_from_run_cost(con, emitted, factors=None):
     """Spend the CLI's own per-session total where it provably covers
     every run, and return how many rows were repriced.
 
     `emitted` maps session_id to the rows that actually ran something.
     Those rows are mutated in place: cost and composition scale by the
     same factor, and `est` stays set, because what the CLI measured is
-    the session and not the prompt.
+    the session and not the prompt. Per-model costs scale with the row, or the
+    detail table and the by-family totals would stop adding up to it. When
+    `factors` is a dict it receives session_id -> scale for every session
+    spent, so the billing blocks can follow the same repricing.
     """
     repriced = 0
     for sid, auth_cost, runs in con.execute(
@@ -693,12 +730,16 @@ def reprice_from_run_cost(con, emitted):
         for g in group:
             g["cost"] *= factor
             g["comp"] = [c * factor for c in g["comp"]]
+            for m in g["models"].values():
+                m["cost"] *= factor
             # The session total is authoritative; this row's share of it is
             # not. Each prompt gets the total scaled by its own estimate, so
             # the figure on the row is still an estimate - a better one - and
             # clearing `est` here would claim a per-prompt measurement the CLI
             # never made. Only the session sum is exact.
             g["est"] = True
+        if factors is not None:
+            factors[sid] = factor
         repriced += len(group)
     return repriced
 
@@ -812,16 +853,8 @@ def collect(con, since=None):
             rows[target] = r
         return rows[target]
 
-    window_cutoff = datetime.now(timezone.utc) - timedelta(hours=WINDOW_LOOKBACK_H)
-    # A date one day either side of the cutoff, for a string prefilter that no
-    # UTC offset (max +/-14h) can make wrong. It keeps the 5h-window scan off
-    # every request ever recorded, and off parse_ts entirely.
-    cutoff_day = (window_cutoff - timedelta(days=1)).strftime("%Y-%m-%d")
-    recent = []
-
     resolve = pricing.resolve
     cost_at = pricing.cost_at
-    w5m, w1h = pricing.CACHE_WRITE_5M_MULT, pricing.CACHE_WRITE_1H_MULT
 
     # API usage is aggregated in SQLite, not in Python. Everything a prompt row
     # needs from api_requests is a sum over (prompt, session, model, provider,
@@ -908,7 +941,9 @@ def collect(con, since=None):
         if rate is not None:
             pi, po = rate.inp, rate.out
             c_read = cr * pi * rate.cache_read_mult / 1e6
-            c_write = (c5 * w5m + (c1 + unsplit) * w1h) * pi / 1e6
+            # The same per-provider multiplier for unsplit writes that cost_at
+            # used for the total, or the split would not sum to it.
+            c_write = cache_write_cost(rate, c5, c1, unsplit, provider)
             c_out = out * po / 1e6
             c_in = inp * pi / 1e6
             est_total = sum((c_read, c_write, c_out, c_in))
@@ -940,30 +975,6 @@ def collect(con, since=None):
         r = rows[rid]
         if not r["ts"]:
             r["ts"] = t
-
-    # The 5h rate-limit block needs individual request times, but only for the
-    # last day and a half, so it is its own small query rather than a field on
-    # every row of the one above.
-    for ts, model, provider, speed, geo, out, cost, inp, cr, cw, c5, c1 in \
-            con.execute(
-            """SELECT ts, model, provider, speed, inference_geo,
-                      COALESCE(output_tokens, 0), cost_usd,
-                      COALESCE(input_tokens, 0), COALESCE(cache_read_tokens, 0),
-                      COALESCE(cache_create_tokens, 0),
-                      COALESCE(cache_5m_tokens, 0), COALESCE(cache_1h_tokens, 0)
-               FROM api_requests
-               WHERE prompt_id IS NOT NULL AND ts >= ?""", (cutoff_day,)):
-        dt = parse_ts(ts)
-        if not dt or dt < window_cutoff:
-            continue
-        if cost is None:
-            unsplit = cw - c5 - c1
-            if unsplit < 0:
-                unsplit = 0
-            rate = resolve(model, ts, provider, speed, geo)
-            cost = 0.0 if rate is None else cost_at(
-                rate, inp, out, cr, c5, c1, unsplit, provider)
-        recent.append((dt, out, cost))
 
     tool_sql, tool_args = _since_clause(
         "SELECT prompt_id, tool_name, detail, agent_name, COUNT(*), "
@@ -1012,7 +1023,8 @@ def collect(con, since=None):
     for r in rows.values():
         if (r["api_calls"] or r["tools"]) and r["session"]:
             emitted[r["session"]].append(r)
-    repriced = reprice_from_run_cost(con, emitted)
+    factors = {}
+    repriced = reprice_from_run_cost(con, emitted, factors)
     REPRICED["rows"] = repriced
 
     agent_meta = agent_identity(con)
@@ -1117,7 +1129,7 @@ def collect(con, since=None):
     PROVIDERS.clear()
     PROVIDERS.update(providers)
 
-    blocks, burn = compute_blocks(con)
+    blocks, burn = compute_blocks(con, factors=factors)
     subagent_ttl = subagent_cache_ttl(con)
     EXTRAS.update({
         "ctx": ctx_series,
@@ -1132,7 +1144,7 @@ def collect(con, since=None):
         "overhead": tool_overhead(con, since),
         "cost_basis": cost_basis(con, since),
     })
-    return out_rows, compute_window(recent)
+    return out_rows, current_window(blocks)
 
 
 def session_rows(out_rows, redact=False):
@@ -1189,7 +1201,9 @@ def session_rows(out_rows, redact=False):
         denom = s["cr"] + s["cw"] + s["uncached"]
         out.append({
             "id": sid,
-            "title": s["title"],
+            # A title is the CLI's summary of the conversation - as revealing
+            # as the prompt it was written from - so it goes with the text.
+            "title": None if redact else s["title"],
             "project": s["project"],
             "kind": s["kind"],
             "start": m.get("first_ts") or s["start"],
@@ -1223,7 +1237,10 @@ def ctx_points(keep_sessions):
 
     Past the cap whole sessions go, oldest first: half a session's context
     curve is a misleading picture, where a missing session is an honest one
-    as long as the page says how many went. Returns (points, dropped).
+    as long as the page says how many went. The kept sessions are the newest
+    contiguous run - the first one that does not fit ends it, rather than a
+    smaller, older session slipping in behind it, so "the oldest were left
+    out" is literally true. Returns (points, dropped).
     """
     series = EXTRAS.get("ctx") or {}
     order = []
@@ -1236,10 +1253,10 @@ def ctx_points(keep_sessions):
     # can hold a None and would raise rather than sort.
     order.sort(key=lambda o: (o[0], o[1]), reverse=True)
     kept, total, dropped = [], 0, 0
-    for _, sid, pts in order:
+    for i, (_, sid, pts) in enumerate(order):
         if total + len(pts) > CTX_CAP:
-            dropped += 1
-            continue
+            dropped = len(order) - i
+            break
         total += len(pts)
         for p in pts:
             kept.append([sid] + p)
@@ -1291,7 +1308,7 @@ AGENT_SPAN_COLUMNS = ("session", "t0", "t1", "type", "desc", "model", "calls",
                       "out", "cost", "est")
 
 BLOCK_COLUMNS = ("start", "end", "calls", "cost", "out", "inp", "cr", "cw",
-                 "models", "active")
+                 "models", "active", "est", "unpriced")
 
 
 class Strings:
@@ -1451,8 +1468,12 @@ def compact_ctx(points, strings):
 RECEIVER_ADDR = ("127.0.0.1", 4318)
 
 
-def receiver_running(addr=RECEIVER_ADDR, timeout=0.2):
+def receiver_running(addr=RECEIVER_ADDR, timeout=0.2, port=None):
     """Is a live receiver holding the OTel port?
+
+    receiver.py takes --port, but nothing records the choice anywhere a build
+    could read (no environment variable, no sources.json key), so a receiver
+    started on another port is only found when the caller passes `port`.
 
     Worth knowing at build time: a receiver started before this code was
     edited will not pick the change up, and says so in its own log where
@@ -1460,6 +1481,8 @@ def receiver_running(addr=RECEIVER_ADDR, timeout=0.2):
     ran the build.
     """
     import socket
+    if port:
+        addr = (addr[0], port)
     try:
         with socket.create_connection(addr, timeout):
             return True
@@ -1474,20 +1497,28 @@ def plan_usage(cfg=None):
     minutes. Per day we keep the peak of each - a limit you touched at noon
     still shaped your day even if you were idle by evening. Returns None when
     the desktop app is not installed.
+
+    `hours` holds the same peaks per hour, keyed by the hour's epoch second:
+    the page can show its days in the viewer's local zone, which this side
+    cannot know, and an hour folds into any whole-hour zone's day exactly.
+    `days` stays as the UTC view, and the page falls back to it when a
+    payload has no `hours`.
     """
     cfg = cfg or sources.SourceConfig.load()
     samples = sources.plan_usage_samples(cfg.plan_usage_paths)
     if not samples:
         return None
-    days = {}
+    days, hours = {}, {}
     for epoch, fh, sd in samples:
         day = datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%d")
-        cur = days.setdefault(day, [0, 0])
-        cur[0] = max(cur[0], fh)
-        cur[1] = max(cur[1], sd)
+        for cur in (days.setdefault(day, [0, 0]),
+                    hours.setdefault(str(int(epoch) // 3600 * 3600), [0, 0])):
+            cur[0] = max(cur[0], fh)
+            cur[1] = max(cur[1], sd)
     last = samples[-1]
     return {
         "days": days,
+        "hours": hours,
         "latest": {
             "ts": datetime.fromtimestamp(last[0], timezone.utc)
                           .isoformat(timespec="seconds"),
@@ -1573,8 +1604,12 @@ def build(con=None, max_rows=DEFAULT_MAX_ROWS, redact=False, cfg=None,
             out_rows = out_rows[:max_rows]      # already newest-first
             truncated = total - max_rows
         if redact:
+            # Text and title both: a session title summarises the conversation
+            # as faithfully as the prompt does. (Everything else a prompt said
+            # is dropped further down - sessions, agent descriptions.)
             for r in out_rows:
                 r["text"] = ""
+                r.pop("title", None)
         # A subscription concept (plan gauges, the 5h rate-limit block) only
         # means something if some traffic actually went through the Anthropic
         # API. Rows predating provider tracking carry no provider and are
@@ -1596,6 +1631,19 @@ def build(con=None, max_rows=DEFAULT_MAX_ROWS, redact=False, cfg=None,
                 f"Conversation pages cover the newest {conversations_n:,} "
                 f"prompt(s); the other {conv['capped']:,} have no page. "
                 "Rebuild with --conversations to change that.")
+
+        # Live telemetry carries the literal "<REDACTED>" unless the CLI was
+        # told to log prompts, and only a transcript can replace it. A prompt
+        # the transcript never covered keeps it, which reads like something
+        # this page withheld on purpose - so the build says where it came
+        # from rather than leaving it to look like --no-prompt-text.
+        otel_redacted = 0 if redact else sum(
+            1 for r in out_rows if r["text"] == db.REDACTED_PROMPT)
+        if otel_redacted:
+            notices.append(
+                f"{otel_redacted:,} prompt(s) show \"{db.REDACTED_PROMPT}\": "
+                "only telemetry recorded them, and it withholds prompt text "
+                "unless OTEL_LOG_USER_PROMPTS=1 is set.")
 
         sessions = session_rows(out_rows, redact)
         points, ctx_dropped = ctx_points([s["id"] for s in sessions])
@@ -1689,7 +1737,7 @@ def build(con=None, max_rows=DEFAULT_MAX_ROWS, redact=False, cfg=None,
             con.close()
     # The landing page is rebuilt alongside the dashboard so a single
     # bookmark always reaches every report, however many digests pile up.
-    index = report_index.build()
+    index = report_index.build(redact=redact)
     result = {"rows": len(out_rows), "output": OUTPUT, "index": index}
     if truncated:
         result["truncated"] = truncated

@@ -21,8 +21,10 @@ Design rules, all of them load-bearing:
 - **Bounded.** Assistant blocks are cut at 4000 characters, tool inputs
   summarised at 200, and a page stops at about a megabyte with a notice
   saying so. A page nobody can open is not a record of anything.
-- **Incremental.** A page is rewritten only when its transcript moved, so a
-  rebuild every minute does not rewrite three hundred files every minute.
+- **Incremental.** A page is rewritten only when its transcript moved or the
+  figures in its header did (see `_fingerprint`), so a rebuild every minute
+  does not rewrite three hundred files every minute - and a pricing fix or a
+  late telemetry row still reaches pages whose transcript never changed.
 """
 import hashlib
 import html
@@ -52,6 +54,11 @@ def safe_filename(pid):
         return pid + ".html"
     digest = hashlib.sha1(pid.encode("utf-8", "surrogateescape")).hexdigest()
     return digest[:24] + ".html"
+
+# Bumped when the page layout changes in a way a fingerprint of the row would
+# not notice, so every existing page is rewritten once.
+RENDER_VERSION = 1
+FINGERPRINT_RE = re.compile(r"<!--lens-fp:([0-9a-f]{16})-->")
 
 # Per assistant text/thinking block, and per tool-call input summary.
 MAX_BLOCK = 4000
@@ -434,9 +441,10 @@ def _agents(con, pids):
     return out
 
 
-def _document(title, sub, meta, body):
+def _document(title, sub, meta, body, fingerprint=None):
+    mark = f"<!--lens-fp:{fingerprint}-->" if fingerprint else ""
     return (
-        '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+        f'<!DOCTYPE html>{mark}<html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         f"<title>{esc(title)}</title><style>{CSS}</style></head><body>"
         f'<div class="wrap"><h1>{esc(title)}</h1>'
@@ -444,8 +452,35 @@ def _document(title, sub, meta, body):
         f'<div class="meta">{meta}</div>{body}</div></body></html>')
 
 
-def _page_is_current(page_path, transcript, session_dir):
-    """True when the page is newer than everything it was rendered from."""
+def _fingerprint(row):
+    """A short hash of every figure a page's header shows for `row`.
+
+    A page is otherwise only as fresh as its transcript's mtime, and none of
+    the things that move a prompt's cost touch the transcript: a corrected
+    rate table, an OTel row arriving after the first build, a CLI session
+    total spread over the prompts. The per-model breakdown is in it because
+    the per-request costs on the page are priced from the same rows.
+    """
+    parts = [RENDER_VERSION] + [row.get(k) for k in (
+        "id", "ts", "project", "text", "cost", "est", "api_calls", "out",
+        "inp", "tools", "agents", "files", "ladd", "lrem", "models")]
+    blob = json.dumps(parts, sort_keys=True, default=str)
+    return hashlib.sha1(blob.encode("utf-8", "surrogateescape")).hexdigest()[:16]
+
+
+def _page_fingerprint(page_path):
+    """The fingerprint a page was written with, or None (older page, no file)."""
+    try:
+        with open(page_path, "r", encoding="utf-8", errors="replace") as f:
+            m = FINGERPRINT_RE.search(f.read(160))
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
+def _page_is_current(page_path, transcript, session_dir, fingerprint=None):
+    """True when the page is newer than everything it was rendered from and,
+    given a fingerprint, was rendered from the same figures."""
     try:
         made = os.path.getmtime(page_path)
     except OSError:
@@ -456,7 +491,9 @@ def _page_is_current(page_path, transcript, session_dir):
             newest = max(newest, os.path.getmtime(path))
         except OSError:
             continue
-    return newest and made >= newest
+    if not (newest and made >= newest):
+        return False
+    return fingerprint is None or _page_fingerprint(page_path) == fingerprint
 
 
 def write_pages(con, out_dir, rows, limit=300, redact=False):
@@ -475,7 +512,13 @@ def write_pages(con, out_dir, rows, limit=300, redact=False):
     """
     result = {"count": 0, "written": 0, "skipped_missing": 0, "capped": 0,
               "dir": None}
-    if redact or not limit:
+    if redact:
+        # A build that withholds prompt text must not leave the pages an
+        # earlier, unredacted build wrote next to it: they are the whole
+        # transcript of the thing being withheld.
+        remove_pages(out_dir)
+        return result
+    if not limit:
         return result
     targets = [r for r in rows[:limit] if r.get("session")]
     result["capped"] = sum(1 for r in rows[limit:] if r.get("session"))
@@ -504,28 +547,29 @@ def write_pages(con, out_dir, rows, limit=300, redact=False):
         href = "conversations/" + os.path.basename(page_path)
         r["conv"] = href
         listed.append((r, href))
+        fp = _fingerprint(r)
         if not _page_is_current(page_path, path,
                                 os.path.join(os.path.dirname(path),
-                                             r["session"])):
-            todo.append((r, path, page_path))
+                                             r["session"]), fp):
+            todo.append((r, path, page_path, fp))
     result["count"] = len(listed)
 
     if todo:
-        folded = _folded(con, [r["id"] for r, _, _ in todo])
+        folded = _folded(con, [r["id"] for r, _, _, _ in todo])
         all_pids = [p for group in folded.values() for p in group]
         costs = _costs(con, all_pids)
         agent_map = _agents(con, all_pids)
 
         # One walk per transcript, however many of its prompts need a page.
         by_transcript = {}
-        for r, path, page_path in todo:
-            by_transcript.setdefault(path, []).append((r, page_path))
+        for r, path, page_path, fp in todo:
+            by_transcript.setdefault(path, []).append((r, page_path, fp))
         for path, wanted in by_transcript.items():
             want = {}
-            for r, page_path in wanted:
+            for r, page_path, _ in wanted:
                 for pid in folded.get(r["id"], [r["id"]]):
                     want[pid] = r["id"]
-            picked = {r["id"]: [] for r, _ in wanted}
+            picked = {r["id"]: [] for r, _, _ in wanted}
             current = None
             for e in _iter_jsonl(path):
                 pid = e.get("promptId")
@@ -534,14 +578,43 @@ def write_pages(con, out_dir, rows, limit=300, redact=False):
                 if current is not None:
                     picked[current].append(e)
             base_dir = os.path.dirname(path)
-            for r, page_path in wanted:
+            for r, page_path, fp in wanted:
                 _write_one(page_path, r, picked.get(r["id"]) or [], costs,
-                           agent_map, base_dir)
+                           agent_map, base_dir, fp)
                 result["written"] += 1
 
     _write_index(folder, listed)
     _prune_stale(folder, {os.path.basename(href) for _, href in listed})
     return result
+
+
+def remove_pages(out_dir):
+    """Delete every conversation page (and its index) under `out_dir`.
+
+    Only what this module writes: a name matching SAFE_FILENAME_RE whose first
+    bytes are the document this module emits. A stray file someone dropped in
+    the folder survives, and the folder itself goes only if that left it empty.
+    """
+    folder = os.path.join(out_dir, "conversations")
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return
+    for name in names:
+        if not SAFE_FILENAME_RE.match(name):
+            continue
+        path = os.path.join(folder, name)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                if not f.read(15).startswith("<!DOCTYPE html>"):
+                    continue
+            os.remove(path)
+        except OSError:
+            pass
+    try:
+        os.rmdir(folder)
+    except OSError:
+        pass
 
 
 def _prune_stale(folder, keep):
@@ -603,7 +676,8 @@ def atomic_write(path, text):
         raise
 
 
-def _write_one(page_path, row, entries, costs, agents, base_dir):
+def _write_one(page_path, row, entries, costs, agents, base_dir,
+               fingerprint=None):
     page = Page()
     _render_entries(page, entries, costs, agents, base_dir, row["session"])
     if not entries:
@@ -626,7 +700,7 @@ def _write_one(page_path, row, entries, costs, agents, base_dir):
     sub = (f"{esc(_short_ts(row.get('ts')))} &middot; {esc(row.get('project'))} "
            "&middot; <a href='index.html'>all conversations</a> &middot; "
            "<a href='../dashboard.html'>dashboard</a>")
-    doc = _document(title, sub, meta, page.html())
+    doc = _document(title, sub, meta, page.html(), fingerprint)
     atomic_write(page_path, doc)
 
 

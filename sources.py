@@ -33,6 +33,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import zlib
 from collections import deque, namedtuple
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -278,6 +279,20 @@ def discover_local(extra_locations=(), scan_siblings=True,
 # SSH config
 # ---------------------------------------------------------------------------
 
+def valid_host(host):
+    """True if `host` is safe to hand to ssh as a destination.
+
+    A host is passed to ssh as an argument, and ssh reads one that starts with
+    a dash as an option: "-oProxyCommand=..." in sources.json, on --remote, or
+    as a `Host` line in a config file this tool merely reads, would run a
+    command. Whitespace and control characters have no place in a host name
+    and are how a second argument gets smuggled into a single one.
+    """
+    return (isinstance(host, str) and bool(host)
+            and not host.startswith("-")
+            and not re.search(r"[\s\x00-\x1f\x7f]", host))
+
+
 def ssh_config_hosts(path=None, _seen=None):
     """Concrete host aliases from an OpenSSH config, following Include.
 
@@ -312,7 +327,7 @@ def ssh_config_hosts(path=None, _seen=None):
         elif key == "host":
             for pattern in parts[1:]:
                 pattern = pattern.strip('"')
-                if not pattern or any(c in pattern for c in "*?!"):
+                if not valid_host(pattern) or any(c in pattern for c in "*?!"):
                     continue
                 hosts.append(pattern)
     out, dedupe = [], set()
@@ -385,9 +400,13 @@ def _safe_extract(tar, dest):
     anything that would resolve outside it (a `..` component, a symlink, a
     device node) is dropped rather than sanitised, since a well-behaved remote
     never sends one.
+
+    Returns (extracted, failed). A member that was refused as unsafe is not a
+    failure; one that was fine but could not be written (disk full, a locked
+    file) is, because the caller must not treat the fetch as having brought it.
     """
     dest = os.path.abspath(dest)
-    count = 0
+    count = failed = 0
     for member in tar:
         if not member.isfile():
             continue
@@ -403,8 +422,8 @@ def _safe_extract(tar, dest):
             tar.extract(member, dest, **_EXTRACT_KW)
             count += 1
         except (OSError, tarfile.TarError):
-            continue
-    return count
+            failed += 1
+    return count, failed
 
 
 def host_cache_dir(host):
@@ -456,6 +475,11 @@ def fetch_remote(host, since=0, depth=DEFAULT_REMOTE_DEPTH,
     "no_claude", "other"). This never raises: a host-level problem must not
     take the whole report - or the background receiver - down with it.
 
+    A transfer that arrives but cannot be fully written to the cache is an
+    error too, with `files` still counting what did land. The caller records
+    a success by the absence of `error`, and a success moves the incremental
+    cutoff forward, past files that were never stored.
+
     Three separate limits keep a bad host cheap rather than annoying:
       * BatchMode + NumberOfPasswordPrompts=0 - a missing key fails in well
         under a second instead of blocking on a password prompt.
@@ -475,8 +499,13 @@ def fetch_remote(host, since=0, depth=DEFAULT_REMOTE_DEPTH,
             result["kind"] = kind or classify_error(error)
         return result
 
+    if not valid_host(host):
+        return done("invalid host name %r" % (host,), "other")
     if not shutil.which("ssh"):
         return done("ssh not found on PATH", "other")
+    # "--" ends ssh's own options, so a host is only ever a destination. The
+    # remote command after it is unaffected: ssh joins everything past the
+    # host into the command string.
     cmd = ["ssh",
            "-o", "BatchMode=yes",
            "-o", "NumberOfPasswordPrompts=0",
@@ -485,7 +514,7 @@ def fetch_remote(host, since=0, depth=DEFAULT_REMOTE_DEPTH,
            "-o", "ServerAliveCountMax=3",
            "-o", "StrictHostKeyChecking=accept-new",
            *ssh_opts,
-           host, "sh", "-s", "--", str(depth), str(int(since))]
+           "--", host, "sh", "-s", "--", str(depth), str(int(since))]
     tmp = None
     try:
         fd, tmp = tempfile.mkstemp(prefix="claude-lens-", suffix=".tar.gz")
@@ -499,14 +528,29 @@ def fetch_remote(host, since=0, depth=DEFAULT_REMOTE_DEPTH,
                                   if sys.platform == "win32" else 0)
         if proc.returncode == 3:
             return done("no Claude directory found on this machine", "no_claude")
-        if proc.returncode != 0:
-            err = (proc.stderr or b"").decode("utf-8", "replace").strip()
-            lines = [ln for ln in err.splitlines() if ln.strip()]
+        err = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        lines = [ln for ln in err.splitlines() if ln.strip()]
+        # GNU tar exits 1 for "file changed as we read it", which on a machine
+        # with a live session is the normal state of a transcript being
+        # appended to. The archive it wrote is complete, so exit 1 is not a
+        # verdict on its own: it is let through and the archive itself is the
+        # judge - a transfer that really failed does not read back cleanly,
+        # and is reported below with the remote's own message.
+        if proc.returncode not in (0, 1):
             return done((lines[-1] if lines
                          else f"ssh exited {proc.returncode}")[:200])
         os.makedirs(result["cache"], exist_ok=True)
-        with tarfile.open(tmp, mode="r|gz") as tar:
-            result["files"] = _safe_extract(tar, result["cache"])
+        try:
+            with tarfile.open(tmp, mode="r|gz") as tar:
+                result["files"], failed = _safe_extract(tar, result["cache"])
+        except (tarfile.TarError, EOFError, OSError, zlib.error) as exc:
+            if proc.returncode == 1:
+                return done((lines[-1] if lines
+                             else "ssh exited 1")[:200])
+            raise
+        if failed:
+            return done("%d file(s) fetched but could not be written to the "
+                        "cache" % failed, "other")
     except subprocess.TimeoutExpired:
         return done(f"timed out after {timeout}s", "unreachable")
     except Exception as exc:  # noqa: BLE001 - nothing here may reach the caller
@@ -793,6 +837,40 @@ def config_db_path(path=CONFIG_PATH):
     return value or None
 
 
+def _config_list(raw, key, path_name):
+    """A list of strings from the config, or [] with a note if it is not one.
+
+    A bare string where a list belongs ("remotes": "build-server") would
+    iterate by character, and a number would not iterate at all, so neither is
+    guessed at. Entries that are not strings are dropped one by one.
+    """
+    value = raw.get(key)
+    if value is None or value == []:
+        return []
+    if not isinstance(value, list):
+        _warn(f"ignoring {key} in {path_name}: expected a list")
+        return []
+    out = [v for v in value if isinstance(v, str) and v]
+    if len(out) != len(value):
+        _warn(f"ignoring non-string entries in {key} in {path_name}")
+    return out
+
+
+def _config_int(raw, key, default, path_name):
+    value = raw.get(key, default)
+    # bool is an int subclass, and "depth": true is not a depth.
+    if not isinstance(value, bool):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+    _warn(f"ignoring {key} in {path_name}: expected a number")
+    return default
+
+
+_bad_hosts_noted = set()    # so the hourly receiver pass says it once
+
+
 class SourceConfig:
     """Which places to look. Loaded from sources.json, overridden by CLI flags.
 
@@ -851,22 +929,29 @@ class SourceConfig:
         except (OSError, ValueError) as exc:
             _warn(f"ignoring {os.path.basename(path)}: {exc}")
             return cls()
+        name = os.path.basename(path)
+        if not isinstance(raw, dict):
+            _warn(f"ignoring {name}: expected a JSON object")
+            return cls()
+        lst = lambda key: _config_list(raw, key, name)  # noqa: E731
+        num = lambda key, default: _config_int(raw, key, default, name)  # noqa: E731
+        db_path = raw.get("db")
         return cls(
-            extra_locations=raw.get("extra_locations") or [],
+            extra_locations=lst("extra_locations"),
             scan_siblings=raw.get("scan_sibling_claude_dirs", True),
-            depth=int(raw.get("depth", DEFAULT_DEPTH)),
-            remotes=raw.get("remotes") or [],
+            depth=num("depth", DEFAULT_DEPTH),
+            remotes=lst("remotes"),
             use_ssh_config=bool(raw.get("use_ssh_config", False)),
-            ssh_timeout=int(raw.get("ssh_timeout", DEFAULT_SSH_TIMEOUT)),
-            ssh_connect_timeout=int(raw.get("ssh_connect_timeout",
-                                            DEFAULT_CONNECT_TIMEOUT)),
-            remote_budget=int(raw.get("remote_budget", DEFAULT_REMOTE_BUDGET)),
-            ssh_options=raw.get("ssh_options") or [],
+            ssh_timeout=num("ssh_timeout", DEFAULT_SSH_TIMEOUT),
+            ssh_connect_timeout=num("ssh_connect_timeout",
+                                    DEFAULT_CONNECT_TIMEOUT),
+            remote_budget=num("remote_budget", DEFAULT_REMOTE_BUDGET),
+            ssh_options=lst("ssh_options"),
             cowork=bool(raw.get("cowork", True)),
-            cowork_paths=raw.get("cowork_paths") or [],
-            code_session_paths=raw.get("code_session_paths") or [],
-            plan_usage_paths=raw.get("plan_usage_paths") or [],
-            db_path=raw.get("db") or None,
+            cowork_paths=lst("cowork_paths"),
+            code_session_paths=lst("code_session_paths"),
+            plan_usage_paths=lst("plan_usage_paths"),
+            db_path=db_path if isinstance(db_path, str) and db_path else None,
         )
 
 
@@ -875,6 +960,14 @@ class SourceConfig:
         out, seen = [], set()
         for h in list(self.remotes) + (ssh_config_hosts()
                                        if self.use_ssh_config else []):
+            # Checked here as well as where the config is read: --remote
+            # appends straight to `remotes`, and this is the one place every
+            # route to a host passes through.
+            if not valid_host(h):
+                if repr(h) not in _bad_hosts_noted:
+                    _bad_hosts_noted.add(repr(h))
+                    _warn(f"ignoring invalid remote host {h!r}")
+                continue
             if h not in seen:
                 seen.add(h)
                 out.append(h)
