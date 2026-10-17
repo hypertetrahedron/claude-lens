@@ -136,15 +136,20 @@ def _describe(name):
     return (name[:-5].replace("-", " ").replace("_", " "), "Report")
 
 
-def entries():
-    """Every report to link: the live pages first, then reports/ newest-first."""
+def entries(redact=False):
+    """Every report to link: the live pages first, then reports/ newest-first.
+
+    `redact` leaves out what a --no-prompt-text build withholds: the
+    conversations index lists prompt text, and the /insights link is a file:
+    URL under the home directory, so it names the account.
+    """
     out = []
     dash = os.path.join(BASE, "dashboard.html")
     if os.path.exists(dash):
         out.append({"href": "dashboard.html", "title": "Usage dashboard",
                     "kind": "Live dashboard", "mtime": _mtime(dash),
                     "primary": True})
-    for extra in (_conversations(BASE), _insights_report()):
+    for extra in (() if redact else (_conversations(BASE), _insights_report())):
         if extra:
             out.append(extra)
 
@@ -205,15 +210,18 @@ def _atomic_write(path, text):
         raise
 
 
-def build(output=None):
+def build(output=None, redact=False):
     """(Re)write index.html. Returns the path written.
 
     The destination is resolved at call time rather than bound as a default,
     so redirecting the module's OUTPUT actually takes effect - which is what
     tests need in order not to write into the working copy.
+
+    `redact` is entries()'s: a redacted dashboard build asks for an index that
+    does not link what that build withheld.
     """
     output = output or OUTPUT
-    items = entries()
+    items = entries(redact)
     rows = "".join(
         "<tr class='{cls}'><td><a href='{href}'>{title}</a></td>"
         "<td class='muted'>{kind}</td><td class='n muted'>{when}</td></tr>".format(

@@ -734,6 +734,27 @@ class DesktopExtras(unittest.TestCase):
                          [(1_000_000_000.0, 100, 0),      # clamped to 0..100
                           (2_000_000_000.0, 5, 10)])      # sorted oldest first
 
+    def test_plan_usage_keeps_hourly_peaks_for_local_days(self):
+        """`hours` lets the page fold the gauges into the viewer's own days.
+
+        The two samples share a UTC day but sit either side of an hour, so
+        they must land in separate hour buckets with their own peaks while
+        `days` keeps the UTC maximum of both.
+        """
+        import build_dashboard as bd
+        path = os.path.join(self.tmp, "plan.json")
+        base = 1_800_000_000 // 3600 * 3600          # an hour boundary, UTC
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"samples": [
+                {"t": (base + 60) * 1000, "u": {"fh": 30, "sd": 5}},
+                {"t": (base + 120) * 1000, "u": {"fh": 10, "sd": 7}},
+                {"t": (base + 3660) * 1000, "u": {"fh": 50, "sd": 6}},
+            ]}, f)
+        got = bd.plan_usage(sources.SourceConfig(plan_usage_paths=[path]))
+        self.assertEqual(got["hours"], {str(base): [30, 7],
+                                        str(base + 3600): [50, 6]})
+        self.assertEqual(list(got["days"].values()), [[50, 7]])
+
     def test_plan_usage_is_absent_not_fatal(self):
         self.assertEqual(sources.plan_usage_samples([os.path.join(self.tmp, "no")]), [])
         for bad in ("not json", "[]", '{"samples": "nope"}'):
@@ -998,7 +1019,12 @@ class ReceiverStaleness(unittest.TestCase):
     def test_fingerprint_notices_a_changed_file(self):
         import receiver
         before = receiver.code_fingerprint()
-        self.assertTrue(all(v is not None for v in before.values()))
+        # pricing.local.json is optional: it is watched so that creating it is
+        # noticed, and so its absence is a fingerprint value, not an error.
+        self.assertTrue(all(v is not None for k, v in before.items()
+                            if k != "pricing.local.json"))
+        self.assertIn("pricing.local.json", before)
+        self.assertIn("conversations.py", before)
         self.assertIn("template.html", before)
         self.assertIn("build_dashboard.py", before)
 
@@ -1040,6 +1066,26 @@ class TemplateWiring(unittest.TestCase):
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "template.html"), encoding="utf-8") as f:
             cls.html = f.read()
+
+    def test_times_go_through_the_zone_aware_formatters(self):
+        """One zone for every time on the page, chosen by the tz toggle.
+
+        The table and the day buckets used to be UTC while "Today" began at
+        local midnight and the timeline printed local time. Each of those was
+        a raw ISO slice or a toLocale* call; any that comes back reintroduces
+        the split, so their spellings are what this looks for.
+        """
+        self.assertIn('id="tz-btn"', self.html)
+        self.assertIn('localStorage.getItem("ccu-tz")', self.html)
+        self.assertNotIn('.slice(0, 16).replace("T", " ")', self.html)
+        self.assertNotIn('.replace("T", " ").slice(0, 16)', self.html)
+        self.assertNotIn("toLocaleTimeString", self.html)
+        self.assertNotIn("toDateString", self.html)
+        # buckets are part of the day cache key, so a toggle must invalidate it
+        self.assertIn("JSON.stringify(state.rf), tzLocal]", self.html)
+        # so must both tables' row caches, which hold formatted times
+        self.assertIn('state.kind + "|" + tzLocal', self.html)
+        self.assertIn('const sk = state.kind + "|" + tzLocal;', self.html)
 
     def test_the_timeline_svg_is_not_announced_as_one_flat_image(self):
         """role="img" flattens the subtree, hiding its own focusable children.
@@ -1250,7 +1296,8 @@ class TemplateWiring(unittest.TestCase):
         self.assertIn("cell: r => el(\"td\", \"muted proj\", projLabel(r.project))",
                       self.html)
         self.assertIn("const g = projLabel(r.project);", self.html)
-        self.assertIn("esc(projLabel(r.project))", self.html)
+        # the CSV cell is escaped once, by the row builder's .map(esc)
+        self.assertIn("r.ts, projLabel(r.project), r.text,", self.html)
 
     def test_view_switch_is_wired(self):
         """The Prompts/Sessions toggle and its state must exist and persist."""
@@ -1484,8 +1531,7 @@ class TemplateWiring(unittest.TestCase):
         """blocks/heat use their own draw(); ctx/miss ride the day-bucket path."""
         for key in ("blocks", "heat", "ctx", "miss"):
             self.assertIn('value="%s"' % key, self.html)
-        self.assertIn("blocks:{ title: \"Cost per 5-hour billing block\", draw: drawBlocks }",
-                      self.html)
+        self.assertRegex(self.html, r'blocks:\{ title: "Cost per 5-hour billing block[^"]*",\s*draw: drawBlocks \}')
         self.assertIn('heat:  { title: "Daily cost", draw: drawHeatmap }', self.html)
         self.assertIn("function drawBlocks", self.html)
         self.assertIn("function drawHeatmap", self.html)
@@ -1815,6 +1861,72 @@ class TemplateWiring(unittest.TestCase):
                     "state.cols", "state.group", "state.ssort", "state.sdir"):
             self.assertNotIn(key, body,
                              key + " is not a filter and must survive a reset")
+
+    def test_csv_escapes_once_and_defuses_formulas(self):
+        """A cell is escaped exactly once, and a text cell cannot be a formula.
+
+        The row builder escaped text, project and models itself and then ran
+        every cell through the same function again, quadrupling each quote.
+        Prompt text is outside input, so a cell that opens with = + - @ TAB or
+        CR gets a leading apostrophe - but only strings: a negative number
+        has to stay a number.
+        """
+        m = re.search(r"function exportCsv\(\) \{.*?\n\}\n", self.html, re.S)
+        self.assertTrue(m, "exportCsv not found")
+        body = m.group(0)
+        self.assertNotIn("esc(projLabel", body)
+        self.assertNotIn("esc(r.text)", body)
+        self.assertIn(".map(esc)", body)
+        self.assertIn('typeof v === "string" && /^[=+\\-@\\t\\r]/', body)
+
+    def test_restored_state_is_validated(self):
+        """A hand-edited or stale ccu-state must not throw or light nothing."""
+        self.assertIn('const RANGE_VALUES = [0, 1, 7, 30, 90, "mtd"];', self.html)
+        self.assertIn("RANGE_VALUES.includes(saved.range)", self.html)
+        self.assertIn('typeof saved.chart === "string"', self.html)
+        self.assertNotIn("state.range = saved.range", self.html)
+        # the whitelist is the range buttons' own values
+        seg = re.findall(r'<button data-range="([^"]+)"',
+                         self.html.split('id="range-seg"')[1].split("</div>")[0])
+        self.assertEqual(sorted(seg), sorted(["0", "1", "7", "30", "90", "mtd"]))
+        # chart names are looked up as own keys, not through the prototype
+        self.assertIn("hasOwnProperty.call(CHARTS, state.chart)", self.html)
+
+    def test_blocks_chart_is_account_wide_and_subscription_only(self):
+        """The 5h blocks chart ignores filters, says so, and goes with the tiles."""
+        self.assertRegex(self.html,
+                         r'blocks:\{ title: "[^"]*account-wide[^"]*"')
+        m = re.search(r'if \(DATA\.subscription === false\) \{\s*'
+                      r'for \(const o of \[\.\.\.\$\("chart-sel"\)\.options\]\)\s*'
+                      r'if \(o\.value === "blocks"\) o\.remove\(\);', self.html)
+        self.assertTrue(m, "blocks option is not removed without a subscription")
+
+    def test_window_and_blocks_state_whether_cost_is_estimated(self):
+        """The window tile and block chart honour est/unpriced, never assume exact."""
+        # 0 from the column-encoded blocks table is "measured", not missing
+        self.assertIn("const isEst = (x) => x.est == null ? true : !!x.est;", self.html)
+        self.assertIn('fmtCost(w.cost, isEst(w))', self.html)
+        self.assertIn("fmtCost(b.cost || 0, isEst(b))", self.html)
+        self.assertIn("unpricedNote(w.unpriced || 0)", self.html)
+        self.assertIn("unpricedNote(b.unpriced)", self.html)
+        self.assertIn("on unpriced models counted as $0", self.html)
+
+    def test_cache_cause_counts_only_the_shown_rows_misses(self):
+        """"mostly <cause>" tallies misses owned by the filtered rows."""
+        self.assertIn("function missCauseCounts(rs)", self.html)
+        self.assertIn("shown.has(owner)", self.html)
+        self.assertIn("missCauseCounts(rs)", self.html)
+
+    def test_daily_axis_keeps_the_newest_days(self):
+        """Over 400 days the axis is cut from the old end, and says so."""
+        self.assertIn("MAX_AXIS_DAYS", self.html)
+        self.assertIn("seq.unshift(key)", self.html)
+        self.assertIn("not drawn", self.html)
+
+    def test_timeline_lifts_its_width_cap_before_measuring(self):
+        i = self.html.index('plot.style.maxWidth = "";')
+        j = self.html.index("plot.clientWidth", i)
+        self.assertLess(i, j)
 
 
 class SshConfig(unittest.TestCase):
@@ -2149,6 +2261,170 @@ class ReportIndex(unittest.TestCase):
             self.assertNotIn("reports/index.html", html)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class RemoteHardening(unittest.TestCase):
+    """What fetch_remote hands to ssh, and what it makes of the answer.
+
+    subprocess.run is replaced, so nothing here opens a connection: the
+    argument vector and the handling of the result are the point.
+    """
+
+    @staticmethod
+    def _archive(path, names=("home/.claude/projects/p/a.jsonl",)):
+        import io
+        with tarfile.open(path, "w:gz") as tar:
+            for name in names:
+                data = b"{}\n"
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+
+    def _run(self, host="build-server", returncode=0, archive=True,
+             stderr=b"", garbage=False):
+        """fetch_remote against a fake ssh; returns (result, argv or None)."""
+        seen = {}
+        tmp = tempfile.mkdtemp(prefix="claude-lens-fetch-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        src = os.path.join(tmp, "src.tar.gz")
+        self._archive(src)
+
+        def fake_run(cmd, input=None, stdout=None, stderr=None, timeout=None,
+                     **kwargs):
+            seen["argv"] = list(cmd)
+            if garbage:
+                stdout.write(b"this is not a gzip stream")
+            elif archive:
+                with open(src, "rb") as f:
+                    stdout.write(f.read())
+            return subprocess.CompletedProcess(cmd, returncode, None, fake_err)
+
+        fake_err = stderr
+        real_run, real_which = sources.subprocess.run, sources.shutil.which
+        real_cache = sources.REMOTE_CACHE
+        sources.subprocess.run = fake_run
+        sources.shutil.which = lambda name: name
+        sources.REMOTE_CACHE = os.path.join(tmp, "cache")
+
+        def restore():
+            sources.subprocess.run = real_run
+            sources.shutil.which = real_which
+            sources.REMOTE_CACHE = real_cache
+        self.addCleanup(restore)
+        return sources.fetch_remote(host), seen.get("argv")
+
+    def test_a_host_that_looks_like_an_option_never_reaches_ssh(self):
+        res, argv = self._run(host="-oProxyCommand=calc")
+        self.assertIsNone(argv, "ssh must not be run for this host")
+        self.assertTrue(res["error"])
+        self.assertEqual(res["kind"], "other")
+
+    def test_whitespace_in_a_host_is_refused(self):
+        for bad in ("a b", "a\tb", "a\nb", "", "-x", "a\x00b"):
+            self.assertFalse(sources.valid_host(bad), repr(bad))
+        for good in ("build-server", "user@10.0.0.1", "mac_mini.local"):
+            self.assertTrue(sources.valid_host(good), good)
+
+    def test_options_end_before_the_host(self):
+        res, argv = self._run()
+        self.assertIsNone(res["error"])
+        i = argv.index("build-server")
+        self.assertEqual(argv[i - 1], "--")
+        self.assertEqual(argv[i + 1:i + 4], ["sh", "-s", "--"])
+
+    def test_ssh_config_cannot_inject_an_option_host(self):
+        tmp = tempfile.mkdtemp(prefix="claude-lens-ssh-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        cfg = os.path.join(tmp, "config")
+        with open(cfg, "w", encoding="utf-8") as f:
+            f.write("Host -oProxyCommand fine-box\n")
+        self.assertEqual(sources.ssh_config_hosts(cfg), ["fine-box"])
+
+    def test_hosts_drops_invalid_remotes(self):
+        cfg = sources.SourceConfig(remotes=["ok", "-oProxyCommand=x", 5, ""])
+        self.assertEqual(cfg.hosts(), ["ok"])
+
+    def test_tar_exit_1_with_a_readable_archive_is_success(self):
+        res, _ = self._run(returncode=1,
+                           stderr=b"tar: ./a.jsonl: file changed as we read it")
+        self.assertIsNone(res["error"], res)
+        self.assertEqual(res["files"], 1)
+
+    def test_exit_1_without_a_readable_archive_is_still_a_failure(self):
+        res, _ = self._run(returncode=1, garbage=True,
+                           stderr=b"something went wrong remotely")
+        self.assertEqual(res["error"], "something went wrong remotely")
+
+    def test_other_exit_codes_still_fail(self):
+        res, _ = self._run(returncode=2, stderr=b"boom")
+        self.assertEqual(res["error"], "boom")
+
+    def test_unwritable_members_are_an_error_so_the_cutoff_stays_put(self):
+        real = tarfile.TarFile.extract
+
+        def broken(self, *a, **kw):
+            raise OSError("disk full")
+        tarfile.TarFile.extract = broken
+        self.addCleanup(setattr, tarfile.TarFile, "extract", real)
+        res, _ = self._run()
+        self.assertTrue(res["error"])
+        self.assertIn("could not be written", res["error"])
+        self.assertEqual(res["files"], 0)
+
+    def test_safe_extract_counts_failures(self):
+        tmp = tempfile.mkdtemp(prefix="claude-lens-fetch-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        src = os.path.join(tmp, "a.tar.gz")
+        self._archive(src)
+        with tarfile.open(src, mode="r|gz") as tar:
+            self.assertEqual(
+                sources._safe_extract(tar, os.path.join(tmp, "out")), (1, 0))
+
+
+class ConfigTypes(unittest.TestCase):
+    """sources.json is hand-edited; a wrong type must not take ingest down."""
+
+    def _load(self, raw):
+        tmp = tempfile.mkdtemp(prefix="claude-lens-cfg-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, "sources.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(raw if isinstance(raw, str) else json.dumps(raw))
+        real = sources._warn
+        notes = []
+        sources._warn = notes.append
+        self.addCleanup(setattr, sources, "_warn", real)
+        return sources.SourceConfig.load(path), notes
+
+    def test_a_string_where_a_list_belongs_is_not_iterated(self):
+        cfg, notes = self._load({"remotes": "build-server"})
+        self.assertEqual(cfg.hosts(), [])
+        self.assertTrue(notes)
+
+    def test_non_string_entries_are_dropped(self):
+        cfg, notes = self._load({"remotes": ["ok", 5, None, {"a": 1}],
+                                 "ssh_options": ["-i", 7],
+                                 "extra_locations": [3]})
+        self.assertEqual(cfg.hosts(), ["ok"])
+        self.assertEqual(cfg.ssh_options, ["-i"])
+        self.assertEqual(cfg.extra_locations, [])
+
+    def test_bad_numbers_fall_back_to_the_default(self):
+        cfg, _ = self._load({"depth": "deep", "ssh_timeout": None,
+                             "remote_budget": [1], "ssh_connect_timeout": True})
+        self.assertEqual(cfg.depth, sources.DEFAULT_DEPTH)
+        self.assertEqual(cfg.ssh_timeout, sources.DEFAULT_SSH_TIMEOUT)
+        self.assertEqual(cfg.remote_budget, sources.DEFAULT_REMOTE_BUDGET)
+        self.assertEqual(cfg.ssh_connect_timeout, sources.DEFAULT_CONNECT_TIMEOUT)
+
+    def test_a_non_object_file_is_ignored(self):
+        cfg, notes = self._load("[1, 2]")
+        self.assertEqual(cfg.hosts(), [])
+        self.assertTrue(notes)
+
+    def test_a_non_string_db_is_ignored(self):
+        cfg, _ = self._load({"db": 5})
+        self.assertIsNone(cfg.db_path)
 
 
 if __name__ == "__main__":

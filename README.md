@@ -252,6 +252,15 @@ build-server                 never                    3  backing off 6h - Permis
 An explicit `--remote HOST` run always ignores the backoff — if you just fixed
 the key, you do not have to wait for it.
 
+A host name that starts with `-` or contains whitespace is refused wherever it
+comes from (`--remote`, `sources.json`, `~/.ssh/config`), and the host is
+passed to ssh after `--`: otherwise `-oProxyCommand=...` in a config file would
+be an option, and ssh would run it. A fetch where some files could not be
+written to the cache (a Windows path over 260 characters, say) counts as a
+failure, so those files are fetched again rather than skipped for good; tar's
+"file changed as we read it", which an active session on the remote causes,
+does not.
+
 ## Older transcript formats
 
 Claude Code's transcript format has changed over time, and Claude Lens reads
@@ -585,7 +594,11 @@ tile.
 ### 5-hour blocks and the burn-rate tile
 
 The **5h blocks** chart view draws one bar per ccusage-style billing block
-(cost on the y axis, the open block outlined), honouring the date range. A
+(cost on the y axis, the open block outlined), honouring the date range and
+nothing else - it is account-wide, and its title says so; it is not offered on a
+Bedrock/Vertex install. A block's cost reads `~$` when any request in it was
+costed from the rate table rather than reported by the CLI, and requests on
+unpriced models are counted in its tooltip rather than silently added as $0. A
 **Current 5h block** tile shows the open block's burn rate — tokens/min,
 $/min, projected cost at close, minutes left — from the payload's `burn`
 figure; it is hidden entirely between blocks (nothing to project) and on a
@@ -615,15 +628,22 @@ shown with a `~` prefix. Live rows use the CLI's own figure and are never
 re-estimated. A model with no entry is **named on the page and counted as
 $0.00 deliberately**; an unknown cost is not a zero cost.
 
+Ids match a table key by prefix, but only at a boundary: a date or a `[1m]`
+may follow the key, a longer version number may not. `claude-opus-5-5` is not
+`claude-opus-5` with a suffix, and before this rule it was billed as one - 83%
+over on Opus 5.5's real $4/$20 - while the page called it priced. A model the
+table has never heard of now comes out unpriced and named, never as its
+nearest neighbour.
+
 Four things can move a request off the base rate, and `pricing.resolve()`
 applies them in this order:
 
 | | What it does | Applies to |
 |---|---|---|
 | Promotion (`INTRO_PRICES`) | A rate that expires on a date, applied only when the request's timestamp is before it | First-party only — a promotion on the Anthropic API says nothing about a marketplace's rate card. Empty today: Claude Sonnet 5's $2/$10 lived here until the September 2026 rise was cancelled and the rate became permanent |
-| Fast mode (`FAST_PRICES`) | 2x list for requests the transcript recorded as `usage.speed = "fast"` | Claude Opus 5 and Opus 4.8, Anthropic provider only — fast mode is not offered on Bedrock, Vertex or Foundry |
+| Fast mode (`FAST_PRICES`) | 2x list for requests the transcript recorded as `usage.speed = "fast"` | Claude Opus 5.5 ($8/$40), Opus 5 and Opus 4.8, Anthropic provider only — fast mode is not offered on Bedrock, Vertex or Foundry |
 | Data residency (`GEO_PREMIUM_MULT`) | 1.1x input and output when a request pinned inference to a geography (`usage.inference_geo = "us"`) | Models that support pinning — Opus 4.6 / Sonnet 4.6 and later, first-party only |
-| Cache read (`CACHE_READ_MULT_BY_MODEL`) | A per-model multiple of the input rate, default 0.1 | Claude Fable 5.1 and Claude Mythos 5.1 read cache at **0.025x** — $0.25/MTok against a $10 input rate. On a cache-heavy agent, using 0.1x there overstates the bill fourfold |
+| Cache read (`CACHE_READ_MULT_BY_MODEL`) | A per-model multiple of the input rate, default 0.1 | Claude Fable 5.1 and Claude Mythos 5.1 read cache at **0.025x** — $0.25/MTok against a $10 input rate. On a cache-heavy agent, using 0.1x there overstates the bill fourfold. Claude Opus 5.5 reads at **0.05x** ($0.20 against $4) |
 
 The cache multipliers apply to whichever input rate came out of the first
 three, so a fast-mode cache read costs a tenth of the *fast* input rate, not
@@ -801,7 +821,7 @@ your machine or your history gets long:
 
 | Flag | Effect |
 |---|---|
-| `--no-prompt-text` | Blanks prompt text. Every number survives; nothing you typed is embedded. The page says it was redacted, no conversation pages are written, and the `/insights` link is withheld: it is a `file:` URL under your home directory, so it carries your account name. |
+| `--no-prompt-text` | Blanks prompt text and session titles (a title summarises the conversation). Every number survives; nothing you typed is embedded. The page says it was redacted, no conversation pages are written (earlier ones are removed), and the `/insights` link is withheld from the page and from `index.html`: it is a `file:` URL under your home directory, so it carries your account name. |
 | `--max-rows N` | Embeds only the newest N prompts (default 8000; `0` for no limit). |
 | `--conversations N` | Writes a conversation page for the newest N prompts (default 300; `0` for none). |
 | `--db PATH` | Reads a database somewhere other than beside the script. |
@@ -852,7 +872,11 @@ lists them all and is linked from the landing page.
 Three things are worth knowing:
 
 - **They are prompt text.** `--no-prompt-text` writes none, for the same
-  reason it blanks the rows.
+  reason it blanks the rows - and removes any an earlier build left behind,
+  which would otherwise still be on disk and linked from `index.html`.
+- **They follow the figures, not just the transcript.** Each page carries a
+  fingerprint of its costs, so a pricing fix or a late telemetry row rewrites
+  it even though its transcript never changed.
 - **They are escaped, not sanitised.** Everything from a transcript goes
   through `html.escape`, and the pages carry no JavaScript at all -- a prompt
   containing `<script>` renders as those nine characters.
@@ -955,8 +979,9 @@ it to be noisy.
 
 ## Optional: weekly digest
 
-`python digest.py` writes a self-contained report for the last 7 full days
-(UTC) to `reports/digest-<YYYY>-W<week>.html`. `--db PATH` reads a database
+`python digest.py` writes a self-contained report for the last complete ISO
+week, Monday to Monday (UTC), to `reports/digest-<YYYY>-W<week>.html` - run on
+any day, it reports the same week its filename names. `--db PATH` reads a database
 elsewhere.
 
 Every headline figure carries **the week before it** — cost, prompts, output
@@ -1094,7 +1119,9 @@ counterfactual.
   nothing extra. Escape or a scroll dismisses it.
 - **Current 5h window tile** — ccusage-style rate-limit block (starts at the
   floored hour of the first request after the previous block ends): output
-  tokens, cost, reset time. Global, not filter-scoped.
+  tokens, cost, reset time. Global, not filter-scoped. It is the open block
+  itself, so the tile and the block chart always count the same requests,
+  and it marks an estimate with `~$` the same way.
 - **Errors tile** — tool-call errors and their share of tool calls, for the
   filtered rows; the hint adds the account-wide count of API-level errors
   (OTel `claude_code.api_error`), which has no per-prompt home so it rides
@@ -1129,10 +1156,19 @@ counterfactual.
   thinking tokens, fast calls, max-token stops, web searches, peak context,
   cache misses and their cost, and the session id (click it to filter the
   table to that session). Errors is the one opt-in column shown by default;
-  a row with any errors gets a red-tinted count. All of these export to CSV.
-- **Date range** — Today, 7d, **MTD** (calendar month to date, in your own
-  timezone), 30d, 90d, All. MTD is a calendar period rather than a rolling
-  window, so early in the month it covers less than 7d.
+  a row with any errors gets a red-tinted count. All of these export to CSV;
+  a text cell starting with `=`, `+`, `-` or `@` is written with a leading `'`
+  so a spreadsheet shows it rather than running it as a formula.
+- **Date range** — Today, 7d, **MTD** (calendar month to date), 30d, 90d,
+  All. MTD is a calendar period rather than a rolling window, so early in the
+  month it covers less than 7d.
+- **UTC or local time** — the button beside Theme switches every time on the
+  page between UTC (the default) and this computer's own zone, and the choice
+  is remembered. It moves the day boundaries too, not only the printed
+  times: the daily chart's buckets, the calendar, the plan-limit days and
+  where Today, 7d and MTD begin all follow it, so a prompt at 23:30 sits on
+  the day its row says. CSV export keeps the raw UTC instants either way, and
+  the conversation pages and the weekly digest are UTC.
 - **Product selector** — when a database holds more than one Claude product,
   a selector appears between the date range and the project list, offering
   **All products**, **Claude Code** and **Claude Cowork**. It scopes
@@ -1334,6 +1370,7 @@ add a changelog line in `db.py` and below.
 | 7 | `api_requests.provider` and `.model_raw` — model ids are stored canonically with the original kept alongside, so Bedrock and Vertex ids resolve against the pricing table. Existing rows are normalised in place |
 | 8 | Per-request detail: `api_requests` gains `effort`, `speed`, `thinking_tokens`, `stop_reason`, `server_tool_requests`, `service_tier`, `inference_geo`, `context_tokens`, `cost_basis` and `error`; `tool_calls` gains `input_bytes`, `result_bytes`, `is_error`, `duration_ms` and `error_type`; `sessions` gains `git_branch`, `cli_version`, `entrypoint`, `permission_mode`, `transcript_path`, `first_ts` and `last_ts`; `prompts` gains `kind`. New tables `agents` (one row per subagent launch, with the requested and resolved model) and `session_events` (context readings, compactions, model/effort/speed switches). Transcript rows stop being insert-or-ignore: a re-parse may raise an existing transcript row but never lower it, and never touches an OTel row. Clears `ingest_state` to force that re-parse, and strips the `agent-` filename prefix from `agent_name` so subagent rows join `agents` |
 | 9 | Repairs two columns live telemetry had been overwriting, and indexes two hot lookups. OTel wrote the subagent *type* into `agent_name`, where a transcript writes the CLI's agentId — the only value that joins the `agents` table — so a live machine lost every subagent span, resolved model and description. `agent_name` now fills rather than replaces, the receiver stops sending the type (`query_source` already carries it as `agent:builtin:<type>`), and OTel rows holding a type are cleared so a re-parse restores the id. OTel rows written before the cache-TTL fix stored `0`/`0` for the 5m/1h split; zero is a value `COALESCE` keeps, so no re-parse could correct them and the writes were billed at the unsplit 1h multiplier — those are reset to NULL and refilled. Adds `idx_tool_session` and `idx_prompts_session`. Clears `ingest_state` |
+| 10 | No column change. Usage in sessions started by another agent ("peer" turns, no human prompt) is attributed to the latest prompt instead of dropped - 1,031 requests on one real machine, with every human-started session unchanged; tool calls fill `prompt_id`/`session_id`/`ts`/`agent_name` on conflict, so a live subagent call gets the transcript's agent id (and file-history recovery can run for live sessions); OTel's `<REDACTED>` prompt text is replaced by the transcript's; prompts adopt their session's project, so one session reached through two spellings of its cwd is no longer split; migrations run one locked transaction per step. Clears `ingest_state` to backfill |
 
 ## Known limitations
 

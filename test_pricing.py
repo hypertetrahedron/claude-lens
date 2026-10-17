@@ -286,6 +286,97 @@ class PrefixResolution(TableState):
         self.assertIsNone(pricing.estimate_cost(None, input_tokens=1000))
 
 
+class PrefixBoundary(TableState):
+    """A prefix match must end where a decoration starts, not mid-version."""
+
+    def test_a_longer_version_is_not_its_shorter_neighbour(self):
+        for raw in ("claude-opus-5-7", "claude-sonnet-5-7", "claude-opus-4-10",
+                    "claude-haiku-4-12"):
+            self.assertIsNone(pricing.resolve(raw), raw)
+            self.assertEqual(pricing.status(raw), "unknown", raw)
+
+    def test_opus_5_5_is_not_opus_5(self):
+        self.assertEqual(pricing.lookup("claude-opus-5-5"), (4.0, 20.0))
+        self.assertEqual(pricing.lookup("claude-opus-5"), (5.0, 25.0))
+        self.assertEqual(pricing.lookup("claude-sonnet-5-5"), (2.0, 10.0))
+
+    def test_opus_4_10_does_not_match_the_retired_4_1(self):
+        self.assertIsNone(pricing.retired_on("claude-opus-4-10"))
+        self.assertEqual(pricing.retired_on("claude-opus-4-1-20250805"),
+                         "2026-08-05")
+
+    def test_decorated_ids_still_resolve(self):
+        cases = {
+            "claude-haiku-4-5-20251001": (1.0, 5.0),
+            "claude-opus-5[1m]": (5.0, 25.0),
+            "claude-opus-5-5[1m]": (4.0, 20.0),
+            "claude-opus-5-5-20260901": (4.0, 20.0),
+            "claude-opus-4-5@20251101": (5.0, 25.0),
+            "claude-opus-5-5@20260901": (4.0, 20.0),
+            "us.anthropic.claude-opus-4-5-20251101-v1:0": (5.0, 25.0),
+            "anthropic.claude-haiku-4-5-20251001-v1:0": (1.0, 5.0),
+            "claude-opus-5-latest": (5.0, 25.0),
+        }
+        for raw, want in cases.items():
+            self.assertEqual(pricing.lookup(raw), want, raw)
+
+    def test_an_unknown_future_id_is_unpriced_not_estimated(self):
+        self.assertIsNone(pricing.estimate_cost("claude-opus-5-7",
+                                                input_tokens=1000))
+        self.assertEqual(pricing.status("claude-opus-5-7"), "unknown")
+        # ... and the overhead estimate falls back rather than borrowing
+        self.assertEqual(pricing.tool_prompt_tokens("claude-opus-5-7"),
+                         pricing.TOOL_PROMPT_DEFAULT)
+
+
+class FivePointFiveRates(TableState):
+    """Claude 5.5, first-party list prices per MTok."""
+
+    def test_list_prices(self):
+        self.assertEqual(pricing.lookup("claude-opus-5-5"), (4.0, 20.0))
+        self.assertEqual(pricing.lookup("claude-sonnet-5-5"), (2.0, 10.0))
+        self.assertEqual(pricing.lookup("claude-haiku-5-5"), (0.1, 0.5))
+
+    def test_opus_cache_read_is_twenty_cents(self):
+        self.assertEqual(pricing.resolve("claude-opus-5-5").cache_read_mult, 0.05)
+        self.assertAlmostEqual(
+            pricing.estimate_cost("claude-opus-5-5", cache_read=MTOK), 0.20)
+
+    def test_sonnet_and_haiku_read_at_the_usual_tenth(self):
+        self.assertAlmostEqual(
+            pricing.estimate_cost("claude-sonnet-5-5", cache_read=MTOK), 0.20)
+        self.assertAlmostEqual(
+            pricing.estimate_cost("claude-haiku-5-5", cache_read=MTOK), 0.01)
+
+    def test_opus_fast_mode_is_eight_and_forty(self):
+        self.assertEqual(pricing.lookup("claude-opus-5-5", speed="fast"),
+                         (8.0, 40.0))
+        # first-party only, and no other 5.5 model has a fast tier
+        self.assertEqual(
+            pricing.lookup("us.anthropic.claude-opus-5-5-v1:0", speed="fast"),
+            (4.0, 20.0))
+        self.assertEqual(pricing.lookup("claude-sonnet-5-5", speed="fast"),
+                         (2.0, 10.0))
+
+    def test_region_pinning_surcharge(self):
+        got = pricing.lookup("claude-opus-5-5", inference_geo="us")
+        self.assertAlmostEqual(got[0], 4.4)
+        self.assertAlmostEqual(got[1], 22.0)
+
+
+class EstimateCostProvider(TableState):
+    """estimate_cost bills the provider the id resolved to."""
+
+    def test_the_resolved_provider_picks_the_unsplit_multiplier(self):
+        pricing.UNSPLIT_CACHE_MULT["bedrock"] = 1.25
+        # No provider passed: the Bedrock id decides it, not the default.
+        self.assertAlmostEqual(
+            pricing.estimate_cost("us.anthropic.claude-haiku-4-5-20251001-v1:0",
+                                  cache_unsplit=MTOK), 1.25)
+        self.assertAlmostEqual(
+            pricing.estimate_cost("claude-haiku-4-5", cache_unsplit=MTOK), 2.0)
+
+
 class Retirement(TableState):
     def test_retired_models_keep_their_rates(self):
         """Old transcripts still need costing; retirement is an annotation."""

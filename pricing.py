@@ -13,11 +13,15 @@ Model ids are matched by longest prefix, so date-suffixed ids
 their base entry. The 1M-context models carry no long-context premium, so the
 "[1m]" decoration does not change the rate.
 
+A prefix only counts when it ends at a boundary (see _at_boundary): a model
+this table has never heard of, claude-opus-5-7, must come out unpriced and
+not as its neighbour claude-opus-5, which would be a confident wrong figure.
+
 What can move a rate off the base table, in the order resolve() applies it:
 
   promotion     INTRO_PRICES, a rate that expires on a date. First-party only.
-  fast mode     FAST_PRICES, Claude Opus 5 / Opus 4.8 at 2x list. First-party
-                only - fast mode does not exist on Bedrock, Vertex or Foundry.
+  fast mode     FAST_PRICES, Claude Opus 5.5 / Opus 5 / Opus 4.8 at 2x list.
+                First-party only - fast mode does not exist on Bedrock, Vertex or Foundry.
   data residency  GEO_PREMIUM_MULT, a 1.1x surcharge for pinning inference to
                 a region (inference_geo="us") on 4.6-and-later models.
 
@@ -60,12 +64,19 @@ PRICES = {
     "claude-fable-5-1": (10.0, 50.0),
     "claude-mythos-5": (10.0, 50.0),
     "claude-mythos-5-1": (10.0, 50.0),
+    "claude-opus-5-5": (4.0, 20.0),
     "claude-opus-5": (5.0, 25.0),
     "claude-opus-4-8": (5.0, 25.0),
     "claude-opus-4-7": (5.0, 25.0),
     "claude-opus-4-6": (5.0, 25.0),
+    "claude-sonnet-5-5": (2.0, 10.0),
     "claude-sonnet-5": (2.0, 10.0),
     "claude-sonnet-4-6": (3.0, 15.0),
+    # Claude Haiku 5.5 is $0.10/$0.50 for prompts up to 100K tokens and
+    # $0.50/$2.50 beyond. There is no long-context tier in this file and the
+    # rate is chosen per model, not per request, so this is the <=100K rate:
+    # a prompt over 100K is understated by 5x.
+    "claude-haiku-5-5": (0.1, 0.5),
     "claude-haiku-4-5": (1.0, 5.0),
     # Legacy / deprecated, still resolvable for historical transcripts
     "claude-opus-4-5": (5.0, 25.0),
@@ -109,8 +120,8 @@ PARTNER_PRICES = {
 INTRO_PRICES = {}
 
 # Fast mode: the same model served at up to 2.5x the output tokens per second,
-# billed at 2x list. Claude Opus 5 and Opus 4.8 only, and first-party only -
-# it is not offered on Bedrock, Vertex or Foundry, so a "fast" speed recorded
+# billed at 2x list. Claude Opus 5.5, Opus 5 and Opus 4.8 only, and
+# first-party only - it is not offered on Bedrock, Vertex or Foundry, so a "fast" speed recorded
 # against one of those is a transcript oddity, not a rate change.
 #
 # The transcript does record the speed used: message.usage.speed is "standard"
@@ -118,6 +129,7 @@ INTRO_PRICES = {}
 # or cost_at() and fast-mode requests are billed at the fast rate instead of
 # being under-counted at half price.
 FAST_PRICES = {
+    "claude-opus-5-5": (8.0, 40.0),
     "claude-opus-5": (10.0, 50.0),
     "claude-opus-4-8": (10.0, 50.0),
 }
@@ -130,6 +142,7 @@ FAST_PRICES = {
 GEO_PREMIUM_MULT = 1.1
 GEO_PREMIUM_MODELS = frozenset((
     "claude-fable-5", "claude-fable-5-1", "claude-mythos-5", "claude-mythos-5-1",
+    "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5",
     "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
     "claude-sonnet-5", "claude-sonnet-4-6",
 ))
@@ -185,7 +198,11 @@ CACHE_WRITE_1H_MULT = 2.0
 # $10/MTok input rate: 0.025x, a quarter of the usual discount rate. On a
 # cache-heavy agent that is the difference between a right answer and one four
 # times too large, which is why this is a table and not a constant.
+#
+# Claude Opus 5.5 reads at $0.20/MTok against a $4 input rate: 0.05x, half the
+# usual discount rate (and the same dollar figure as Sonnet 5.5's 0.1x of $2).
 CACHE_READ_MULT_BY_MODEL = {
+    "claude-opus-5-5": 0.05,
     "claude-fable-5-1": 0.025,
     "claude-mythos-5-1": 0.025,
 }
@@ -296,6 +313,31 @@ _BEDROCK_ARN = _re.compile(r"^arn:aws[a-z-]*:bedrock:", _re.I)
 _BEDROCK_REGION_PREFIXES = ("us.", "eu.", "apac.", "global.", "us-gov.")
 _BEDROCK_VERSION_SUFFIX = _re.compile(r"-v\d+:\d+$")
 
+# What may follow a table key for the id to still be that model. A version
+# continues in "-<1-2 digits>" (opus-5 -> opus-5-5, opus-4-1 -> opus-4-10), so
+# that spelling means a different model and is refused; a date ("-20260601"),
+# "-latest" and the like decorate the same one. canonical_model() has already
+# turned Vertex's "@date" into "-date" and removed Bedrock's "-v1:0", and
+# "[1m]" is split off before this is asked.
+_VERSION_CONTINUATION = _re.compile(r"-\d{1,2}(?:-|$)")
+# A key ending in four or more digits is the front of a date, not a version.
+_PARTIAL_DATE_KEY = _re.compile(r"-\d{4,}$")
+
+
+def _at_boundary(m, known):
+    """True when id m is table key `known`, or `known` plus a decoration."""
+    if not m.startswith(known):
+        return False
+    rest = m[len(known):]
+    if not rest:
+        return True
+    if rest[0].isdigit():
+        # Only the keys that stop mid-date (claude-opus-4-2025, for
+        # claude-opus-4-20250514) can be followed by a digit; anywhere else
+        # it is a longer number, claude-opus-4-10 against claude-opus-4-1.
+        return bool(_PARTIAL_DATE_KEY.search(known))
+    return not _VERSION_CONTINUATION.match(rest)
+
 
 def canonical_model(raw):
     """(canonical_id, provider) for a model id from any provider.
@@ -365,7 +407,7 @@ def _resolve_base(model, provider):
              or _BY_PREFIX_BY_PROVIDER[ANTHROPIC])
     m = canon.split("[")[0].strip()
     for known, _p in index:
-        if m == known or m.startswith(known):
+        if _at_boundary(m, known):
             return known, provider
     return None
 
@@ -451,7 +493,7 @@ def tool_prompt_tokens(model):
         return TOOL_PROMPT_DEFAULT
     m = canon.split("[")[0].strip()
     for known, n in _TOOL_PROMPT_BY_PREFIX:
-        if m == known or m.startswith(known):
+        if _at_boundary(m, known):
             return n
     return TOOL_PROMPT_DEFAULT
 
@@ -474,8 +516,11 @@ def estimate_cost(model, input_tokens=0, output_tokens=0, cache_read=0,
     rate = resolve(model, ts, provider, speed, inference_geo)
     if rate is None:
         return None
+    # The provider the id resolved to, not the one the caller passed: a
+    # Bedrock id handed in with no provider is still billed on Bedrock terms.
+    resolved = _resolve_base(model, provider)[1]
     return cost_at(rate, input_tokens, output_tokens, cache_read,
-                   cache_5m, cache_1h, cache_unsplit, provider)
+                   cache_5m, cache_1h, cache_unsplit, resolved)
 
 
 def cost_at(rate, input_tokens=0, output_tokens=0, cache_read=0,
