@@ -3,7 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="300">
+<!-- The 5-minute reload is scheduled by the script (see scheduleReload) so
+     it can wait for the reader; this is the fallback with scripts off. -->
+<noscript><meta http-equiv="refresh" content="300"></noscript>
 <title>Claude Lens</title>
 <style>
   :root {
@@ -1035,7 +1037,7 @@ const kindPrefix = id => (PRODUCT_META[id] || {}).prefix || "";
    prompts view ("show me this session's prompts"). It used to be dropped on
    reload outright, on the theory that a session id from a stale payload
    would filter everything away with no visible reason - but the page now
-   reloads itself every 5 minutes (the meta refresh), and over that span the
+   reloads itself every 5 minutes (the auto-refresh), and over that span the
    session almost always still exists. It is persisted like every other
    filter and validated against the freshly loaded session table below
    (`sessById`) the moment that table exists, so the one case the old comment
@@ -1087,7 +1089,7 @@ const state = { range: RANGE_VALUES.includes(saved.range) ? saved.range : DEFAUL
                 rf: sanitizeRf(saved.rf) };
 /* Everything a reload must not lose: filters, sort (both tables), the range
    filters and the view. Written on every change that affects what is on
-   screen, so the 5-minute meta refresh restores exactly what the viewer had,
+   screen, so the 5-minute auto-refresh restores exactly what the viewer had,
    not just the coarse filters this originally covered. */
 const persist = () => localStorage.setItem("ccu-state", JSON.stringify(
   { range: state.range, project: state.project, kind: state.kind,
@@ -1524,7 +1526,7 @@ function filteredSessions() {
     rfPassSession(s));
 }
 
-// A session id restored from localStorage across the meta refresh only
+// A session id restored from localStorage across the auto-refresh only
 // stays a filter if it still names a real session in this payload; see the
 // comment above `state` for why this replaced the old "never persist it".
 if (state.session && !sessById.has(state.session)) state.session = null;
@@ -4152,6 +4154,7 @@ function renderTable(rs) {
   for (const [proj, list] of order) {
     gi++;
     const gtr = el("tr", "group-row " + tint(gi));
+    gtr.__group = proj;   // what saveView() remembers a collapsed group by
     gtr.tabIndex = 0;
     gtr.setAttribute("role", "button");
     gtr.setAttribute("aria-expanded", "true");
@@ -4739,24 +4742,91 @@ renderOverheadTile();
 renderInsightsLink();
 renderCostBasisBadge();
 render();
-/* The 5-minute meta refresh reloads the whole page, which drops scroll
-   position along with everything persist() covers - restoring the filters
-   into a table the viewer is back at the top of is only half the fix. This
-   is sessionStorage, not localStorage: surviving one automatic reload is the
-   goal, not following the viewer to their next real visit, where the top of
-   a probably-different table is the right place to land. Saved on a timer
-   rather than on scroll itself, since a scroll handler firing on every pixel
-   of a fast drag is needless work for a value only ever read back once. */
-const SCROLL_KEY = "ccu-scrollY";
-function saveScroll() {
-  try { sessionStorage.setItem(SCROLL_KEY, String(scrollY || 0)); } catch {}
+/* The 5-minute auto-refresh reloads the whole page, which drops everything
+   that lives only in the DOM - scroll position, the prompt and session rows
+   the reader has opened, the project groups they have collapsed, the "More
+   filters" panel - along with what persist() covers. persist() restores the
+   filters; this restores the rest. It is sessionStorage, not localStorage:
+   surviving one automatic reload is the goal, not following the viewer to
+   their next real visit, where the top of a probably-different table is the
+   right place to land. Saved on a timer and on unload rather than on every
+   scroll or toggle, since the value is only ever read back once.
+
+   Rows are remembered by a key that survives a rebuild (a prompt by session
+   and timestamp, a session by id, a group by its label); one that is not in
+   the new payload, or not on screen under the restored filters, is simply
+   not reopened. */
+const SCROLL_KEY = "ccu-scrollY", OPEN_KEY = "ccu-open";
+const promptKey = (r) => r.session + "|" + r.ts;
+function saveView() {
+  try {
+    sessionStorage.setItem(SCROLL_KEY, String(scrollY || 0));
+    const open = { p: [], s: [], g: [], more: !$("more-filters").hidden };
+    for (const tr of $("tbl-body").querySelectorAll("tr.data-row.open"))
+      if (tr.__row) open.p.push(promptKey(tr.__row));
+    for (const tr of $("sess-body").querySelectorAll("tr.sess-row.open"))
+      if (tr.__sess) open.s.push(tr.__sess.id);
+    for (const tr of $("tbl-body").querySelectorAll("tr.group-row"))
+      if (tr.__group != null && tr.getAttribute("aria-expanded") === "false")
+        open.g.push(tr.__group);
+    sessionStorage.setItem(OPEN_KEY, JSON.stringify(open));
+  } catch {}
 }
-addEventListener("beforeunload", saveScroll);
-setInterval(saveScroll, 4000);
-try {
-  const y = +sessionStorage.getItem(SCROLL_KEY);
-  if (y > 0) scrollTo(0, y);
-} catch {}
+addEventListener("beforeunload", saveView);
+setInterval(saveView, 4000);
+/* Details are reopened before groups are collapsed: __collapse() hides a
+   row's open detail along with it, whereas a detail opened under an already
+   collapsed group would show with its row hidden. Scroll goes last because
+   every reopened panel changes the page height above the saved position. */
+function restoreView() {
+  let o = null;
+  try { o = JSON.parse(sessionStorage.getItem(OPEN_KEY)); } catch {}
+  if (o && typeof o === "object") {
+    const want = (a) => new Set(Array.isArray(a) ? a.map(String) : []);
+    const p = want(o.p), ss = want(o.s), g = want(o.g);
+    if (p.size)
+      for (const tr of [...$("tbl-body").querySelectorAll("tr.data-row")])
+        if (tr.__row && p.has(promptKey(tr.__row))) toggleDetail(tr, tr.__row);
+    if (ss.size)
+      for (const tr of [...$("sess-body").querySelectorAll("tr.sess-row")])
+        if (tr.__sess && ss.has(String(tr.__sess.id)))
+          toggleSessionDetail(tr, tr.__sess);
+    if (g.size)
+      for (const tr of [...$("tbl-body").querySelectorAll("tr.group-row")])
+        if (g.has(tr.__group) && tr.__collapse) tr.__collapse();
+    // opened without moving focus into it, unlike a click: nobody asked
+    if (o.more === true) {
+      $("more-filters").hidden = false;
+      $("more-filters-btn").setAttribute("aria-expanded", "true");
+    }
+  }
+  try {
+    const y = +sessionStorage.getItem(SCROLL_KEY);
+    if (y > 0) scrollTo(0, y);
+  } catch {}
+}
+restoreView();
+/* The reload itself. A <meta refresh> fires on the dot whatever the reader
+   is doing - mid-scroll, mid-hover over the timeline, halfway through typing
+   a search. This waits until the page is due and the reader has left it
+   alone for a minute; a background tab reloads as soon as it is due, since
+   nobody is looking at it. Input is listened for in the capture phase so a
+   scroll inside a panel (which does not bubble) still counts. */
+const RELOAD_MS = 300000, IDLE_MS = 60000;
+function scheduleReload() {
+  const loadedAt = Date.now();
+  let lastInput = loadedAt;
+  const touch = () => { lastInput = Date.now(); };
+  for (const ev of ["pointerdown", "pointermove", "keydown", "wheel", "scroll"])
+    addEventListener(ev, touch, { capture: true, passive: true });
+  setInterval(() => {
+    const now = Date.now();
+    if (now - loadedAt < RELOAD_MS) return;
+    if (!document.hidden && now - lastInput < IDLE_MS) return;
+    location.reload();
+  }, 5000);
+}
+scheduleReload();
 /* resize fires continuously while a window is dragged, and each one re-ran
    the filter, re-aggregated the days and rebuilt the SVG - after reading
    clientWidth, which forces layout of the table sitting below it. One redraw

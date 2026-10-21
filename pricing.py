@@ -24,6 +24,9 @@ What can move a rate off the base table, in the order resolve() applies it:
                 First-party only - fast mode does not exist on Bedrock, Vertex or Foundry.
   data residency  GEO_PREMIUM_MULT, a 1.1x surcharge for pinning inference to
                 a region (inference_geo="us") on 4.6-and-later models.
+  long prompt   LONG_PROMPT_MULT, Claude Haiku 5.5 at 5x over a 100K-token
+                prompt. Per request, not per model, so it is carried on the Rate
+                and applied by cost_at(long_prompt=True).
 
 Cache multipliers are applied to whichever input rate came out of that, so a
 fast-mode cache read costs 0.1x the *fast* input rate.
@@ -73,9 +76,8 @@ PRICES = {
     "claude-sonnet-5": (2.0, 10.0),
     "claude-sonnet-4-6": (3.0, 15.0),
     # Claude Haiku 5.5 is $0.10/$0.50 for prompts up to 100K tokens and
-    # $0.50/$2.50 beyond. There is no long-context tier in this file and the
-    # rate is chosen per model, not per request, so this is the <=100K rate:
-    # a prompt over 100K is understated by 5x.
+    # $0.50/$2.50 beyond. This is the <=100K rate; LONG_PROMPT_MULT carries
+    # the other card.
     "claude-haiku-5-5": (0.1, 0.5),
     "claude-haiku-4-5": (1.0, 5.0),
     # Legacy / deprecated, still resolvable for historical transcripts
@@ -133,6 +135,30 @@ FAST_PRICES = {
     "claude-opus-5": (10.0, 50.0),
     "claude-opus-4-8": (10.0, 50.0),
 }
+
+# Long prompts: a model whose rate card changes with the size of the prompt.
+# Claude Haiku 5.5 bills $0.10/$0.50 when the prompt is LONG_PROMPT_TOKENS or
+# fewer and $0.50/$2.50 when it is longer - output included, and every cache
+# multiplier applies to the higher input rate. The prompt is everything the
+# request sent: uncached input plus cache reads plus cache writes, which is
+# what api_requests.context_tokens holds.
+#
+# That is a property of one request, not of a model, so resolve() cannot pick
+# it: the Rate carries the multiplier and cost_at(long_prompt=True) applies
+# it. A caller that sums requests before billing them must keep long and short
+# ones apart - LONG_PROMPT_SQL is the group key for that - or a hundred small
+# prompts would add up to one "long" one.
+#
+# Held as a multiplier rather than a second price so it composes with the
+# residency surcharge and with partner rates pasted into pricing.local.json;
+# the two published cards are exactly 5x apart.
+LONG_PROMPT_TOKENS = 100_000
+LONG_PROMPT_MULT = {
+    "claude-haiku-5-5": 5.0,
+}
+LONG_PROMPT_SQL = ("(COALESCE(input_tokens, 0) + COALESCE(cache_read_tokens, 0)"
+                   " + COALESCE(cache_create_tokens, 0) > %d)"
+                   % LONG_PROMPT_TOKENS)
 
 # Pinning inference to a geography (inference_geo="us") carries a surcharge on
 # the models that support it - Opus 4.6 / Sonnet 4.6 and later. Applied to the
@@ -211,9 +237,11 @@ CACHE_READ_MULT_BY_MODEL = {
 # in a single tuple so the table is consulted once per distinct model.
 # fast_inp/fast_out are the same model's fast-mode rate, or None where it has
 # none, so a caller holding one Rate for a batch can still bill the fast
-# requests in that batch correctly - see cost_at(speed=...).
-Rate = _namedtuple("Rate", "inp out cache_read_mult fast_inp fast_out")
-Rate.__new__.__defaults__ = (None, None)
+# requests in that batch correctly - see cost_at(speed=...). long_mult is the
+# LONG_PROMPT_MULT that applies to a long prompt, or None where the model has
+# one card - see cost_at(long_prompt=...).
+Rate = _namedtuple("Rate", "inp out cache_read_mult fast_inp fast_out long_mult")
+Rate.__new__.__defaults__ = (None, None, None)
 
 ANTHROPIC, BEDROCK, VERTEX = "anthropic", "bedrock", "vertex"
 
@@ -454,7 +482,8 @@ def resolve(model, ts=None, provider=None, speed=None, inference_geo=None):
             fast = (fast[0] * GEO_PREMIUM_MULT, fast[1] * GEO_PREMIUM_MULT)
 
     return Rate(inp, out, CACHE_READ_MULT_BY_MODEL.get(base, CACHE_READ_MULT),
-                fast[0] if fast else None, fast[1] if fast else None)
+                fast[0] if fast else None, fast[1] if fast else None,
+                LONG_PROMPT_MULT.get(base))
 
 
 def status(model):
@@ -498,6 +527,29 @@ def tool_prompt_tokens(model):
     return TOOL_PROMPT_DEFAULT
 
 
+def is_long(rate, prompt_tokens):
+    """True when one request's prompt puts it on `rate`'s long-prompt card.
+
+    prompt_tokens is the whole prompt - input, cache reads and cache writes -
+    of a single request. Never pass a sum over several.
+    """
+    return bool(rate.long_mult) and (prompt_tokens or 0) > LONG_PROMPT_TOKENS
+
+
+def prices(rate, speed=None, long_prompt=False):
+    """(input, output) per million tokens for one request billed at `rate`.
+
+    The fast-mode and long-prompt adjustments cost_at() makes, for a caller
+    that needs the per-token figures themselves (a cost broken into parts).
+    """
+    inp, out = rate.inp, rate.out
+    if speed == "fast" and rate.fast_inp is not None:
+        inp, out = rate.fast_inp, rate.fast_out
+    if long_prompt and rate.long_mult:
+        inp, out = inp * rate.long_mult, out * rate.long_mult
+    return inp, out
+
+
 def lookup(model, ts=None, provider=None, speed=None, inference_geo=None):
     """(input, output) prices per million tokens, or None. See resolve()."""
     r = resolve(model, ts, provider, speed, inference_geo)
@@ -507,11 +559,15 @@ def lookup(model, ts=None, provider=None, speed=None, inference_geo=None):
 def estimate_cost(model, input_tokens=0, output_tokens=0, cache_read=0,
                   cache_5m=0, cache_1h=0, cache_unsplit=0, ts=None,
                   provider=None, speed=None, inference_geo=None):
-    """Estimated USD cost.
+    """Estimated USD cost of one request.
 
     cache_unsplit is cache-creation tokens with an unrecorded TTL, billed at
     the provider's UNSPLIT_CACHE_MULT (1h by default, which is what Claude
     Code uses against the Anthropic API).
+
+    The counts are taken to be a single request's, so they also decide
+    whether it was a long prompt (LONG_PROMPT_MULT). To bill a sum of
+    requests, use cost_at() and say which side of the line they fell on.
     """
     rate = resolve(model, ts, provider, speed, inference_geo)
     if rate is None:
@@ -519,13 +575,15 @@ def estimate_cost(model, input_tokens=0, output_tokens=0, cache_read=0,
     # The provider the id resolved to, not the one the caller passed: a
     # Bedrock id handed in with no provider is still billed on Bedrock terms.
     resolved = _resolve_base(model, provider)[1]
+    prompt = input_tokens + cache_read + cache_5m + cache_1h + cache_unsplit
     return cost_at(rate, input_tokens, output_tokens, cache_read,
-                   cache_5m, cache_1h, cache_unsplit, resolved)
+                   cache_5m, cache_1h, cache_unsplit, resolved,
+                   long_prompt=is_long(rate, prompt))
 
 
 def cost_at(rate, input_tokens=0, output_tokens=0, cache_read=0,
             cache_5m=0, cache_1h=0, cache_unsplit=0, provider=None,
-            speed=None):
+            speed=None, long_prompt=False):
     """estimate_cost() against an already-resolved Rate.
 
     Split out so a caller aggregating many requests at one price resolves once
@@ -535,10 +593,13 @@ def cost_at(rate, input_tokens=0, output_tokens=0, cache_read=0,
     batch resolved once at the standard rate can still bill its fast requests
     correctly. It is a no-op on a model with no fast tier, and on a Rate that
     resolve() already returned at the fast rate.
+
+    long_prompt=True bills on the model's long-prompt card (LONG_PROMPT_MULT),
+    and is a no-op on a model with one card. It is the caller's to decide,
+    from each request's own prompt size (is_long()) - the token counts here
+    may be a sum over many requests, which says nothing about any one of them.
     """
-    inp, out = rate.inp, rate.out
-    if speed == "fast" and rate.fast_inp is not None:
-        inp, out = rate.fast_inp, rate.fast_out
+    inp, out = prices(rate, speed, long_prompt)
     unsplit_mult = UNSPLIT_CACHE_MULT.get(provider or ANTHROPIC,
                                           CACHE_WRITE_1H_MULT)
     return (

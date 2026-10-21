@@ -1776,8 +1776,28 @@ class TemplateWiring(unittest.TestCase):
 
     def test_scroll_position_survives_the_meta_refresh(self):
         self.assertIn('sessionStorage.setItem(SCROLL_KEY,', self.html)
-        self.assertIn('addEventListener("beforeunload", saveScroll)', self.html)
-        self.assertIn("setInterval(saveScroll,", self.html)
+        self.assertIn('addEventListener("beforeunload", saveView)', self.html)
+        self.assertIn("setInterval(saveView,", self.html)
+
+    def test_open_rows_survive_the_auto_refresh(self):
+        """Opened prompt/session rows, collapsed groups and the More filters
+        panel are saved and reopened, and the reload waits for an idle reader
+        instead of a bare <meta refresh> firing mid-interaction."""
+        start = self.html.index("function saveView()")
+        body = self.html[start:self.html.index("scheduleReload();", start)]
+        for piece in ("sessionStorage.setItem(OPEN_KEY,", "tr.data-row.open",
+                      "tr.sess-row.open", "tr.__group", '$("more-filters").hidden',
+                      "toggleDetail(tr, tr.__row)",
+                      "toggleSessionDetail(tr, tr.__sess)", "tr.__collapse()"):
+            self.assertIn(piece, body, "view restore missing " + piece)
+        self.assertIn("gtr.__group = proj;", self.html)
+        self.assertIn("restoreView();", self.html)
+        self.assertIn("now - lastInput < IDLE_MS", self.html)
+        self.assertIn("location.reload()", self.html)
+        # the only unconditional refresh left is the no-script fallback
+        head = self.html[:self.html.index("</head>")]
+        self.assertIn('<noscript><meta http-equiv="refresh"', head)
+        self.assertEqual(head.count('http-equiv="refresh"'), 1)
 
     def test_reduced_motion_guards_every_transition(self):
         """Every `transition:` in the stylesheet must sit after the nearest
