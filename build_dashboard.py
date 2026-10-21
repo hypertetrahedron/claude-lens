@@ -214,13 +214,14 @@ def _since_clause(sql, since, args=()):
     return sql + " AND ts >= ?", tuple(args) + (since,)
 
 
-def cache_write_cost(rate, c5, c1, unsplit, provider):
+def cache_write_cost(rate, c5, c1, unsplit, provider, long_prompt=False):
     """USD for one request's cache-creation tokens alone."""
     mult = pricing.UNSPLIT_CACHE_MULT.get(provider or pricing.ANTHROPIC,
                                           pricing.CACHE_WRITE_1H_MULT)
+    inp = pricing.prices(rate, long_prompt=long_prompt)[0]
     return (c5 * pricing.CACHE_WRITE_5M_MULT
             + c1 * pricing.CACHE_WRITE_1H_MULT
-            + unsplit * mult) * rate.inp / 1e6
+            + unsplit * mult) * inp / 1e6
 
 
 def cache_scan(con, since=None, canon=None):
@@ -351,7 +352,8 @@ def cache_scan(con, since=None, canon=None):
             rate = resolve(model, ts, provider, speed, geo)
             if rate is not None:
                 cost = cache_write_cost(rate, c5, c1, max(cw - c5 - c1, 0),
-                                        provider)
+                                        provider,
+                                        pricing.is_long(rate, ctx_tokens))
                 stats["miss_cost"] += cost
                 if pid:
                     per_prompt[canon.get(pid, pid)][1] += cost
@@ -418,19 +420,22 @@ def agent_spans(con, since=None):
                   SUM(MAX(COALESCE(cache_create_tokens, 0)
                           - COALESCE(cache_5m_tokens, 0)
                           - COALESCE(cache_1h_tokens, 0), 0)),
-                  SUM(cost_usd), MIN(ts), MAX(ts)
+                  SUM(cost_usd), MIN(ts), MAX(ts), """ + pricing.LONG_PROMPT_SQL
+        + """
              FROM api_requests
             WHERE agent_name IS NOT NULL AND session_id IS NOT NULL""", since)
     acc = {}
     for (sid, aid, model, provider, speed, geo, nocost, calls, inp, out, cr,
-         cw, c5, c1, unsplit, cost, ts_min, ts_max) in con.execute(
+         cw, c5, c1, unsplit, cost, ts_min, ts_max, long_prompt) in con.execute(
             sql + """ GROUP BY session_id, agent_name, model, provider, speed,
                                inference_geo, cost_usd IS NULL,
-                               substr(ts, 1, 10)""", args):
+                               substr(ts, 1, 10), """ + pricing.LONG_PROMPT_SQL,
+            args):
         rate = pricing.resolve(model, ts_min, provider, speed, geo)
         if nocost:
             cost = 0.0 if rate is None else pricing.cost_at(
-                rate, inp, out, cr, c5, c1, unsplit, provider)
+                rate, inp, out, cr, c5, c1, unsplit, provider,
+                long_prompt=bool(long_prompt))
         a = acc.get((sid, aid))
         if a is None:
             a = acc[(sid, aid)] = {"agent": aid, "t0": ts_min, "t1": ts_max,
@@ -544,7 +549,9 @@ def compute_blocks(con, now=None, days=BLOCK_DAYS, factors=None):
                 unpriced = (inp + out + cr + cw) > 0
             else:
                 cost = cost_at(rate, inp, out, cr, c5, c1,
-                               max(cw - c5 - c1, 0), provider)
+                               max(cw - c5 - c1, 0), provider,
+                               long_prompt=pricing.is_long(rate,
+                                                           inp + cr + cw))
         f = factors.get(sid)
         if f is not None:
             cost *= f
@@ -881,7 +888,8 @@ def collect(con, since=None):
                   SUM(COALESCE(server_tool_requests, 0)),
                   SUM(CASE WHEN stop_reason = 'max_tokens' THEN 1 ELSE 0 END),
                   MAX(CASE WHEN """ + MAIN_QS_SQL + """
-                           THEN COALESCE(context_tokens, 0) ELSE 0 END)
+                           THEN COALESCE(context_tokens, 0) ELSE 0 END),
+                  """ + pricing.LONG_PROMPT_SQL + """
            FROM api_requests WHERE prompt_id IS NOT NULL""", since)
     # Peak context is the main conversation's window, not a subagent's: a
     # subagent runs against its own, so its context_tokens is not a reading of
@@ -895,14 +903,18 @@ def collect(con, since=None):
     # fast mode is billed at 2x and a pinned US region at 1.1x, so a group
     # that mixed them would be costed at whichever one the row happened to
     # carry. They are near-constant within a session, so the group count
-    # barely moves.
+    # barely moves. Whether each request was a long prompt joins it too: a
+    # model with a long-prompt card bills by each request's own size, which a
+    # sum over the group cannot say (pricing.LONG_PROMPT_SQL).
     for (pid, sid, model, provider, agent, nocost, effort, speed, geo, calls,
          inp, out, cr, cw, c5, c1, unsplit, cost, ts_min, ts_max, thinking,
-         server_tools, max_stops, peak_ctx) in con.execute(
+         server_tools, max_stops, peak_ctx, long_prompt) in con.execute(
             req_sql + """
                GROUP BY prompt_id, session_id, model, provider, agent_name,
                         cost_usd IS NULL, effort, speed, inference_geo,
-                        substr(ts, 1, 10)""", req_args):
+                        substr(ts, 1, 10), """ + pricing.LONG_PROMPT_SQL,
+            req_args):
+        long_prompt = bool(long_prompt)
         if provider:
             providers[provider] += calls
         r = bucket(pid)
@@ -932,18 +944,20 @@ def collect(con, since=None):
             r["unpriced"] = True
         if nocost:
             cost = 0.0 if rate is None else cost_at(
-                rate, inp, out, cr, c5, c1, unsplit, provider)
+                rate, inp, out, cr, c5, c1, unsplit, provider,
+                long_prompt=long_prompt)
             r["est"] = True
         m["cost"] += cost
         r["cost"] += cost
         # Cost components from the pricing table; when the CLI reported an
         # authoritative total, scale the split so components sum to it.
         if rate is not None:
-            pi, po = rate.inp, rate.out
+            pi, po = pricing.prices(rate, long_prompt=long_prompt)
             c_read = cr * pi * rate.cache_read_mult / 1e6
             # The same per-provider multiplier for unsplit writes that cost_at
             # used for the total, or the split would not sum to it.
-            c_write = cache_write_cost(rate, c5, c1, unsplit, provider)
+            c_write = cache_write_cost(rate, c5, c1, unsplit, provider,
+                                       long_prompt)
             c_out = out * po / 1e6
             c_in = inp * pi / 1e6
             est_total = sum((c_read, c_write, c_out, c_in))

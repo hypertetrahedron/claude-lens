@@ -635,19 +635,21 @@ over on Opus 5.5's real $4/$20 - while the page called it priced. A model the
 table has never heard of now comes out unpriced and named, never as its
 nearest neighbour.
 
-Four things can move a request off the base rate, and `pricing.resolve()`
-applies them in this order:
+Five things can move a request off the base rate. `pricing.resolve()`
+applies the first four in this order; the long-prompt card depends on the
+request rather than the model, so `cost_at(long_prompt=True)` applies it:
 
 | | What it does | Applies to |
 |---|---|---|
 | Promotion (`INTRO_PRICES`) | A rate that expires on a date, applied only when the request's timestamp is before it | First-party only — a promotion on the Anthropic API says nothing about a marketplace's rate card. Empty today: Claude Sonnet 5's $2/$10 lived here until the September 2026 rise was cancelled and the rate became permanent |
 | Fast mode (`FAST_PRICES`) | 2x list for requests the transcript recorded as `usage.speed = "fast"` | Claude Opus 5.5 ($8/$40), Opus 5 and Opus 4.8, Anthropic provider only — fast mode is not offered on Bedrock, Vertex or Foundry |
 | Data residency (`GEO_PREMIUM_MULT`) | 1.1x input and output when a request pinned inference to a geography (`usage.inference_geo = "us"`) | Models that support pinning — Opus 4.6 / Sonnet 4.6 and later, first-party only |
+| Long prompt (`LONG_PROMPT_MULT`) | 5x input and output when one request's whole prompt — uncached input plus cache reads plus cache writes — is over 100K tokens | Claude Haiku 5.5: $0.10/$0.50 up to 100K, $0.50/$2.50 beyond. Decided per request, so every query that sums requests before pricing them also groups by `LONG_PROMPT_SQL`; a hundred short prompts never add up to a long one |
 | Cache read (`CACHE_READ_MULT_BY_MODEL`) | A per-model multiple of the input rate, default 0.1 | Claude Fable 5.1 and Claude Mythos 5.1 read cache at **0.025x** — $0.25/MTok against a $10 input rate. On a cache-heavy agent, using 0.1x there overstates the bill fourfold. Claude Opus 5.5 reads at **0.05x** ($0.20 against $4) |
 
-The cache multipliers apply to whichever input rate came out of the first
-three, so a fast-mode cache read costs a tenth of the *fast* input rate, not
-of list.
+The cache multipliers apply to whichever input rate came out of the others,
+so a fast-mode cache read costs a tenth of the *fast* input rate, not of
+list, and a long Haiku 5.5 prompt's cache read a tenth of $0.50.
 
 Retired models keep their rates — old transcripts still need costing — and
 gain a retirement date in `pricing.RETIRED`, so a model whose line simply
@@ -1226,16 +1228,19 @@ counterfactual.
   sessions does not throw you back to prompts. The button is disabled (not
   hidden, which would shift everything beside it) whenever nothing is
   filtered.
-- **Auto-refresh** — the page reloads every 5 minutes. Every filter (date
+- **Auto-refresh** — the page reloads every 5 minutes, waiting until you have
+  left it alone for a minute so it never lands mid-scroll or mid-search (a
+  background tab reloads on time). Every filter (date
   range, product, project, model, search text, the range filters above),
   both tables' sort column and direction, the Prompts/Sessions view, column
   layout, chart choice, grouping and the session filter all persist
   (localStorage) and are restored before the first render, so the reload is
-  invisible. Scroll position survives it too (sessionStorage, saved every
-  few seconds and on unload). A session filter is validated against the
-  freshly loaded session table on restore, so a session that no longer
-  exists is dropped instead of hiding every row with no explanation. Light/
-  dark theme with toggle.
+  invisible. Scroll position, the prompt and session rows you have opened,
+  collapsed project groups and the More filters panel survive it too
+  (sessionStorage, saved every few seconds and on unload). A session filter
+  is validated against the freshly loaded session table on restore, so a
+  session that no longer exists is dropped instead of hiding every row with
+  no explanation. Light/dark theme with toggle.
 - **Keyboard access** — every clickable row (prompt, session, group header,
   day bar) and every chart mark with its own tooltip (block bars, heatmap
   days, context events and misses) is a focusable, tabbable element that

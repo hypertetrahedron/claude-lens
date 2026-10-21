@@ -359,6 +359,67 @@ class PeakContextIsTheMainThreads(unittest.TestCase):
                          "figure that should only ever be the main thread's")
 
 
+class LongPromptsAreBilledOneByOne(unittest.TestCase):
+    """Claude Haiku 5.5 is 5x over a 100K-token prompt - per request.
+
+    Every cost path that sums requests before pricing them has to keep the
+    long ones apart: two 50K prompts are not a 100K one, and a 120K prompt
+    summed with small ones must still bill at the long rate.
+    """
+
+    H55 = "claude-haiku-5-5"
+    MAIN = (2 * (50000 * 0.1 + 1000 * 0.5)               # two short
+            + (10 * 0.5 + 120000 * 0.5 * 0.1 + 1000 * 2.5)) / 1e6  # one long
+    AGENT = (150000 * 0.5 + 1000 * 0.1) / 1e6            # one long, one short
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="claude-lens-longprompt-")
+        self.con = db.connect(os.path.join(self.tmp, "metrics.db"))
+        db.upsert_session(self.con, "s1", project="p", cwd="/w/p",
+                          first_ts=ts(0), last_ts=ts(3))
+        db.upsert_prompt(self.con, "q1", "s1", "p", ts(0), "hello", "jsonl",
+                         0, None, "human")
+        db.insert_requests_jsonl(self.con, [
+            request("a", "q1", "s1", ts(0), self.H55, input_tokens=50000,
+                    output_tokens=1000),
+            request("b", "q1", "s1", ts(1), self.H55, input_tokens=50000,
+                    output_tokens=1000),
+            request("c", "q1", "s1", ts(2), self.H55, input_tokens=10,
+                    cache_read_tokens=120000, output_tokens=1000),
+            request("d", "q1", "s1", ts(3), self.H55, input_tokens=150000,
+                    query_source="subagent", agent_name="ag1"),
+            request("e", "q1", "s1", ts(3), self.H55, input_tokens=1000,
+                    query_source="subagent", agent_name="ag1"),
+        ])
+        self.con.commit()
+
+    def tearDown(self):
+        self.con.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_prompt_row_and_its_breakdown(self):
+        rows, _ = bd.collect(self.con)
+        r = {x["id"]: x for x in rows}["q1"]
+        self.assertAlmostEqual(r["cost"], self.MAIN + self.AGENT, places=4)
+        self.assertAlmostEqual(sum(r["comp"]), r["cost"], places=4)
+
+    def test_agent_span(self):
+        spans = bd.agent_spans(self.con)["s1"]
+        self.assertAlmostEqual(sum(sp["cost"] for sp in spans), self.AGENT,
+                               places=9)
+
+    def test_five_hour_block(self):
+        blocks, _ = bd.compute_blocks(self.con, now=T0 + timedelta(hours=1),
+                                      days=365)
+        self.assertAlmostEqual(blocks[-1]["cost"], self.MAIN + self.AGENT,
+                               places=9)
+
+    def test_conversation_page_costs(self):
+        got = conversations._costs(self.con, ["q1"])
+        self.assertAlmostEqual(sum(c for c, _, _ in got.values()),
+                               self.MAIN + self.AGENT, places=9)
+
+
 class Rows(Fixture):
     def test_streamed_duplicate_keeps_the_complete_row(self):
         out = self.con.execute(

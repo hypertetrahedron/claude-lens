@@ -345,8 +345,10 @@ class FivePointFiveRates(TableState):
     def test_sonnet_and_haiku_read_at_the_usual_tenth(self):
         self.assertAlmostEqual(
             pricing.estimate_cost("claude-sonnet-5-5", cache_read=MTOK), 0.20)
+        # A tenth of a million: a whole million would be a long prompt.
         self.assertAlmostEqual(
-            pricing.estimate_cost("claude-haiku-5-5", cache_read=MTOK), 0.01)
+            pricing.estimate_cost("claude-haiku-5-5", cache_read=MTOK // 10),
+            0.001)
 
     def test_opus_fast_mode_is_eight_and_forty(self):
         self.assertEqual(pricing.lookup("claude-opus-5-5", speed="fast"),
@@ -362,6 +364,75 @@ class FivePointFiveRates(TableState):
         got = pricing.lookup("claude-opus-5-5", inference_geo="us")
         self.assertAlmostEqual(got[0], 4.4)
         self.assertAlmostEqual(got[1], 22.0)
+
+
+class LongPrompt(TableState):
+    """Claude Haiku 5.5's second rate card, chosen per request by prompt size.
+
+    $0.10/$0.50 up to 100K prompt tokens, $0.50/$2.50 beyond - output too, and
+    cache multipliers on the higher input rate.
+    """
+
+    LIMIT = pricing.LONG_PROMPT_TOKENS
+
+    def test_at_the_line_is_the_short_card(self):
+        self.assertAlmostEqual(
+            pricing.estimate_cost("claude-haiku-5-5", input_tokens=self.LIMIT,
+                                  output_tokens=MTOK),
+            self.LIMIT * 0.1 / MTOK + 0.5)
+
+    def test_one_past_the_line_is_five_times_everything(self):
+        got = pricing.estimate_cost("claude-haiku-5-5",
+                                    input_tokens=self.LIMIT + 1,
+                                    output_tokens=MTOK)
+        self.assertAlmostEqual(got, (self.LIMIT + 1) * 0.5 / MTOK + 2.5)
+
+    def test_cached_tokens_count_toward_the_prompt(self):
+        # 10 fresh + 100K read is over the line; the read bills at 0.1x of
+        # the long input rate, and the 1h write at 2x of it.
+        got = pricing.estimate_cost("claude-haiku-5-5", input_tokens=10,
+                                    cache_read=self.LIMIT)
+        self.assertAlmostEqual(got, (10 * 0.5 + self.LIMIT * 0.05) / MTOK)
+        got = pricing.estimate_cost("claude-haiku-5-5", cache_read=self.LIMIT,
+                                    cache_1h=1)
+        self.assertAlmostEqual(got, (self.LIMIT * 0.05 + 1.0) / MTOK)
+
+    def test_cost_at_leaves_the_decision_to_the_caller(self):
+        # A sum over many small requests is not a long prompt.
+        rate = pricing.resolve("claude-haiku-5-5")
+        self.assertAlmostEqual(pricing.cost_at(rate, input_tokens=MTOK), 0.1)
+        self.assertAlmostEqual(
+            pricing.cost_at(rate, input_tokens=MTOK, long_prompt=True), 0.5)
+        self.assertTrue(pricing.is_long(rate, self.LIMIT + 1))
+        self.assertFalse(pricing.is_long(rate, self.LIMIT))
+
+    def test_other_models_have_one_card(self):
+        for model in ("claude-haiku-4-5", "claude-sonnet-5-5", "claude-opus-5-5"):
+            rate = pricing.resolve(model)
+            self.assertIsNone(rate.long_mult)
+            self.assertFalse(pricing.is_long(rate, 10 * MTOK))
+            self.assertEqual(
+                pricing.cost_at(rate, input_tokens=MTOK, long_prompt=True),
+                pricing.cost_at(rate, input_tokens=MTOK))
+
+    def test_composes_with_residency_and_partners(self):
+        rate = pricing.resolve("claude-haiku-5-5", inference_geo="us")
+        self.assertAlmostEqual(
+            pricing.cost_at(rate, output_tokens=MTOK, long_prompt=True), 2.75)
+        rate = pricing.resolve("anthropic.claude-haiku-5-5")
+        self.assertEqual(rate.long_mult, 5.0)
+
+    def test_sql_key_matches_is_long(self):
+        import sqlite3
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE api_requests (input_tokens, "
+                    "cache_read_tokens, cache_create_tokens)")
+        con.executemany("INSERT INTO api_requests VALUES (?,?,?)",
+                        [(self.LIMIT, None, None), (1, self.LIMIT, None),
+                         (None, None, self.LIMIT + 1), (5, 5, 5)])
+        got = [r[0] for r in con.execute(
+            "SELECT " + pricing.LONG_PROMPT_SQL + " FROM api_requests")]
+        self.assertEqual(got, [0, 1, 1, 0])
 
 
 class EstimateCostProvider(TableState):
